@@ -1,26 +1,17 @@
 //! `numbers-base`: the leaf crate every other crate may depend on, frontends included.
 //!
-//! It will hold the frame codec (`write_frame` / `read_frame`: a u32 length and JSON, with the size
-//! cap and read deadline as parameters) and the key-file helper for daemons; later the roster
-//! codec. It never depends on iroh or any network code.
+//! It holds the frame codec ([`frame`]: `write_frame` / `read_frame`, a big-endian u32 length and
+//! JSON, with the size cap and the read deadline as parameters) and, on Unix, the private-directory
+//! and key-file helpers for daemons ([`keyfile`]); later the roster codec. It never depends on iroh
+//! or any network code, and it holds no process-global state.
 
-/// Largest frame accepted from a peer over the network.
-pub const WIRE_FRAME_MAX: usize = 64 * 1024;
+pub mod frame;
+#[cfg(unix)]
+pub mod keyfile;
 
-/// Largest frame accepted on the station's local socket.
-pub const LOCAL_FRAME_MAX: usize = 1024 * 1024;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frame_caps_are_pinned() {
-        assert_eq!(WIRE_FRAME_MAX, 65_536);
-        assert_eq!(LOCAL_FRAME_MAX, 1_048_576);
-        const { assert!(WIRE_FRAME_MAX < LOCAL_FRAME_MAX) };
-        // Both must be expressible in the u32 length prefix.
-        assert!(u32::try_from(WIRE_FRAME_MAX).is_ok());
-        assert!(u32::try_from(LOCAL_FRAME_MAX).is_ok());
-    }
-}
+pub use frame::{FrameError, LOCAL_FRAME_MAX, WIRE_FRAME_MAX, read_frame, write_frame};
+#[cfg(unix)]
+pub use keyfile::{
+    KeyOrigin, PrivatePathError, StoredKey, check_private_dir, create_key_file, ensure_private_dir,
+    load_or_create_key, read_key_file,
+};
