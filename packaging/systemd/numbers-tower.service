@@ -58,6 +58,15 @@ ProtectClock=yes
 # The service gets its own copy of the host name and cannot change the host name or the domain
 # name. The tower takes its host name from tower.toml.
 ProtectHostname=yes
+# No creating or entering namespaces of any kind (unshare(2), clone(2) and setns(2) with
+# namespace flags). systemd makes the mount and UTS namespaces of the lines above before this
+# applies; the tower's threads need none.
+RestrictNamespaces=yes
+# No realtime scheduling (SCHED_FIFO, SCHED_RR, SCHED_DEADLINE), with which a process can keep
+# the CPUs from the rest of the host. The tower uses the normal policy.
+RestrictRealtime=yes
+# The execution domain of personality(2) cannot be changed.
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
