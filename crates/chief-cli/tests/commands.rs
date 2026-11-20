@@ -408,6 +408,403 @@ async fn status_without_towers_says_so() {
     .await;
 }
 
+fn tower(url: &str, state: TowerState, source: Option<TowerSource>) -> TowerStatus {
+    TowerStatus {
+        url: url.to_owned(),
+        state,
+        source,
+    }
+}
+
+const TOWER_A: &str = "https://tower-a.example.invalid/";
+const TOWER_B: &str = "https://tower-b.example.invalid/";
+const TOWER_C: &str = "https://tower-c.example.invalid/";
+const TOWER_D: &str = "https://tower-d.example.invalid/";
+
+#[tokio::test]
+async fn status_shows_every_state_with_every_source() {
+    bounded(async {
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1");
+        let c = Client::new(fake.clone());
+        // The state word and the detail after it, as literal text.
+        let states = [
+            (TowerState::Connecting, "connecting", ""),
+            (TowerState::Connected, "connected", ""),
+            (TowerState::Standby, "standby", ""),
+            (
+                TowerState::Failing {
+                    error: "connection refused".to_owned(),
+                },
+                "failing",
+                ": connection refused",
+            ),
+            (
+                TowerState::Denied {
+                    reason: "not allowed".to_owned(),
+                },
+                "denied",
+                ": not allowed",
+            ),
+            (
+                // The reason a tower of this project gives (crates/tower/src/lib.rs, DENY_REASON).
+                TowerState::Denied {
+                    reason: "not on this tower's list".to_owned(),
+                },
+                "denied",
+                ": not on this tower's list",
+            ),
+        ];
+        // The source and its suffix after the state word.
+        let sources = [
+            (None, ""),
+            (Some(TowerSource::Configured), " (configured)"),
+            (Some(TowerSource::Remembered), " (remembered)"),
+            (Some(TowerSource::Srv), " (srv)"),
+            (Some(TowerSource::Peer), " (peer)"),
+        ];
+        for (state, word, detail) in &states {
+            for (source, suffix) in &sources {
+                fake.set_towers(vec![tower(TOWER_A, state.clone(), *source)]);
+                assert_eq!(
+                    exec(&c, &["status"]).await,
+                    (
+                        Exit::Done,
+                        format!("tower {TOWER_A} {word}{suffix}{detail}\nno peers\n"),
+                        String::new()
+                    ),
+                    "{state:?} {source:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_shows_the_domain_first_and_the_towers_in_their_order() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        fake.set_towers(vec![
+            tower(TOWER_D, TowerState::Standby, Some(TowerSource::Remembered)),
+            tower(TOWER_A, TowerState::Connected, Some(TowerSource::Srv)),
+            tower(
+                TOWER_C,
+                TowerState::Failing {
+                    error: "connection refused".to_owned(),
+                },
+                Some(TowerSource::Configured),
+            ),
+            tower(
+                TOWER_B,
+                TowerState::Denied {
+                    reason: "not allowed".to_owned(),
+                },
+                Some(TowerSource::Peer),
+            ),
+            tower(FAKE_TOWER_URL, TowerState::Connecting, None),
+        ]);
+        let towers = "tower https://tower-d.example.invalid/ standby (remembered)\n\
+                      tower https://tower-a.example.invalid/ connected (srv)\n\
+                      tower https://tower-c.example.invalid/ failing (configured): connection \
+                      refused\n\
+                      tower https://tower-b.example.invalid/ denied (peer): not allowed\n\
+                      tower http://127.0.0.1:3340/ connecting\n";
+        let peers = "peer alice STATION-AL down\npeer bob STATION-B down\n";
+        // No domain line without a domain.
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (Exit::Done, format!("{towers}{peers}"), String::new())
+        );
+        fake.set_bootstrap_domain(Some("team.example.invalid".to_owned()));
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (
+                Exit::Done,
+                format!("domain team.example.invalid\n{towers}{peers}"),
+                String::new()
+            )
+        );
+        // A domain and no towers.
+        fake.set_towers(Vec::new());
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (
+                Exit::Done,
+                format!("domain team.example.invalid\nno towers\n{peers}"),
+                String::new()
+            )
+        );
+        fake.set_bootstrap_domain(None);
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (Exit::Done, format!("no towers\n{peers}"), String::new())
+        );
+    })
+    .await;
+}
+
+/// A fake whose `Status` answers carry these towers and this bootstrap domain exactly as given,
+/// past the fake's own cleaning: what a station that broke rule 9 would send.
+#[derive(Clone)]
+struct RawStatus {
+    fake: FakeStation,
+    towers: Vec<TowerStatus>,
+    domain: Option<String>,
+}
+
+impl Transport for RawStatus {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        match self.fake.call(request).await? {
+            Response::Status { status } => Ok(Response::Status {
+                status: Status {
+                    towers: self.towers.clone(),
+                    bootstrap_domain: self.domain.clone(),
+                    ..status
+                },
+            }),
+            other => Ok(other),
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+impl BindInstance for RawStatus {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            fake: self.fake.bound_to(instance_id),
+            ..self.clone()
+        }
+    }
+}
+
+fn raw_status(towers: Vec<TowerStatus>, domain: Option<&str>) -> Client<RawStatus> {
+    Client::new(RawStatus {
+        fake: FakeStation::new("STATION-A", "INSTANCE-1"),
+        towers,
+        domain: domain.map(str::to_owned),
+    })
+}
+
+#[tokio::test]
+async fn status_leaves_out_an_error_or_reason_with_nothing_to_show() {
+    bounded(async {
+        // Empty, white space only, and only characters that rule 9 replaces.
+        for text in [
+            "",
+            "   ",
+            " \t ",
+            "\u{1b}\n",
+            "\u{1b}",
+            "\u{2028}\u{202E}\r\n\u{7f}",
+        ] {
+            let towers = vec![
+                tower(
+                    TOWER_A,
+                    TowerState::Failing {
+                        error: text.to_owned(),
+                    },
+                    Some(TowerSource::Srv),
+                ),
+                tower(
+                    TOWER_B,
+                    TowerState::Failing {
+                        error: text.to_owned(),
+                    },
+                    None,
+                ),
+                tower(
+                    TOWER_C,
+                    TowerState::Denied {
+                        reason: text.to_owned(),
+                    },
+                    Some(TowerSource::Peer),
+                ),
+                tower(
+                    TOWER_D,
+                    TowerState::Denied {
+                        reason: text.to_owned(),
+                    },
+                    None,
+                ),
+            ];
+            let expected = "tower https://tower-a.example.invalid/ failing (srv)\n\
+                            tower https://tower-b.example.invalid/ failing\n\
+                            tower https://tower-c.example.invalid/ denied (peer)\n\
+                            tower https://tower-d.example.invalid/ denied\n\
+                            no peers\n";
+            // As the station sends it, and as the fake cleans it.
+            let raw = raw_status(towers.clone(), Some(text));
+            let fake = FakeStation::new("STATION-A", "INSTANCE-1");
+            fake.set_towers(towers);
+            fake.set_bootstrap_domain(Some(text.to_owned()));
+            for (exit, out, err) in [
+                exec(&raw, &["status"]).await,
+                exec(&Client::new(fake), &["status"]).await,
+            ] {
+                assert_eq!(
+                    (exit, out.as_str(), err.as_str()),
+                    (Exit::Done, expected, ""),
+                    "{text:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_strips_tower_and_domain_text_itself() {
+    bounded(async {
+        // The fake's own cleaning is bypassed: the CLI is the last place to strip it.
+        let forged = "\ntower https://forged.example.invalid/ connected";
+        let c = raw_status(
+            vec![
+                tower(
+                    &format!("{TOWER_A}\u{1b}[2J{forged}\u{2028}x\u{202E}"),
+                    TowerState::Connected,
+                    Some(TowerSource::Srv),
+                ),
+                tower(
+                    TOWER_C,
+                    TowerState::Failing {
+                        error: format!("refused\u{1b}[31m{forged}\u{2028}x\u{202E}y"),
+                    },
+                    Some(TowerSource::Configured),
+                ),
+                tower(
+                    TOWER_D,
+                    TowerState::Denied {
+                        reason: format!("no\u{1b}]0;owned\u{7}{forged}\u{2028}x\u{202E}y"),
+                    },
+                    None,
+                ),
+            ],
+            Some(&format!("team.example.invalid\u{1b}[2K{forged}\u{202E}z")),
+        );
+        let (exit, out, err) = exec(&c, &["status"]).await;
+        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+        assert_clean(&out);
+        // One domain line, one line per tower, and the peers.
+        assert_eq!(out.lines().count(), 5, "{out:?}");
+        // The URL is one token: what rule 9 made a space, and any other white space, is `%20`.
+        assert_eq!(
+            out,
+            "domain team.example.invalid [2K tower https://forged.example.invalid/ connected z\n\
+             tower https://tower-a.example.invalid/%20[2J%20tower%20https://forged.example.invalid/\
+             %20connected%20x%20 connected (srv)\n\
+             tower https://tower-c.example.invalid/ failing (configured): refused [31m tower \
+             https://forged.example.invalid/ connected x y\n\
+             tower https://tower-d.example.invalid/ denied: no ]0;owned  tower \
+             https://forged.example.invalid/ connected x y\n\
+             no peers\n"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_tower_url_is_one_token_and_cannot_put_a_state_before_the_real_one() {
+    bounded(async {
+        let c = raw_status(
+            vec![
+                tower(
+                    "https://a.example.invalid/ connected (srv)\u{2028}tower https://b.example.invalid/",
+                    TowerState::Denied {
+                        reason: "not on this tower's list".to_owned(),
+                    },
+                    Some(TowerSource::Peer),
+                ),
+                tower("", TowerState::Connected, None),
+                tower(" \t", TowerState::Standby, None),
+            ],
+            None,
+        );
+        let (exit, out, err) = exec(&c, &["status"]).await;
+        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+        assert_eq!(
+            out,
+            "tower https://a.example.invalid/%20connected%20(srv)%20tower%20https://b.example.invalid/ \
+             denied (peer): not on this tower's list\n\
+             tower - connected\n\
+             tower %20%20 standby\n\
+             no peers\n"
+        );
+        // Exactly one state word, after the one URL token.
+        let first = out.lines().next().unwrap();
+        assert_eq!(first.matches(" connected").count(), 0, "{first}");
+        assert_eq!(first.matches(" denied").count(), 1, "{first}");
+        assert_eq!(first.split(' ').nth(2), Some("denied"), "{first}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_trims_an_error_a_reason_and_a_domain_that_have_text_left() {
+    bounded(async {
+        let towers = vec![
+            tower(
+                TOWER_A,
+                TowerState::Failing {
+                    error: "\t connection refused \u{1b}\n".to_owned(),
+                },
+                Some(TowerSource::Srv),
+            ),
+            tower(
+                TOWER_B,
+                TowerState::Denied {
+                    reason: " not allowed\r\n".to_owned(),
+                },
+                Some(TowerSource::Peer),
+            ),
+        ];
+        let domain = " team.example.invalid\n";
+        let expected = "domain team.example.invalid\n\
+                        tower https://tower-a.example.invalid/ failing (srv): connection refused\n\
+                        tower https://tower-b.example.invalid/ denied (peer): not allowed\n\
+                        no peers\n";
+        // As the station sends it, and as the fake stores it.
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1");
+        fake.set_towers(towers.clone());
+        fake.set_bootstrap_domain(Some(domain.to_owned()));
+        for (exit, out, err) in [
+            exec(&raw_status(towers, Some(domain)), &["status"]).await,
+            exec(&Client::new(fake), &["status"]).await,
+        ] {
+            assert_eq!(
+                (exit, out.as_str(), err.as_str()),
+                (Exit::Done, expected, "")
+            );
+        }
+    })
+    .await;
+}
+
+#[test]
+fn status_help_describes_its_lines() {
+    let help = cli(&["status", "--help"]).unwrap_err().to_string();
+    for text in [
+        "Show the bootstrap domain, each tower's state and source, then each peer station's link",
+        "domain <domain>",
+        "tower <url> <state>[ (<source>)][: <detail>]",
+        "standby (in the station's set, state not observed)",
+        "failing (the last attempt failed, the station keeps trying; its error follows)",
+        "denied (the tower refused this station, and trying again does not help until the \
+         tower's operator changes that; the tower's reason follows; a tower of this project says \
+         \"not on this tower's list\": give its operator the id that `chief id` prints)",
+        "configured (given when the station was started)",
+        "remembered (stored by an earlier run)",
+        "srv (found through the domain's DNS record)",
+        "peer (named by a peer and added by the chief)",
+        "peer <name> <station-id> <link>",
+    ] {
+        assert!(help.contains(text), "{text:?} not in {help}");
+    }
+}
+
 #[tokio::test]
 async fn peer_add_ls_rm() {
     bounded(async {
