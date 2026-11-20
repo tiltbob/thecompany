@@ -28,9 +28,15 @@ stop_job() {
     local job=$1 pid=${2:-} deadline=$((SECONDS + 10))
     if [[ -z $pid ]]; then
         pid=$(jobs -p "%$job" 2>/dev/null) || return 0
+    elif ! running "$pid"; then
+        wait "$pid" 2>/dev/null || true
+        return 1
     fi
     # Signal by job name so Bash can only target a child started by this script.
-    kill -TERM "%$job" 2>/dev/null || true
+    # The job can exit between the liveness check and the signal.
+    if ! kill -TERM "%$job" 2>/dev/null && [[ -n ${2:-} ]]; then
+        return 1
+    fi
     while running "$pid" && (( SECONDS < deadline )); do
         sleep 0.1
     done
