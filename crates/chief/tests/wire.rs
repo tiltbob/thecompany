@@ -10,6 +10,7 @@ use std::fmt::Debug;
 
 // Samples.
 
+const CANDIDATE_URL: &str = "https://xn--bcher-kva.synthetic.invalid/";
 const AT_MS: u64 = 1_767_225_600_000;
 
 fn outgoing(seq: u64, rev: u32, status: MessageStatus) -> Message {
@@ -72,12 +73,37 @@ fn delivered() -> Message {
     outgoing(42, 1, MessageStatus::Delivered)
 }
 
-/// One value of every `Request` variant (`Log` twice: without and with its options), each with its
-/// exact JSON text.
+/// Every `Request` variant, with both forms of the optional cursors and exact JSON text.
 fn requests() -> Vec<(Request, &'static str)> {
     vec![
         (Request::Status, r#"{"type":"status"}"#),
         (Request::Peers, r#"{"type":"peers"}"#),
+        (
+            Request::TowerCandidates {
+                after_peer: None,
+                limit: 0,
+            },
+            r#"{"type":"tower_candidates","limit":0}"#,
+        ),
+        (
+            Request::TowerCandidates {
+                after_peer: Some("alice".into()),
+                limit: 1,
+            },
+            r#"{"type":"tower_candidates","after_peer":"alice","limit":1}"#,
+        ),
+        (
+            Request::TowerAdd {
+                url: "https://bücher.synthetic.invalid".into(),
+            },
+            r#"{"type":"tower_add","url":"https://bücher.synthetic.invalid"}"#,
+        ),
+        (
+            Request::TowerRemove {
+                url: "https://bücher.synthetic.invalid".into(),
+            },
+            r#"{"type":"tower_remove","url":"https://bücher.synthetic.invalid"}"#,
+        ),
         (
             Request::PeerAdd {
                 name: "bob".into(),
@@ -195,6 +221,44 @@ fn responses() -> Vec<(Response, &'static str)> {
             ),
         ),
         (Response::Done, r#"{"type":"done"}"#),
+        (
+            Response::TowerCandidates {
+                page: TowerCandidatesPage {
+                    groups: vec![TowerCandidateGroup {
+                        peer: "bob".into(),
+                        candidates: vec![TowerCandidate {
+                            url: CANDIDATE_URL.into(),
+                        }],
+                    }],
+                    next_after_peer: Some("bob".into()),
+                },
+            },
+            concat!(
+                r#"{"type":"tower_candidates","page":{"groups":[{"peer":"bob","candidates":["#,
+                r#"{"url":"https://xn--bcher-kva.synthetic.invalid/"}]}],"next_after_peer":"bob"}}"#,
+            ),
+        ),
+        (
+            Response::TowerAdd {
+                tower: TowerStatus {
+                    url: CANDIDATE_URL.into(),
+                    state: TowerState::Standby,
+                    source: Some(TowerSource::Peer),
+                },
+                outcome: TowerAddOutcome::Added,
+            },
+            concat!(
+                r#"{"type":"tower_add","tower":{"url":"https://xn--bcher-kva.synthetic.invalid/","#,
+                r#""state":{"type":"standby"},"source":"peer"},"outcome":"added"}"#,
+            ),
+        ),
+        (
+            Response::TowerRemove {
+                url: CANDIDATE_URL.into(),
+                outcome: TowerRemoveOutcome::NotInSet,
+            },
+            r#"{"type":"tower_remove","url":"https://xn--bcher-kva.synthetic.invalid/","outcome":"not_in_set"}"#,
+        ),
     ]
 }
 
@@ -256,6 +320,8 @@ fn errors() -> Vec<ApiError> {
             field: "body".into(),
             reason: "must not be empty".into(),
         },
+        ApiError::TowersPinned,
+        ApiError::TowerSetFull { max: 8 },
         ApiError::Stopping,
         ApiError::Internal {
             detail: "writing the peer book failed".into(),
@@ -332,7 +398,7 @@ fn tower_sources() -> [TowerSource; 4] {
 // Exhaustive matches: a new variant does not compile until it is numbered here, and the coverage
 // tests then fail until the samples above hold a value of it.
 
-const REQUEST_VARIANTS: usize = 7;
+const REQUEST_VARIANTS: usize = 10;
 fn request_variant(value: &Request) -> usize {
     match value {
         Request::Status => 0,
@@ -342,10 +408,13 @@ fn request_variant(value: &Request) -> usize {
         Request::Send { .. } => 4,
         Request::Message { .. } => 5,
         Request::Log { .. } => 6,
+        Request::TowerCandidates { .. } => 7,
+        Request::TowerAdd { .. } => 8,
+        Request::TowerRemove { .. } => 9,
     }
 }
 
-const RESPONSE_VARIANTS: usize = 6;
+const RESPONSE_VARIANTS: usize = 9;
 fn response_variant(value: &Response) -> usize {
     match value {
         Response::Status { .. } => 0,
@@ -354,6 +423,9 @@ fn response_variant(value: &Response) -> usize {
         Response::Message { .. } => 3,
         Response::Log { .. } => 4,
         Response::Done => 5,
+        Response::TowerCandidates { .. } => 6,
+        Response::TowerAdd { .. } => 7,
+        Response::TowerRemove { .. } => 8,
     }
 }
 
@@ -368,7 +440,7 @@ fn event_variant(value: &Event) -> usize {
     }
 }
 
-const ERROR_VARIANTS: usize = 12;
+const ERROR_VARIANTS: usize = 14;
 fn error_variant(value: &ApiError) -> usize {
     match value {
         ApiError::PeerNotFound { .. } => 0,
@@ -383,6 +455,8 @@ fn error_variant(value: &ApiError) -> usize {
         ApiError::Disconnected { .. } => 9,
         ApiError::Timeout { .. } => 10,
         ApiError::BadReply { .. } => 11,
+        ApiError::TowersPinned => 12,
+        ApiError::TowerSetFull { .. } => 13,
     }
 }
 
@@ -523,14 +597,13 @@ fn numbers_keep_their_full_range() {
 #[test]
 fn a_full_tower_status_fits_local_socket_frames() {
     use chief::socket::wire::Reply;
-    use numbers_base::{LOCAL_FRAME_MAX, encode_frame};
+    use numbers_base::{LOCAL_FRAME_MAX, MAX_TOWERS, encode_frame};
 
     // Quotes and backslashes each double in JSON after cleaning.
     let worst = "\"\\".repeat(TOWER_TEXT_MAX_BYTES);
     let reason = clean_tower_display(&worst);
     assert_eq!(reason.len(), TOWER_TEXT_MAX_BYTES);
-    // Eight is the tower set limit (numbers::MAX_TOWERS), with no frontend dependency on numbers.
-    let towers = (0..8)
+    let towers = (0..MAX_TOWERS as u16)
         .map(|offset| {
             tower(
                 3340 + offset,
@@ -554,6 +627,41 @@ fn a_full_tower_status_fits_local_socket_frames() {
         matches!(encode_frame(&event, LOCAL_FRAME_MAX), Ok(frame) if frame.len() < LOCAL_FRAME_MAX)
     );
     assert_eq!(TOWER_TEXT_MAX_BYTES, 1024);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_full_candidate_page_fits_local_socket_frames() {
+    use chief::socket::wire::Reply;
+    use numbers_base::{LOCAL_FRAME_MAX, MAX_TOWERS, canonical_tower_url, encode_frame};
+
+    let groups: Vec<_> = (0..TOWER_CANDIDATES_PAGE_MAX_GROUPS)
+        .map(|peer| TowerCandidateGroup {
+            peer: format!("peer-{peer:027}"),
+            candidates: (0..MAX_TOWERS)
+                .map(|tower| {
+                    let suffix = "a".repeat(59);
+                    let label_63 = "b".repeat(63);
+                    let label_43 = "c".repeat(43);
+                    let url = format!(
+                        "https://{peer:02}{tower:02}{suffix}.{label_63}.{label_63}.{label_43}.synthetic.invalid:65535/"
+                    );
+                    assert_eq!(url.len(), 268);
+                    assert_eq!(canonical_tower_url(&url).unwrap(), url);
+                    TowerCandidate { url }
+                })
+                .collect(),
+        })
+        .collect();
+    assert!(groups.iter().all(|g| g.peer.len() == PEER_NAME_MAX_BYTES));
+    let page = TowerCandidatesPage {
+        next_after_peer: groups.last().map(|g| g.peer.clone()),
+        groups,
+    };
+    let reply = Reply::Ok {
+        response: Response::TowerCandidates { page },
+    };
+    assert!(encode_frame(&reply, LOCAL_FRAME_MAX).unwrap().len() < 96 * 1024);
 }
 
 // 2. Golden JSON.
@@ -594,6 +702,11 @@ fn errors_have_this_json() {
             },
             r#"{"type":"invalid","field":"body","reason":"must not be empty"}"#,
         ),
+        (ApiError::TowersPinned, r#"{"type":"towers_pinned"}"#),
+        (
+            ApiError::TowerSetFull { max: 8 },
+            r#"{"type":"tower_set_full","max":8}"#,
+        ),
         (ApiError::Stopping, r#"{"type":"stopping"}"#),
         (
             ApiError::IncompatibleApi {
@@ -625,6 +738,59 @@ fn label_enums_are_bare_strings() {
             r#""srv""#,
             r#""peer""#
         ]
+    );
+}
+
+#[test]
+fn tower_outcome_labels_are_bare_strings() {
+    assert_golden(&[
+        (TowerAddOutcome::Added, r#""added""#),
+        (TowerAddOutcome::AlreadyInSet, r#""already_in_set""#),
+    ]);
+    assert_golden(&[
+        (TowerRemoveOutcome::Removed, r#""removed""#),
+        (TowerRemoveOutcome::NotInSet, r#""not_in_set""#),
+    ]);
+}
+
+#[test]
+fn candidate_cursors_are_optional_and_extra_fields_are_ignored() {
+    let request = Request::TowerCandidates {
+        after_peer: None,
+        limit: 0,
+    };
+    assert_eq!(
+        serde_json::from_value::<Request>(json!({
+            "type": "tower_candidates", "limit": 0, "after_peer": null, "extra": 0,
+        }))
+        .unwrap(),
+        request,
+    );
+    let mut value = json!({
+        "type": "tower_candidates",
+        "page": {
+            "next_after_peer": null,
+            "extra": 0,
+            "groups": [{
+                "peer": "bob",
+                "extra": 0,
+                "candidates": [{"url": CANDIDATE_URL, "extra": 0}],
+            }],
+        },
+        "extra": 0,
+    });
+    let decoded: Response = serde_json::from_value(value.clone()).unwrap();
+    value["page"]
+        .as_object_mut()
+        .unwrap()
+        .remove("next_after_peer");
+    assert_eq!(serde_json::from_value::<Response>(value).unwrap(), decoded);
+    assert_eq!(
+        serde_json::to_value(decoded).unwrap(),
+        json!({
+            "type": "tower_candidates",
+            "page": {"groups": [{"peer": "bob", "candidates": [{"url": CANDIDATE_URL}]}]},
+        })
     );
 }
 
@@ -753,6 +919,8 @@ fn an_unknown_type_does_not_decode() {
     assert!(serde_json::from_value::<Direction>(json!("sideways")).is_err());
     assert!(serde_json::from_value::<FailReason>(json!("quota")).is_err());
     assert!(serde_json::from_value::<TowerSource>(json!("unknown")).is_err());
+    assert!(serde_json::from_value::<TowerAddOutcome>(json!("unknown")).is_err());
+    assert!(serde_json::from_value::<TowerRemoveOutcome>(json!("unknown")).is_err());
 
     // The decoder's message names the unknown variant: the socket server passes it on in
     // `ApiError::BadRequest`.
@@ -765,6 +933,15 @@ fn a_missing_tag_or_required_field_does_not_decode() {
     assert!(serde_json::from_value::<Request>(json!({"peer": "bob", "body": "x"})).is_err());
     assert!(serde_json::from_value::<Request>(json!({"type": "send", "peer": "bob"})).is_err());
     assert!(serde_json::from_value::<Request>(json!({"type": "log"})).is_err());
+    for request in ["tower_candidates", "tower_add", "tower_remove"] {
+        assert!(serde_json::from_value::<Request>(json!({"type": request})).is_err());
+    }
+    assert!(
+        serde_json::from_value::<Response>(json!({
+            "type": "tower_remove", "url": CANDIDATE_URL,
+        }))
+        .is_err()
+    );
     assert!(serde_json::from_value::<Request>(json!({"type": "message", "seq": -1})).is_err());
 }
 
@@ -835,6 +1012,8 @@ fn errors_display_as_sentences() {
             "station STATION-B already belongs to peer robert",
             "message 7 is not in the station's log",
             "invalid body: must not be empty",
+            "this station uses pinned towers for this run",
+            "the tower set is full (maximum 8)",
             "the station is shutting down",
             "station error: writing the peer book failed",
             "the station could not read the request: unknown variant `frobnicate`",
@@ -864,8 +1043,8 @@ fn fail_reasons_follow_the_peer_name() {
 }
 
 #[test]
-fn api_version_is_two_and_exported_at_the_root() {
-    assert_eq!(chief::API_VERSION, 2);
+fn api_version_is_three_and_exported_at_the_root() {
+    assert_eq!(chief::API_VERSION, 3);
     assert_eq!(chief::API_VERSION, chief::api::API_VERSION);
 }
 

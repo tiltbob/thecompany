@@ -17,8 +17,8 @@
 //! - [`Request`], [`Response`], [`Event`], [`ApiError`], [`TowerState`] and [`MessageStatus`] are
 //!   internally tagged: `{"type":"<variant in snake_case>", ...fields}`, for example
 //!   `{"type":"peer_add","name":"bob","station_id":"..."}` or `{"type":"status"}`.
-//! - The label enums [`Link`], [`Direction`], [`FailReason`] and [`TowerSource`] are bare
-//!   snake_case strings, for example `"relayed"`.
+//! - The label enums [`Link`], [`Direction`], [`FailReason`], [`TowerSource`], [`TowerAddOutcome`]
+//!   and [`TowerRemoveOutcome`] are bare snake_case strings, for example `"relayed"`.
 //! - Field names are the Rust names. Unknown fields are ignored on input, at every level.
 //! - An `Option` field that is `None` is left out on output. A missing field or `null` reads as
 //!   `None`.
@@ -146,6 +146,58 @@
 //!     the answer, and pushes the change's events as always. A frontend that needs to know reads
 //!     the state again (the log, the peer book) before it repeats a change; a repeated
 //!     [`Request::Send`] is a second message.
+//! 13. **Candidate paging.** [`Request::TowerCandidates`] shows the latest valid whole tower
+//!     announcement from each logical peer. Any of that peer's stations can replace its set,
+//!     including with an empty set. Removing the peer or restarting the station forgets the set.
+//!     Candidate URLs are canonical HTTPS root URLs as stored, including ASCII names for IDNs,
+//!     with at most [`numbers_base::MAX_TOWERS`] distinct URLs per peer. Validation performs no
+//!     lookup or probe. Receiving or listing a candidate never initiates a connection to its URL,
+//!     installs it or re-shares it. Candidates are outside rules 2, 3 and 5: receipt emits no event
+//!     and listing is not a stream snapshot.
+//!     The station filters out all URLs in its installed set, including denied towers currently
+//!     outside the relay map, then omits empty groups. An empty terminal listing means only that
+//!     no cached set names an outside URL after the requested boundary.
+//!
+//!     Groups are ordered by peer name, byte for byte. Only names strictly after `after_peer`
+//!     match. This boundary is not validated and need not name a current peer. A page returns up
+//!     to `min(limit, TOWER_CANDIDATES_PAGE_MAX_GROUPS)` matching groups and at least one if any
+//!     match and `limit > 0`. [`TowerCandidatesPage::next_after_peer`] is `None` only at the end.
+//!     If more groups match, it is the last returned peer, or, for `limit: 0`, the requested
+//!     `after_peer` (the empty string if absent). Echoing a supplied boundary at a zero limit
+//!     remains subject to the transport's frame limit. Use a returned cursor as the next
+//!     exclusive boundary. Pagination is live. A frontend reading several pages binds to the
+//!     instance that supplied them (see [`crate::client::Client::bound_to`]).
+//! 14. **Explicit tower changes.** [`Request::TowerAdd`] and [`Request::TowerRemove`] first
+//!     validate and canonicalize the supplied URL with [`check_tower_url`], then refuse with
+//!     [`ApiError::TowersPinned`] if this run uses pins. This includes adds of installed URLs and
+//!     removes of absent URLs. An add of an installed URL answers with its existing [`TowerStatus`]
+//!     and [`TowerAddOutcome::AlreadyInSet`]. Otherwise, an add fails with
+//!     [`ApiError::TowerSetFull`] if the installed set is full, including denied towers. A new
+//!     entry uses the explicit-URL defaults for QUIC address discovery (UDP 7842 for HTTPS, off
+//!     for loopback HTTP), independent of peer-advertised settings. Its source is
+//!     [`TowerSource::Peer`] if a cached peer announcement named the URL at adoption, otherwise
+//!     [`TowerSource::Configured`]. Success does not promise a working connection.
+//!
+//!     Removing an absent URL answers with the canonical URL and [`TowerRemoveOutcome::NotInSet`].
+//!     The chief may remove the last entry. Removal creates no exclusion list: SRV can rediscover
+//!     the URL and a retained peer announcement can make it a candidate again. An existing home
+//!     relay connection may continue after removal. A real bootstrap domain change discards the
+//!     old domain's set, including adopted entries.
+//!
+//!     A real change stores the complete remembered set and its provenance, applies the set,
+//!     pushes [`Event::Status`], then answers [`TowerAddOutcome::Added`] or
+//!     [`TowerRemoveOutcome::Removed`]. When a persisted set is loaded again, its towers are shown
+//!     as [`TowerSource::Remembered`]. A failure before the rename leaves the visible set
+//!     unchanged and answers [`ApiError::Internal`]. After a visible rename with failed directory
+//!     sync, the station applies the visible set and pushes its Status event, then answers
+//!     [`ApiError::Internal`].
+//!
+//!     Ordinarily an already-installed add or absent remove writes nothing, changes no
+//!     provenance and pushes no event. While the visible set's durability is uncertain, either
+//!     otherwise no-op request repeats the whole atomic write of the same current content and
+//!     original provenance: temporary file, file sync, rename, then directory sync. The retry
+//!     pushes no second Status event. It answers with the no-op outcome only if the whole write
+//!     is durable and answers [`ApiError::Internal`] again on failure.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -169,7 +221,10 @@ use std::fmt;
 ///
 /// Version 2 adds [`TowerState::Standby`]. The optional tower source and bootstrap domain can
 /// be absent from older JSON.
-pub const API_VERSION: u32 = 2;
+///
+/// Version 3 adds paged tower candidates, explicit tower additions and removals, and the two
+/// typed tower-set refusals.
+pub const API_VERSION: u32 = 3;
 
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
@@ -193,6 +248,11 @@ pub const LOG_PAGE_MAX_MESSAGES: u32 = 1000;
 /// a [`Response::Log`] well under the local socket's 1 MiB frame cap.
 pub const LOG_PAGE_MAX_BYTES: usize = 512 * 1024;
 
+/// The most peer groups one [`Request::TowerCandidates`] returns, whatever its `limit` says.
+/// Each group has at most [`numbers_base::MAX_TOWERS`] canonical URLs. A full page with its
+/// generated peer-name cursor fits within the local socket frame limit.
+pub const TOWER_CANDIDATES_PAGE_MAX_GROUPS: u32 = 32;
+
 /// How many accepted incoming messages the station remembers, by peer and id, to recognise a
 /// message that is sent again (rule 8 in the [module docs](self)).
 pub const RECEIPT_WINDOW: usize = 1000;
@@ -204,6 +264,27 @@ pub const RECEIPT_WINDOW: usize = 1000;
 pub enum Request {
     /// This station's id, instance and towers. Answer: [`Response::Status`].
     Status,
+    /// A page of peer-supplied tower candidates (rule 13). Answer: [`Response::TowerCandidates`].
+    TowerCandidates {
+        /// Exclusive lexical boundary. `None` starts at the first eligible peer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_peer: Option<String>,
+        /// The most groups wanted. A zero limit checks for more without returning groups.
+        limit: u32,
+    },
+    /// Explicitly adds a tower (rule 14). Answer: [`Response::TowerAdd`]. Errors:
+    /// [`ApiError::Invalid`] (field `url`), [`ApiError::TowersPinned`],
+    /// [`ApiError::TowerSetFull`] or [`ApiError::Internal`].
+    TowerAdd {
+        /// The chief's URL, validated and canonicalized by the station.
+        url: String,
+    },
+    /// Explicitly removes a tower (rule 14). Answer: [`Response::TowerRemove`]. Errors:
+    /// [`ApiError::Invalid`] (field `url`), [`ApiError::TowersPinned`] or [`ApiError::Internal`].
+    TowerRemove {
+        /// The chief's URL, validated and canonicalized by the station.
+        url: String,
+    },
     /// The peer book with the state of every link. Answer: [`Response::Peers`].
     Peers,
     /// Adds the station `station_id` to the peer `name`, creating the peer if needed (rule 10).
@@ -259,6 +340,25 @@ pub enum Response {
     Status {
         /// The station's status.
         status: Status,
+    },
+    /// The answer to [`Request::TowerCandidates`].
+    TowerCandidates {
+        /// The page.
+        page: TowerCandidatesPage,
+    },
+    /// The answer to [`Request::TowerAdd`].
+    TowerAdd {
+        /// The installed tower, with its canonical URL.
+        tower: TowerStatus,
+        /// Whether the call added it.
+        outcome: TowerAddOutcome,
+    },
+    /// The answer to [`Request::TowerRemove`].
+    TowerRemove {
+        /// The canonical URL checked for removal.
+        url: String,
+        /// Whether the call removed it.
+        outcome: TowerRemoveOutcome,
     },
     /// The answer to [`Request::Peers`].
     Peers {
@@ -345,17 +445,83 @@ pub struct TowerStatus {
     pub source: Option<TowerSource>,
 }
 
+/// A live page of peer-supplied tower candidates (rule 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TowerCandidatesPage {
+    /// Nonempty candidate groups in ascending peer-name byte order.
+    pub groups: Vec<TowerCandidateGroup>,
+    /// Exclusive boundary of the next page, or `None` at the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after_peer: Option<String>,
+}
+
+/// The eligible URLs from one logical peer's latest valid announcement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TowerCandidateGroup {
+    /// The peer's local name in the station's peer book.
+    pub peer: String,
+    /// The peer-supplied candidates, in announcement order.
+    pub candidates: Vec<TowerCandidate>,
+}
+
+/// A tower URL supplied by the peer named in its group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TowerCandidate {
+    /// A validated canonical HTTPS root URL, displayed as stored.
+    pub url: String,
+}
+
+/// What an explicit tower addition did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TowerAddOutcome {
+    /// The tower was added.
+    Added,
+    /// The tower was already installed.
+    AlreadyInSet,
+}
+
+/// The typed result of [`crate::client::Client::tower_add`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TowerAddResult {
+    /// The installed tower, with its canonical URL.
+    pub tower: TowerStatus,
+    /// Whether the call added it.
+    pub outcome: TowerAddOutcome,
+}
+
+/// What an explicit tower removal did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TowerRemoveOutcome {
+    /// The tower was removed.
+    Removed,
+    /// The tower was absent.
+    NotInSet,
+}
+
+/// The typed result of [`crate::client::Client::tower_remove`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TowerRemoveResult {
+    /// The canonical URL checked for removal.
+    pub url: String,
+    /// Whether the call removed it.
+    pub outcome: TowerRemoveOutcome,
+}
+
 /// How the station learned about a tower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TowerSource {
-    /// From the station's explicit configuration.
+    /// From the station's explicit configuration or a URL the chief added that no cached peer
+    /// announcement named at adoption.
     Configured,
     /// From a previously stored tower set.
     Remembered,
     /// From a DNS SRV lookup.
     Srv,
-    /// From another station's advertised tower set, adopted at the chief's explicit request.
+    /// A cached peer announcement named the URL when the chief adopted it. This label
+    /// changes neither behavior nor priority.
     Peer,
 }
 
@@ -543,6 +709,13 @@ pub enum ApiError {
         /// What is wrong, as display text that follows "invalid {field}: ".
         reason: String,
     },
+    /// This run uses a pinned tower set. Explicit additions and removals are refused.
+    TowersPinned,
+    /// All slots in the installed tower set are in use. Remove a tower to make room.
+    TowerSetFull {
+        /// The maximum number of installed towers, including denied ones.
+        max: u32,
+    },
     /// The station is shutting down and takes no more calls.
     Stopping,
     /// The station failed in a way the caller cannot fix, for example writing its peer book.
@@ -599,6 +772,8 @@ impl fmt::Display for ApiError {
             }
             Self::MessageNotFound { seq } => write!(f, "message {seq} is not in the station's log"),
             Self::Invalid { field, reason } => write!(f, "invalid {field}: {reason}"),
+            Self::TowersPinned => f.write_str("this station uses pinned towers for this run"),
+            Self::TowerSetFull { max } => write!(f, "the tower set is full (maximum {max})"),
             Self::Stopping => f.write_str("the station is shutting down"),
             Self::Internal { detail } => write!(f, "station error: {detail}"),
             Self::BadRequest { detail } => {
@@ -623,6 +798,17 @@ impl fmt::Display for ApiError {
 }
 
 impl std::error::Error for ApiError {}
+
+/// Canonicalizes a chief-supplied tower URL without any lookup or probe.
+///
+/// Accepts HTTPS or loopback HTTP as defined by [`numbers_base::canonical_tower_url`].
+/// The fixed diagnostic in [`ApiError::Invalid`] (field `url`) never quotes the supplied URL.
+pub fn check_tower_url(url: &str) -> Result<String, ApiError> {
+    numbers_base::canonical_tower_url(url).map_err(|error| ApiError::Invalid {
+        field: "url".to_owned(),
+        reason: error.to_string(),
+    })
+}
 
 /// Whether rule 9 (in the [module docs](self)) replaces `c` in text that came from a peer or a
 /// tower: a control character (`char::is_control`: C0, DEL and C1), U+2028 or U+2029, or one of
