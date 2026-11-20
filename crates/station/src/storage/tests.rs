@@ -359,6 +359,13 @@ fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
 }
 
 #[test]
+fn production_staging_suffixes_are_fresh_per_draw() {
+    let first = random_staging_suffix().expect("draw first suffix");
+    let second = random_staging_suffix().expect("draw second suffix");
+    assert!(first != second, "production staging suffixes must differ");
+}
+
+#[test]
 fn all_legacy_staging_names_can_be_occupied_without_blocking_a_save() {
     let (_temp, path) = scratch();
     let storage = Storage::lock(&path).expect("lock fixture");
