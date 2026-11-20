@@ -5,7 +5,12 @@
 //! [`subscription`]: the transport keeps the [`EventSink`] and pushes events into it; the frontend
 //! pulls them from the [`Subscription`]. The rules both sides keep are in [`crate::api`].
 //!
-//! The attach order for a live view of the log is [`Client::follow_log`] in [`crate::follow`].
+//! [`SocketTransport`] (Unix) is the transport over the station's local socket; it lives in
+//! `crate::socket` with the socket's envelope. The attach order for a live view of the log is
+//! [`Client::follow_log`] in [`crate::follow`].
+
+#[cfg(unix)]
+pub use crate::socket::{DEFAULT_CALL_TIMEOUT, SocketTransport};
 
 use crate::api::{
     ApiError, Event, LogPage, Message, MessageStatus, Peer, Request, Response, Status,
@@ -31,7 +36,8 @@ pub trait Transport: Send + Sync + 'static {
     /// Makes one call. Answers with the [`Response`] variant the request names, or with an
     /// [`ApiError`]: the station's refusal, passed through unchanged, or the transport's own
     /// failure ([`ApiError::NotRunning`], [`ApiError::IncompatibleApi`],
-    /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`]).
+    /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`], and from the
+    /// socket transport [`ApiError::BadRequest`] for a request too large for one frame).
     ///
     /// Dropping the future does not take the request back: the station may still carry it out, as
     /// after a lost answer (rule 12 in [`crate::api`]).
