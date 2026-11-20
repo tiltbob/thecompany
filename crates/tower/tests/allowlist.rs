@@ -4,134 +4,20 @@
 //! Every endpoint is relay-only and every id is generated at run time. Assertions compare ids
 //! with `assert!(a == b)` so that a failure prints no id.
 
-use std::future::Future;
+mod common;
+
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::{Connection, PortmapperConfig, RelayStatus, presets};
-use iroh::{
-    Endpoint, EndpointAddr, NetReportConfig, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
-    Watcher,
+use common::{
+    ALPN, DENIED_WITHIN, DENY_REASON, accept, bounded, connected, denial, dial_addr, online, spawn,
+    station, stays_pending,
 };
+use iroh::SecretKey;
 use numbers_tower::{Tower, TowerConfig, TowerError};
-use tokio::time::timeout;
-
-const ALPN: &[u8] = b"test/tower/0";
-const DENY_REASON: &str = "not on this tower's list";
-/// Bounds every test, so that a regression fails instead of hanging.
-const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Under load a home relay may be selected only on the next net report (20-26 s later).
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long an unlisted endpoint must stay offline, and how soon it must see the denial.
-const DENIED_WITHIN: Duration = Duration::from_secs(10);
 
 fn loopback() -> TowerConfig {
     TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into())
-}
-
-async fn spawn(config: TowerConfig) -> (Tower, RelayUrl) {
-    let tower = Tower::spawn(config)
-        .await
-        .unwrap_or_else(|_| panic!("start loopback tower"));
-    let url = tower
-        .url()
-        .parse()
-        .unwrap_or_else(|_| panic!("parse tower URL"));
-    (tower, url)
-}
-
-/// A relay-only endpoint homed on `tower`, with the same settings a station uses.
-async fn station(key: SecretKey, tower: &RelayUrl) -> Endpoint {
-    let relays = RelayMap::from_iter([RelayConfig::new(tower.clone(), None)]);
-    let mut net_report = NetReportConfig::default();
-    net_report.captive_portal_check = false;
-    Endpoint::builder(presets::Minimal)
-        .secret_key(key)
-        .relay_mode(RelayMode::Custom(relays))
-        .clear_ip_transports()
-        .portmapper_config(PortmapperConfig::Disabled)
-        .net_report_config(net_report)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap_or_else(|_| panic!("bind endpoint"))
-}
-
-/// The home relay status as text, for failure messages. It carries no id.
-fn status(endpoint: &Endpoint) -> String {
-    format!("{:?}", endpoint.home_relay_status().get())
-}
-
-/// Whether the endpoint reports a connection to its home relay.
-fn connected(endpoint: &Endpoint) -> bool {
-    endpoint
-        .home_relay_status()
-        .get()
-        .iter()
-        .any(RelayStatus::is_connected)
-}
-
-async fn online(endpoint: &Endpoint) {
-    if timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
-        panic!(
-            "endpoint not online after 30 s; home relay status: {}",
-            status(endpoint)
-        );
-    }
-}
-
-/// Waits until the home relay reports a denial, and returns its reason.
-async fn denial(endpoint: &Endpoint) -> String {
-    let mut watcher = endpoint.home_relay_status();
-    let wait = async {
-        loop {
-            let reason = watcher
-                .get()
-                .iter()
-                .find_map(|relay: &RelayStatus| relay.auth_denied_reason().map(str::to_owned));
-            if let Some(reason) = reason {
-                return reason;
-            }
-            if watcher.updated().await.is_err() {
-                panic!("home relay status watcher closed");
-            }
-        }
-    };
-    match timeout(DENIED_WITHIN, wait).await {
-        Ok(reason) => reason,
-        Err(_) => panic!(
-            "no denial within 10 s; home relay status: {}",
-            status(endpoint)
-        ),
-    }
-}
-
-/// Fails unless `future` is still pending after `within`.
-async fn stays_pending<F: Future>(within: Duration, future: F, what: &str) {
-    assert!(timeout(within, future).await.is_err(), "{what}");
-}
-
-fn dial_addr(endpoint: &Endpoint, tower: &RelayUrl) -> EndpointAddr {
-    EndpointAddr::new(endpoint.id()).with_relay_url(tower.clone())
-}
-
-async fn accept(endpoint: &Endpoint) -> Connection {
-    let incoming = endpoint
-        .accept()
-        .await
-        .unwrap_or_else(|| panic!("endpoint closed"));
-    let accepting = incoming
-        .accept()
-        .unwrap_or_else(|_| panic!("accept incoming connection"));
-    accepting
-        .await
-        .unwrap_or_else(|_| panic!("complete incoming connection"))
-}
-
-async fn bounded(test: impl Future<Output = ()>) {
-    if timeout(TEST_TIMEOUT, test).await.is_err() {
-        panic!("test timed out after {TEST_TIMEOUT:?}");
-    }
 }
 
 #[tokio::test]
