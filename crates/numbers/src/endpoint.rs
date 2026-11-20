@@ -5,6 +5,7 @@ use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as SnapshotMutex, MutexGuard, PoisonError, Weak};
 use std::task::Poll;
+use std::time::Duration;
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::dns::DnsResolver;
@@ -20,6 +21,8 @@ use tokio::sync::Mutex;
 
 use crate::gate::Gate;
 use crate::{Authorizer, MAX_TOWERS, NodeId, TowerSet};
+
+pub(crate) const QUIC_KEEPALIVE: Duration = Duration::from_secs(5);
 
 /// Endpoint settings supplied by the station.
 #[derive(Clone, Debug, Default)]
@@ -324,6 +327,8 @@ impl Endpoint {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(16u32.into())
             .max_concurrent_uni_streams(0u32.into())
+            .keep_alive_interval(QUIC_KEEPALIVE)
+            .default_path_keep_alive_interval(QUIC_KEEPALIVE)
             .build();
         let dns_resolver = DnsResolver::builder()
             .with_system_defaults()
