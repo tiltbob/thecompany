@@ -39,10 +39,14 @@
 //! - Exactly one of `[tls]` (certificate files, read and reloaded once a day by the tower) and
 //!   `[acme]` (a Let's Encrypt certificate; see [`CertSource::Acme`](crate::CertSource::Acme))
 //!   must be given. With `[acme]`, the host name needs at least two labels, the contact is
-//!   `mailto:` and one address, and the cache directory holds the tower's keys: when the tower
-//!   starts it creates a missing one with mode 0700 and refuses one that the group or others
-//!   can access (on unix). The loaded configuration says what to do; only starting the tower
-//!   checks these.
+//!   `mailto:` and one address, and the cache directory holds the tower's keys. It must be
+//!   private to, owned by and writable for the tower's user: when the tower starts it creates
+//!   a missing one with mode 0700, and refuses one that the group or others can access, that
+//!   another user owns (on unix), or that it cannot write. The loaded configuration says what
+//!   to do; only starting the tower checks these.
+//! - A host name or path that is present but empty is refused with its key (`hostname`,
+//!   `allow_file`, `[tls] cert`, `[tls] key`, `[acme] contact`, `[acme] cache_dir`): an empty
+//!   path would otherwise name the config's directory or the working directory.
 //! - A production tower is not an open relay by accident: either `allow_file` names the list of
 //!   endpoint ids it admits, or `open = true` admits everybody. Both together, or neither, is an
 //!   error.
@@ -161,6 +165,14 @@ pub enum ConfigError {
         /// The key, for example ``hostname`` or ``[tls] cert``.
         key: &'static str,
     },
+    /// A key that names a host, an address or a path is empty.
+    ///
+    /// An empty path would name the config file's directory, or with a relative config path
+    /// the working directory: for `[acme] cache_dir` the ACME client would write its keys there.
+    Empty {
+        /// The key, for example ``[acme] cache_dir``.
+        key: &'static str,
+    },
     /// Both `[tls]` and `[acme]` are given.
     BothTlsAndAcme,
     /// Neither `[tls]` nor `[acme]` is given.
@@ -217,6 +229,7 @@ impl fmt::Display for ConfigError {
                 OnLine(*line)
             ),
             Self::Missing { key } => write!(f, "`{key}` is missing in the config file"),
+            Self::Empty { key } => write!(f, "`{key}` is empty in the config file"),
             Self::BothTlsAndAcme => f.write_str("`[tls]` and `[acme]` are both given"),
             Self::NoCertificateSource => f.write_str("neither `[tls]` nor `[acme]` is given"),
             Self::OpenAndAllowFile => f.write_str("`open = true` and `allow_file` are both given"),
@@ -294,25 +307,19 @@ pub fn load(path: &Path) -> Result<TowerConfig, ConfigError> {
 /// blocks on that read.
 pub fn parse(text: &str, base_dir: &Path) -> Result<TowerConfig, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|error| toml_error(&error, text))?;
-    let hostname = raw
-        .hostname
-        .ok_or(ConfigError::Missing { key: "hostname" })?;
+    let hostname = present(raw.hostname, "hostname")?;
 
     let tls = match (raw.tls, raw.acme) {
         (Some(_), Some(_)) => return Err(ConfigError::BothTlsAndAcme),
         (None, None) => return Err(ConfigError::NoCertificateSource),
         (Some(tls), None) => {
-            let cert = tls.cert.ok_or(ConfigError::Missing { key: "[tls] cert" })?;
-            let key = tls.key.ok_or(ConfigError::Missing { key: "[tls] key" })?;
+            let cert = present(tls.cert, "[tls] cert")?;
+            let key = present(tls.key, "[tls] key")?;
             TlsTower::new(hostname, base_dir.join(cert), base_dir.join(key))
         }
         (None, Some(acme)) => {
-            let contact = acme.contact.ok_or(ConfigError::Missing {
-                key: "[acme] contact",
-            })?;
-            let cache_dir = acme.cache_dir.ok_or(ConfigError::Missing {
-                key: "[acme] cache_dir",
-            })?;
+            let contact = present(acme.contact, "[acme] contact")?;
+            let cache_dir = present(acme.cache_dir, "[acme] cache_dir")?;
             TlsTower::acme(hostname, contact, base_dir.join(cache_dir))
                 .production(acme.production.unwrap_or(false))
         }
@@ -349,6 +356,7 @@ pub fn parse(text: &str, base_dir: &Path) -> Result<TowerConfig, ConfigError> {
         (false, None) => Err(ConfigError::NoAccessRule),
         (true, None) => Ok(config.allow_everyone()),
         (false, Some(allow_file)) => {
+            let allow_file = present(Some(allow_file), "allow_file")?;
             let text = read_text(
                 &base_dir.join(allow_file),
                 ConfigFile::Allow,
@@ -357,6 +365,19 @@ pub fn parse(text: &str, base_dir: &Path) -> Result<TowerConfig, ConfigError> {
             Ok(config.allow(parse_allow_file(&text)?))
         }
     }
+}
+
+/// The value of a required key that must not be empty: `Missing` when it is absent, `Empty`
+/// when it is empty.
+fn present<T: AsRef<std::ffi::OsStr>>(
+    value: Option<T>,
+    key: &'static str,
+) -> Result<T, ConfigError> {
+    let value = value.ok_or(ConfigError::Missing { key })?;
+    if value.as_ref().is_empty() {
+        return Err(ConfigError::Empty { key });
+    }
+    Ok(value)
 }
 
 /// Parses the text of an allow file into its endpoint ids, in file order.
@@ -635,7 +656,46 @@ mod tests {
                 ConfigError::ZeroBurst,
             ),
         ] {
-            assert_eq!(error(&text, dir.path()), expected, "{text}");
+            assert!(error(&text, dir.path()) == expected, "case {expected:?}");
+        }
+    }
+
+    /// An empty host name or path is refused with its key; an empty cache directory would name
+    /// the working directory (with a relative config path, as here) or the config's directory.
+    #[test]
+    fn refuses_empty_values_with_their_key() {
+        let (dir, _) = dir_with_allow_file();
+        let tls = "[tls]\ncert = \"c.pem\"\nkey = \"k.pem\"\n";
+        let named = "hostname = \"t.example.com\"\nallow_file = \"allow.txt\"\n";
+        let acme = |contact: &str, cache: &str| {
+            format!(
+                "hostname = \"t.example.com\"\nopen = true\n\
+                 [acme]\ncontact = \"{contact}\"\ncache_dir = \"{cache}\"\n"
+            )
+        };
+        for (text, key) in [
+            (
+                format!("hostname = \"\"\nallow_file = \"allow.txt\"\n{tls}"),
+                "hostname",
+            ),
+            (
+                format!("{named}[tls]\ncert = \"\"\nkey = \"k.pem\"\n"),
+                "[tls] cert",
+            ),
+            (
+                format!("{named}[tls]\ncert = \"c.pem\"\nkey = \"\"\n"),
+                "[tls] key",
+            ),
+            (
+                format!("hostname = \"t.example.com\"\nallow_file = \"\"\n{tls}"),
+                "allow_file",
+            ),
+            (acme("mailto:o@example.com", ""), "[acme] cache_dir"),
+            (acme("", "a"), "[acme] contact"),
+        ] {
+            for base in [Path::new(""), dir.path()] {
+                assert_eq!(error(&text, base), ConfigError::Empty { key }, "{key}");
+            }
         }
     }
 
@@ -687,7 +747,7 @@ mod tests {
                 ConfigError::Syntax { line: Some(2) },
             ),
         ] {
-            assert_eq!(error(&text, dir.path()), expected, "{text}");
+            assert!(error(&text, dir.path()) == expected, "case {expected:?}");
         }
     }
 
@@ -798,7 +858,7 @@ mod tests {
     }
 
     /// One leading byte-order mark is ignored in the allow file, as the TOML parser ignores one
-    /// in the config file.
+    /// in the config file; a mark at the start of a later line is not.
     #[test]
     fn a_leading_byte_order_mark_is_ignored_in_both_files() {
         let an_id = id();
@@ -811,7 +871,14 @@ mod tests {
         )
         .unwrap();
         let config = parse(&format!("\u{feff}{MINIMAL}"), dir.path()).unwrap();
-        assert!(config.allow == Some(vec![an_id]));
+        assert!(config.allow == Some(vec![an_id.clone()]));
+        // Only the mark at the start of the file: one at the start of a later line is part of
+        // that line's entry, which is then not an id.
+        assert!(
+            parse_allow_file(&format!("{an_id}\n\u{feff}{an_id}\n"))
+                == Err(ConfigError::InvalidAllowEntry { line: 2 }),
+            "a byte-order mark at the start of line 2 was ignored"
+        );
     }
 
     /// A file of exactly its cap is read; the test of one byte more is above.
@@ -860,27 +927,31 @@ mod tests {
         assert!(config.allow == Some(ids));
     }
 
-    /// Fails if `error` shows any needle, as text or as decimal or hex byte lists.
+    /// Fails if `error` shows any needle, as text or as decimal or hex byte lists. The failure
+    /// names the needle's position, the rendering and the form, never the text or the needle.
     fn assert_no_leak(error: &ConfigError, needles: &[&str]) {
         let texts = [
-            error.to_string(),
-            format!("{error:?}"),
-            format!("{error:#?}"),
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+            ("pretty Debug", format!("{error:#?}")),
         ];
-        for needle in needles {
+        for (index, needle) in needles.iter().enumerate() {
             let bytes = needle.as_bytes();
             let join =
                 |format: fn(&u8) -> String| bytes.iter().map(format).collect::<Vec<_>>().join(",");
             let forms = [
-                (*needle).to_owned(),
-                join(|b| b.to_string()),
-                join(|b| format!("{b:x}")),
-                join(|b| format!("{b:#x}")),
+                ("as text", (*needle).to_owned()),
+                ("as decimal bytes", join(|b| b.to_string())),
+                ("as hex bytes", join(|b| format!("{b:x}"))),
+                ("as 0x bytes", join(|b| format!("{b:#x}"))),
             ];
-            for text in &texts {
+            for (rendering, text) in &texts {
                 let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                for form in &forms {
-                    assert!(!squeezed.contains(form.as_str()), "{text}");
+                for (form, value) in &forms {
+                    assert!(
+                        !squeezed.contains(value.as_str()),
+                        "the {rendering} of the error shows needle {index} {form}"
+                    );
                 }
             }
         }
