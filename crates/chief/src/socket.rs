@@ -39,6 +39,7 @@ use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
 };
 use numbers_base::{FrameError, LOCAL_FRAME_MAX, encode_frame, read_frame, write_frame};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -142,12 +143,23 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// subscriptions share that handshake, so both are covered.
 ///
 /// Needs a tokio runtime with the time driver; [`Transport::subscribe`] spawns a task on it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SocketTransport {
     path: PathBuf,
     call_timeout: Duration,
     /// The instance this transport is bound to, if any ([`BindInstance`]).
     instance: Option<String>,
+}
+
+/// Shows whether the transport is bound, never the instance id it is bound to.
+impl fmt::Debug for SocketTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SocketTransport")
+            .field("path", &self.path)
+            .field("call_timeout", &self.call_timeout)
+            .field("bound", &self.instance.is_some())
+            .finish()
+    }
 }
 
 impl SocketTransport {

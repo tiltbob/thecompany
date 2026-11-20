@@ -6,6 +6,8 @@
 use chief::api::*;
 use chief::client::{BindInstance, Client};
 use chief::fake::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const ME: &str = "STATION-A";
@@ -93,6 +95,40 @@ async fn a_restart_made_by_the_hook_inside_the_call_is_caught() {
 }
 
 #[tokio::test]
+async fn a_handle_bound_to_a_gone_instance_refuses_before_the_hook_runs() {
+    let fake = station().await;
+    let client = Client::new(fake.bound_to("INSTANCE-1"));
+    fake.restart("INSTANCE-2");
+    // A subscriber of the new instance, through an unbound handle, before the bound calls.
+    let mut events = Client::new(fake.clone()).subscribe().await.unwrap();
+    let recorded = fake.requests();
+    // A hook that, had it run, would leave a log entry and an event behind.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
+    fake.on_call(move |fake, _request| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let _ = fake.receive("bob", "from the hook");
+    });
+
+    let err = client.send("bob", "hello").await.unwrap_err();
+    assert!(is_disconnected(&err), "{err:?}");
+    let err = client.status().await.unwrap_err();
+    assert!(is_disconnected(&err), "{err:?}");
+    let err = client.subscribe().await.unwrap_err();
+    assert!(is_disconnected(&err), "{err:?}");
+
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(fake.messages().is_empty(), "{:?}", fake.messages());
+    assert_eq!(fake.requests(), recorded);
+    assert_eq!(sends(&fake), 0);
+    // No event is queued for the subscriber of the new instance: a stop ends the subscription after
+    // what is still queued, and nothing is.
+    fake.stop();
+    let next = tokio::time::timeout(BOUND, events.next()).await.unwrap();
+    assert_eq!(next, None);
+}
+
+#[tokio::test]
 async fn an_unbound_handle_of_the_same_station_keeps_working() {
     let fake = station().await;
     let bound = Client::new(fake.bound_to("INSTANCE-1"));
@@ -176,4 +212,41 @@ async fn send_and_wait_on_a_bound_client_never_sends_to_a_restarted_station() {
         .unwrap();
     assert_eq!(done.status, MessageStatus::Delivered);
     assert_eq!(sends(&fake), 1);
+}
+
+/// The `{:?}` and `{:#?}` of a bound value say that it is bound, and never name the instance.
+fn assert_debug_hides_the_instance(value: &impl std::fmt::Debug, instance: &str) {
+    for text in [format!("{value:?}"), format!("{value:#?}")] {
+        assert!(!text.contains(instance), "{text}");
+        assert!(text.contains("bound"), "{text}");
+    }
+}
+
+#[test]
+fn a_bound_fake_debug_shows_only_that_it_is_bound() {
+    let fake = FakeStation::new(ME, "INSTANCE-1");
+    let bound = fake.bound_to("PINNED-INSTANCE-7");
+    assert_debug_hides_the_instance(&bound, "PINNED-INSTANCE-7");
+    assert!(format!("{bound:?}").contains("bound: true"), "{bound:?}");
+    assert!(format!("{fake:?}").contains("bound: false"), "{fake:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bound_socket_transport_debug_shows_only_that_it_is_bound() {
+    use chief::socket::SocketTransport;
+    let transport = SocketTransport::new("/nonexistent/chief.sock");
+    let bound = transport.bound_to("PINNED-INSTANCE-7");
+    assert_debug_hides_the_instance(&bound, "PINNED-INSTANCE-7");
+    let text = format!("{bound:?}");
+    assert!(text.contains("bound: true"), "{text}");
+    // What it showed before the binding was added is still there.
+    assert!(
+        text.contains("chief.sock") && text.contains("call_timeout"),
+        "{text}"
+    );
+    assert!(
+        format!("{transport:?}").contains("bound: false"),
+        "{transport:?}"
+    );
 }
