@@ -1603,6 +1603,60 @@ mod tests {
         source.to_string() == "injected sync failure"
     }
 
+    /// How often a create syncs the directory when nothing fails: once in path mode, after
+    /// publication, and twice in descriptor mode, where the check before generation comes first.
+    /// The failing-sync tests below stop at their first failed call and could not see one more.
+    #[test]
+    fn a_successful_create_syncs_the_directory_once_per_step() {
+        let (_t, base) = tmp();
+        let name = OsStr::new("node.key");
+
+        let dir = File::open(&base).unwrap();
+        let calls = Cell::new(0);
+        let created = load_or_create_in(
+            &dir,
+            None,
+            Path::new(name),
+            name,
+            || *KEY,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(created.origin, KeyOrigin::Created);
+        assert_eq!(calls.get(), 2);
+
+        let other = base.join("other");
+        let other_dir = open_private_dir(&other, Create::IfMissing).unwrap();
+        let other_path = other.join(name);
+        let calls = Cell::new(0);
+        let created = load_or_create_in(
+            &other_dir,
+            Some(&other),
+            &other_path,
+            name,
+            || *KEY,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(created.origin, KeyOrigin::Created);
+        assert_eq!(calls.get(), 1);
+
+        let third = base.join("third");
+        let third_dir = open_private_dir(&third, Create::IfMissing).unwrap();
+        let calls = Cell::new(0);
+        create_in(
+            &third_dir,
+            Some(&third),
+            &third.join(name),
+            name,
+            KEY,
+            write_all,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn failed_directory_sync_after_publication_leaves_the_key_published() {
         let (_t, base) = tmp();
