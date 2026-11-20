@@ -3,7 +3,7 @@
 A p2p network, called `numbers`, for a small self-hosted team working with coding agents: chat,
 sockets, files, locks and a persistence layer.
 
-**Status:** the design is settled and the first milestones are being built. Nothing here runs yet.
+**Status:** the loopback dev tower runs. The station and chat tools are in development.
 
 | Name | What it is |
 |---|---|
