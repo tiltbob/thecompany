@@ -286,16 +286,27 @@ and skips that early check. If the connection is still current and has received 
 authenticated QUIC frames since before the request was written, the sender closes it.
 
 On that first attempt, a send waiting to open a stream also checks for authenticated QUIC
-frames. The wait for stream credit allows the greater of `connect_timeout` and the configured
-5 s transport keepalive plus 1 s for its acknowledgement. A quiet link can take a keepalive
-to transmit its queued STREAMS_BLOCKED frame. The observation stays with the current connection
-across short sends and resets when new authenticated frames arrive. A caller checks only within
-its original send deadline. If the observed connection is still current and has made
-no progress for the full interval, the sender closes it and can redial. QUIC replenishes
-credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
+frames. The progress window is `max(connect_timeout, 6 s + 2 × RTT)`, allowing at least the
+configured 5 s keepalive interval plus a 1 s margin and two round trips. Each check reads the
+selected path's current round-trip estimate, using zero if it is unavailable. The observation
+stays with the current connection across short sends and resets when new authenticated frames
+arrive. A caller checks only within its original send deadline. A send that first observes a
+stall can close the connection only if its remaining budget exceeds the window. A later send
+can use the same observation to close and redial if the connection is still current and has made
+no progress for the full window. QUIC replenishes credits in batches. A crash with 14 unanswered
+sends can exhaust those credits on loopback.
 An opt-in tower announcement takes one of those credits, so 13 unanswered chat sends can
 exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
+
+A quiet link can take a keepalive to transmit its queued `STREAMS_BLOCKED` frame. Both sides
+reset their keepalive timers when they send a packet or receive an authenticated packet. The gap
+between frames at the waiting sender can be about 5 s or about 5 s plus a round trip, depending
+on which timer fires first. On a lossless path with a measured 1.53 s round trip, the gap reached
+6.48 s and the previous fixed 6 s window caused a healthy credit-blocked link to close. The extra
+round trips allow for this timing and give a lost probe time to be retransmitted. Packet loss can
+still lengthen the gap beyond the window.
+[#148](https://github.com/tiltbob/thecompany/issues/148)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that
 connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
