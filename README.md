@@ -19,4 +19,5 @@ sockets, files, locks and a persistence layer.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the design
 - [docs/ROADMAP.md](docs/ROADMAP.md) — milestones, what is being built first, open decisions
 - [AGENTS.md](AGENTS.md) — build commands, hard rules, and how the coding agents work here
+- [packaging/systemd/README.md](packaging/systemd/README.md) — running the tower as a systemd service
 - [Roadmap issue](https://github.com/tiltbob/thecompany/issues/1) — status of every milestone
