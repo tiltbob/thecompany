@@ -872,6 +872,9 @@ mod tests {
         // directory; the tower requires mode 0700 when the cache is that directory itself.
         has("StateDirectory", "numbers-tower");
         has("StateDirectoryMode", "0700");
+        // The tower sets no umask of its own, and the ACME client creates the key files in the
+        // cache with mode 0666 under the umask: this makes them 0600 instead of 0644.
+        has("UMask", "0077");
         // The binary exits with a failure when its relay stops by itself and with success on
         // SIGTERM: the first is restarted, a stop is not.
         has("Restart", "on-failure");

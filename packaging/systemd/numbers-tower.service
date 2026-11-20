@@ -23,7 +23,8 @@ RestartPreventExitStatus=2 78
 
 # A user allocated at start and released at stop. It also implies a private /tmp,
 # ProtectSystem=strict, ProtectHome=read-only, NoNewPrivileges=yes, RestrictSUIDSGID=yes and
-# RemoveIPC=yes. The lines at the end repeat two of them and make ProtectHome stricter.
+# RemoveIPC=yes (systemd.exec(5) of systemd 255). NoNewPrivileges= and ProtectSystem= below
+# repeat two of them, and ProtectHome= below is stricter than the implied value.
 DynamicUser=yes
 
 # /var/lib/numbers-tower, owned by the dynamic user and writable despite ProtectSystem=strict.
@@ -37,9 +38,16 @@ StateDirectoryMode=0700
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# The sandbox: each line below takes something away from the service. packaging/systemd/README.md
+# says how a refusal shows in the journal and how to take one line out on a host with a drop-in.
+#
+# Repeated from DynamicUser= above, so that they still hold if a drop-in sets DynamicUser=no:
+# the manual implies them only while DynamicUser= is on.
 NoNewPrivileges=yes
 ProtectSystem=strict
+# /home, /root and /run/user are inaccessible and empty, not only read-only.
 ProtectHome=yes
+# Only IPv4, IPv6 and local (AF_UNIX) sockets can be made.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # Kernel variables in /proc/sys, /sys and a few other /proc files are read-only for the
@@ -80,7 +88,12 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # Only the system calls of systemd's @system-service set. A call outside it fails with EPERM
 # instead of killing the service: systemd 250 to 254 treat calls newer than themselves the same
-# way, and a newer libc may try such a call before it falls back to an older one.
+# way, and a newer libc may try such a call before it falls back to an older one. The set leaves
+# out the calls that ProtectKernelTunables=, ProtectKernelModules=, ProtectKernelLogs=,
+# ProtectClock=, ProtectHostname= and PrivateDevices= refuse above. Those lines stay: each does
+# more than refuse calls (read-only or hidden paths, a smaller capability bounding set, the
+# device policy, its own host name), and they keep refusing the calls if a drop-in takes this
+# filter out.
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 # The service's /proc shows no process of another user.

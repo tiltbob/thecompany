@@ -21,7 +21,8 @@ before the first start anyway, and the tower takes the config path from `ExecSta
 
 The service runs as a user that systemd allocates when it starts (`DynamicUser=yes`). It sees
 the file system read-only, except its state directory and a private `/tmp`, and no home
-directories. `StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
+directories; the rest of its sandbox is under [The sandbox](#the-sandbox).
+`StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
 `/var/lib/private/numbers-tower`, which only root can reach from outside the service. Inside
 the service that directory belongs to the service's user and has mode 0700
 (`StateDirectoryMode=0700`). Seen from outside, its owner depends on the systemd version: the
@@ -239,3 +240,95 @@ The start line then says `certificate="files"`.
 while it runs. The tower reloads its certificate files once a day, but under this drop-in it
 reads the same copies again, so a renewed certificate is used only after
 `sudo systemctl restart numbers-tower`. With certbot, a deploy hook can run that command.
+
+## The sandbox
+
+Besides the dynamic user, the read-only file system and its one capability, the unit takes away
+from the service what a relay does not need. In practice the tower:
+
+- cannot change kernel settings under `/proc/sys` and `/sys`, load kernel modules, read the
+  kernel log, change control groups, set the clock or change the host name;
+- cannot create namespaces, use realtime scheduling or change its execution domain
+  (`personality(2)`);
+- sees a private `/dev` with only `null`, `zero`, `full`, `random`, `urandom` and the TTY
+  devices;
+- cannot make memory writable and executable at once;
+- can make only the system calls of systemd's `@system-service` set, and only through the
+  architecture systemd was built for; another call fails with "permission denied" (`EPERM`),
+  except that systemd 255 answers a call newer than itself with `ENOSYS`;
+- sees no process of another user in `/proc`, and none of its files about the kernel
+  (`/proc/sys`, `/proc/net`, `/proc/meminfo` and the like);
+- creates files that only its own user can read (`UMask=0077`).
+
+Each setting in the unit has a comment that says what it does. The unit needs systemd 250 or
+later: `ProcSubset=pid` together with `ProtectKernelTunables=yes` or `ProtectKernelLogs=yes`
+works from 250 on (systemd's NEWS), and `scripts/check-units.sh` needs 250 too.
+
+To see how much the sandbox leaves open:
+
+```bash
+systemd-analyze security numbers-tower
+```
+
+It prints one line per setting and ends with the overall level. Under systemd 255 this unit
+gives `Overall exposure level for numbers-tower.service: 1.6 OK`, with and without the
+certificate drop-in; the unit before the sandbox gave `5.4 MEDIUM`. Most lines still marked
+`✗` are about the network and `CAP_NET_BIND_SERVICE`, which a relay needs; the others are
+settings the unit does not take, such as `PrivateUsers=` and leaving `@privileged` and
+`@resources` out of the filter.
+
+### When the sandbox refuses something
+
+In the tests (systemd 255) systemd logged nothing when the sandbox refused a call or a path:
+only the tower's own error line showed it, and that line looks like any other permission
+problem. Whether the kernel's audit log records a refused call was not seen there. With a test
+drop-in that took `bind` out of the filter (`SystemCallFilter=~bind`), the journal had:
+
+```text
+tower: cannot bind the plain-HTTP listener (permission denied)
+numbers-tower.service: Main process exited, code=exited, status=1/FAILURE
+numbers-tower.service: Scheduled restart job, restart counter is at 1.
+```
+
+`systemctl status numbers-tower` showed `Active: activating (auto-restart) (Result: exit-code)`
+and `(code=exited, status=1/FAILURE)`, and the tower was started again every 5 seconds. A
+write to a read-only path is refused the same way: with `cache_dir` outside the state directory
+the tower logged `tower: cannot use the ACME cache directory (read-only filesystem or storage
+medium)` and stopped with status 78. A path that the sandbox hides (in `/proc` or `/dev`) is
+"not found" for the service.
+
+A filter that kills instead of answering `EPERM` (the default when `SystemCallErrorNumber=` is
+not set) shows differently: there is no line from the tower, systemd logs
+`Main process exited, code=killed, status=31/SYS`, and `systemctl status` shows
+`(code=killed, signal=SYS)`. This unit answers `EPERM`, so expect the first form.
+
+### Taking one setting out on one host
+
+If a refusal looks like the sandbox's, take the one setting out with a drop-in, restart, and see
+whether the error goes away. An empty value resets a list such as `SystemCallFilter=`; a yes/no
+setting takes `no`, and one with values takes its default (`ProcSubset=all`,
+`ProtectProc=default`). For the system-call filter:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/numbers-tower.service.d
+```
+
+```bash
+printf '[Service]\nSystemCallFilter=\n' | sudo tee /etc/systemd/system/numbers-tower.service.d/no-system-call-filter.conf
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+```bash
+sudo systemctl restart numbers-tower
+```
+
+Under systemd 255, `systemctl status numbers-tower` then lists `no-system-call-filter.conf`
+under `Drop-In:`, `systemctl show -p SystemCallFilter numbers-tower` prints
+`SystemCallFilter=~` (no call is filtered), and `systemd-analyze security` gives `3.0 OK`. The
+other settings, the certificate drop-in and `SystemCallArchitectures=native` stay in force.
+Remove the file, run `sudo systemctl daemon-reload` and restart the tower to put the filter
+back. If the filter was in the way, say which line of the journal showed it in an issue, so the
+unit can be fixed for everyone.
