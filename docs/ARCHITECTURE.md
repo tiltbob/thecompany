@@ -108,29 +108,34 @@ two networks do not meet.
   requires the HSM**. Setting up a new node then needs a second signature from an *enrollment key*
   that lives only on a Nitrokey HSM: commissioning a station, admitting a safehouse (later a
   handler), adding an admin key — and changing this rule. An ordinary admin key still signs
-  first, so every enrollment names a device. The frontend signs through
+  first, so every enrollment names a device; the one exception is recovery, below. The frontend signs through
   PKCS#11; the key never leaves the token, signing needs the token and its PIN, and the roster can
   demand the token's own proof that the key was generated inside it. With one chief this rule is
   what stands between a stolen device with an unlocked admin key and new nodes of the thief's.
-  **Nothing else needs the token.** Not daily use — chat, airspace, driving safehouses, secrets,
+  **Nothing day to day needs the token.** Not daily use — chat, airspace, driving safehouses, secrets,
   sessions — and not routine administration either: removing a node, revoking an admin key,
   settings and harness definitions are signed by an ordinary admin key alone. The token
   can stay in a drawer between enrollments, and a compromised node can be removed without fetching
-  it.
+  it. The token is fetched for three things only: an enrollment, settling a dispute, and
+  recovery.
   Two limits: node keys cannot live on the token, because iroh needs the raw key and the token has
   no Ed25519, so the HSM backs *who may enroll*, not each node's transport key; and the token signs
   with ECDSA P-256, so roster signatures carry an algorithm tag. A phone cannot enroll under this
   rule. One token plus a spare is the plan (**decision 1**).
 - **The HSM key outranks every admin key** (settled by the owner). The key on the token is
   recorded in genesis as the network's root key. A statement it signs wins over any conflicting
-  statement by an admin key, whatever order the two arrived in: that is what settles a stolen
-  device and the chief's other device revoking each other. It can also add an admin key when
-  the chief has lost every one, which is the recovery path. It is used for nothing day to day;
-  the token still stays in a drawer. What a network created without a token does in these two
+  statement by an admin key, whatever order the two arrived in. Two uses, and no others:
+  *dispute* — when a stolen device and the chief's other device revoke each other, the
+  revocation the root key signs stands; an ordinary revocation that nobody contests needs no
+  token. *Recovery* — when the chief has lost every admin key, a statement signed by the root
+  key alone adds a new one; it is the only statement in the roster that carries no admin
+  signature. Recovery restores who may administer. It does not decrypt anything: see what a
+  lost last station means for secrets, below. What a network created without a token does in these two
   cases is open (**decision 2**).
 
 Membership is a **roster**: a hash-linked log (a DAG — each statement names its parents) of
-statements signed by admin keys. The network id is the hash of genesis. No node shares a secret
+statements signed by admin keys, or by the root key in the two cases above. The network id is
+the hash of genesis. No node shares a secret
 with another to be a member, so removing a device needs no rotation of membership. Authorization
 everywhere is remote node id → roster → "station of the chief" or "safehouse" → policy for that
 protocol, default deny.
@@ -142,8 +147,9 @@ Rules the membership milestone (M3) implements:
   URL and node id); settings. There is no statement that admits a second chief. A node's entry
   carries an encryption public key, which airspace needs later. Statements carry no display names,
   because towers receive the roster; names travel between members.
-- **Who may sign what:** any unrevoked admin key signs anything; they are all the chief's. A
-  decommissioned station id never comes back.
+- **Who may sign what:** any unrevoked admin key signs anything; they are all the chief's.
+  Enrollments need the token's second signature where the rule is on. The root key alone signs
+  a dispute-settling revocation and a recovery. A decommissioned station id never comes back.
 - **Pairing a new device.** The chief adds a phone or a second laptop from a device that already
   has an admin key. The ticket's secret seeds a throwaway node key. The signed ticket lists that
   join id and an expiry, and towers and nodes let unexpired join ids through for joining only. The
@@ -222,8 +228,11 @@ again. So a station watches its home tower (below).
   keep. How it is built is **decision 20**.
   - *Routing.* The towers together know, for every connected node id, which tower holds its
     connection, and keep that current as nodes come, go and move. A node asks nothing and is
-    told nothing about where a peer is: it hands traffic for a node id to its own tower. A node
-    that no tower holds is reported as unreachable at once, not by a timeout.
+    told nothing about where a peer is: it hands traffic for a node id to its own tower. When
+    the towers know no route to a node, the sender is told "no route currently known" at once
+    and does not wait out a timeout. That is a statement about now, by untrusted towers: while
+    routes converge or towers are cut off from each other it can be wrong, so a sender may try
+    again. Freshness, retries and recovery are part of **decision 20**.
   - *Links.* Every tower in the roster's signed tower set keeps an authenticated link to every
     other one, from its own endpoint and node key (below). The set is small, so this is a full
     mesh. A tower links only to towers the roster names, never to one a peer or another tower
@@ -277,12 +286,15 @@ this protocol:
 | station → safehouse | everything the chief may do there: terminals, sessions, files, secrets for a start; configuration only as admin-signed statements |
 | station → station | chat, roster sync, airspace blocks and names |
 | safehouse → station | chat, roster sync, airspace blocks and names, answers on streams the station opened, file offers into quarantine |
-| safehouse → safehouse | airspace blocks and names, and what agents coordinate with through the MCP bridge: chat, locks, file transfers between workspaces of the same project; anything else only under an admin-signed grant naming both |
+| safehouse → safehouse | airspace blocks and names, and what agents coordinate with through the MCP bridge: chat, locks, file transfers between workspaces of the same project (proposed, **decision 21**: the receiving safehouse must itself establish the session's project and rights; a caller naming a project is not a grant); anything else only under an admin-signed grant naming both |
 | member → tower | relay; on the tower's own endpoint: roster feed, block storage, leases |
 | tower → tower | with towers in the signed set only: routing (which node ids each holds), forwarding relayed traffic, replication of the roster, blocks, names and leases |
 
-`numbers/join/0` (M3) is the only surface open to non-members: pairing-ticket redemption and bounded delivery
-of roster proofs. Control messages are length-prefixed JSON frames (size-capped, read deadlines,
+`numbers/join/0` (M3) is the only surface open to a node the roster does not name: pairing-ticket
+redemption and bounded delivery of roster proofs. Towers are never members, and the tower rows
+above are not member authorization: a tower is authenticated by the node key the signed tower
+set lists for it, and that admits it to the tower protocols only (relay, routing, forwarding,
+replication, the roster feed). It opens no member protocol and holds no content key. Control messages are length-prefixed JSON frames (size-capped, read deadlines,
 unknown fields tolerated); bulk data is raw stream bytes. One link instead of one ALPN per feature
 keeps authorization in one place and hides from the tower which feature is in use.
 
@@ -431,7 +443,9 @@ encrypted blocks**.
   things (text objects, git data) are packed into blocks of a few MiB; large files are cut into
   blocks and can be resumed, streamed and read by range. The tower binary contains no sealing code
   and no member, admin or airspace key, and CI checks that it links no member code. Its only keys
-  are its own TLS key and, when it takes its certificate from Let's Encrypt, its ACME account key.
+  are its own TLS key, when it takes its certificate from Let's Encrypt its ACME account key,
+  and from M3 the node key of its own endpoint, which authenticates it to members and to other
+  towers and decrypts nothing that members store or send.
 - **Durability (agreed).** Every tower keeps every block. A write counts as stored once two towers
   confirm it, whichever tower the writer uses; a tower that was down catches up afterwards. The writer keeps its copy until then and
   airspace reports "not yet durable" (always, with a single tower). A member uploads once and the
@@ -548,12 +562,16 @@ no teams:
   Until projects exist a session has no project, and the user scope works without them.
 - **At rest: sealed, in airspace.** Each scope has a space of its own whose key is wrapped only
   to the chief's stations, never to a safehouse. A secret is a versioned text object in that
-  space, so it is on the laptop and the phone alike, survives a lost device, and a tower holds
-  ciphertext only (hard rule 2). Setting, replacing and removing are signed records; a list
+  space, so it is on the laptop and the phone alike and survives the loss of a device for as
+  long as another station remains, and a tower holds ciphertext only (hard rule 2). If the last
+  station is lost, the secrets are lost with it: the root key restores administration, not
+  decryption. Whether there should be a separate recovery wrap for secret spaces is part of
+  **decision 19**. The plaintext of these spaces is not served by the general airspace calls
+  (`chief airspace`, object read and export): only the secret service opens them. Setting, replacing and removing are signed records; a list
   shows names, scopes, which device set each and when.
 - **Write-only from outside.** `chief secret set` reads the value without echo, or from stdin,
-  never from the command line. No command, API call, event, log line or error returns a value
-  or a part of one; `chief secret list` shows names and metadata. A frontend never receives a
+  never from the command line. No theCompany command, station or safehouse API call, event, log
+  line or error returns a value or a part of one; `chief secret list` shows names and metadata. A frontend never receives a
   stored value from its station. There is deliberately no `chief secret show`.
 - **To a safehouse: only for a start, only what was asked for.** When the chief starts a
   terminal or a session, the station resolves the names the harness definition asks for, opens
@@ -564,7 +582,9 @@ no teams:
   sessions, so that a session can restart while every station is offline, is part of
   **decision 19**.
 - **The process can read what it is given.** A harness needs its key, so an agent in a session
-  can read every secret that session was started with. A spending limit at the vendor is the
+  can read every secret that session was started with, and can print it into its own terminal
+  or output; the write-only promise covers theCompany's own interfaces, not what a process does
+  with what it was given. A spending limit at the vendor is the
   control for an API key; hiding a key from the agent behind a proxy on the safehouse is part of
   **decision 8**.
 - **Revocation means rotation.** Revoking a station or removing a safehouse re-keys the spaces
@@ -596,13 +616,18 @@ it. The two presets:
 
 - **Which key a session runs on** follows the resolution rule above: the project's, else the
   chief's own. With none in either scope the start fails and says which name is missing.
-- **Status.** `chief harness status <safehouse>` says for each harness which scope a start
-  would take its key from, when that secret was set and whether the vendor last rejected it. It
-  never returns the key or a part of it: the safehouse answers from its own record and never
-  passes on what a harness CLI prints (`codex login status` prints part of the key). A key the
-  vendor rejects is reported to the chief's stations, by name and scope.
+- **Status**, in two parts that are not mixed. *What a start would use* is answered by the
+  station, which holds the secrets: `chief harness status [--project <project>]` says for each
+  harness which scope the name resolves to now and when that secret was set. *What happened*
+  is answered by the safehouse from its own record: for each past session, the scope and
+  version of the secret it was started with and whether the vendor rejected it. Neither
+  returns the key or a part of it, and the safehouse never passes on what a harness CLI prints
+  (`codex login status` prints part of the key). A rejection is reported to the chief's
+  stations by name, scope and version, so a key replaced since then is not shown as bad.
 - **No lifecycle to manage.** A key has no session to renew. Replacing one is `chief secret
-  set` again; running sessions keep the value they started with.
+  set` again; running sessions keep the value they started with. How that holds for Codex,
+  which keeps its key in a store that two sessions of one project would share, is part of
+  **decision 8**.
 - theCompany never reads, copies or moves a harness's own credential files. A subscription sign-in
   typed by hand into a terminal on a safehouse is outside what theCompany supports.
 
