@@ -2,10 +2,11 @@
 
 > These snippets were read from the published sources of **iroh 1.5.0**, **iroh-relay 1.5.0** and
 > **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked by a second reviewer.
-> Sections 2 to 10 were then compiled and run against iroh 1.5.0 and iroh-relay 1.5.0 in a lab of
-> loopback tests (127.0.0.1, also inside a network namespace with only loopback); the code there is
-> the code that compiled, and the numbers are measured. Section 1's feature claims and section 11
-> are still source reading only. The summary is the appendix of
+> The code fences of sections 2 to 10 compile as written against iroh 1.5.0 and iroh-relay 1.5.0:
+> a generator copies them byte for byte into a lab crate built with `--features verbatim`. The
+> measured numbers come from that lab's loopback tests (127.0.0.1, also inside a network namespace
+> with only loopback), which exercise equivalent code, not these exact fences. Section 1's feature
+> claims and section 11 are still source reading only. The summary is the appendix of
 > [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
 
 ## 1. Cargo dependencies and features
@@ -52,22 +53,25 @@ server.shutdown().await?;                                   // Err: SupervisorEr
 
 `iroh::RelayConfig` (client map entry) is a different type; `accept_conn_*` limits are unimplemented.
 
-`shutdown()` does not always disconnect a client that connected just before (likely because the
-WebSocket upgrade runs in a detached task). Shut down right after a client's `online()`, the client
-still reported itself connected 3 s later (once for over 40 s) in 8 of 180 isolated runs and in 3
-of 7 runs of the whole suite. Neither of two ways ever showed it (0 of 180 each): shutting down at
-least 1 s after the last client connected, or running the tower on its own Tokio runtime and
-stopping that with `Runtime::shutdown_background()`. A tower-restart test should also assert that
-the client noticed.
+After `shutdown()`, a client that connected just before may not notice (possibly because the
+WebSocket upgrade runs in a detached task). Shut down right after a client's `online()`, the
+client's `home_relay_status()` still reported it connected 3 s later (once for over 40 s) in 8 of
+180 isolated runs and in 3 of 7 runs of the whole suite; whether that connection still relayed
+anything was not tested. In 180 runs each, this was not observed when shutting down at least 1 s
+after the last client connected, nor with the tower on its own Tokio runtime stopped with
+`Runtime::shutdown_background()`; these are observations, not guarantees. A tower-restart test
+should assert that the client noticed.
 
 ## 3. Relay map and net-report setting
 `RelayMode::custom(urls)`, `RelayMap::from_iter(urls)`, `RelayMap::from(url)` and
-`RelayConfig::from(url)` all assume QAD on UDP 7842. A net report plans QAD probes only for an
-endpoint with IP sockets on a host with a routed IPv4 interface; against a plain-HTTP tower it then
-waits out the 3 s probe timeout: `online()` took 3.02 s instead of 0.22 s (measured for the first
-report). A relay-only endpoint, or any endpoint in a network namespace with only loopback, plans no
-QAD and pays nothing, so the cost depends on the host. `RelayConfig::new(url, None)` behaves the
-same everywhere. `TowerSet` carries a QAD setting per tower instead:
+`RelayConfig::from(url)` all assume QAD on UDP 7842. A net report plans QAD probes per IP family
+(`src/net_report.rs`, `if_state.have_v4` / `have_v6`): IPv4 when an up interface has a non-loopback
+IPv4 address, IPv6 when one has a global or unique-local IPv6 address. Against a plain-HTTP tower a
+planned probe waits out the 3 s probe timeout. The lab host had IPv4 only: there `online()` took
+3.02 s instead of 0.22 s (first report). A relay-only endpoint, or any endpoint in a network
+namespace with only loopback, planned no QAD and paid nothing, so the cost depends on the host.
+`RelayConfig::new(url, None)` behaves the same everywhere. `TowerSet` carries a QAD setting per
+tower instead:
 ```rust
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
 use iroh_relay::RelayQuicConfig; // not re-exported by iroh: needs the direct iroh-relay dependency
@@ -254,14 +258,18 @@ The link is one `ProtocolHandler` on `numbers/0`; these lifecycle rules decide h
 impl ProtocolHandler for Link {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id(); // infallible after the handshake
+        // A refusal (rule 5) is `return refuse(&conn);` from here.
         while let Ok((send, recv)) = conn.accept_bi().await { /* StreamHeader, check, dispatch */ }
         // send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream
         Ok(()) // returning drops and closes the connection
     }
 }
-// Refuse (see rule 5): close with our code first, then return the error.
-conn.close(CLOSE_NOT_ALLOWED.into(), b"not allowed");
-return Err(n0_error::e!(AcceptError::NotAllowed)); // or AcceptError::from_err(..) (hidden meta)
+
+/// Called from `accept` to refuse: close with our code first, then return the error.
+fn refuse(conn: &Connection) -> Result<(), AcceptError> {
+    conn.close(CLOSE_NOT_ALLOWED.into(), b"not allowed");
+    Err(n0_error::e!(AcceptError::NotAllowed)) // or AcceptError::from_err(..) (hidden meta)
+}
 ```
 
 1. `spawn()` (`#[must_use]`) calls `endpoint.set_alpns`, overriding builder ALPNs: our bind takes none.
@@ -274,7 +282,7 @@ return Err(n0_error::e!(AcceptError::NotAllowed)); // or AcceptError::from_err(.
 5. A refusal in `accept` comes after the handshake: the dialer's `connect()` succeeds, then sees an
    application close. Returning the error alone gives the dialer close code 0 with an empty reason,
    the same as a normal close; our code reaches the dialer only if the handler calls
-   `conn.close(code, reason)` before it returns the error (the two lines above).
+   `conn.close(code, reason)` before it returns the error (`refuse` above).
 
 ## 8. Relay versus direct paths
 A connection usually starts on the relay and moves to a direct path, so "relayed" belongs to the
@@ -310,10 +318,11 @@ the relay path stays open but unselected. With one side relay-only it never goes
   tower is chosen; once the tower was up, `online()` followed 14–24 s later. `network_change()` did
   not help (19–23 s). `remove_relay` then `insert_relay` of the same tower brought it online in
   215–220 ms (observed behaviour, not documented).
-- Measured, tower stopped after the endpoint was online: `connected` turned false within 0–51 ms,
-  with `last_error` "Failed to connect to relay server". The reconnect backoff (10 ms–16 s) has
-  jitter: gaps between attempts reached about 31 s. After a 1 s outage the endpoint was back
-  0.05–2 s after the tower; after a 35 s outage, 10–28 s after it.
+- Measured, tower stopped after the endpoint was online: in the runs where the endpoint noticed
+  (see section 2 for the runs where it did not), `connected` turned false 0–51 ms after
+  `Server::shutdown()` was called, with `last_error` "Failed to connect to relay server". The
+  reconnect backoff (10 ms–16 s) has jitter: gaps between attempts reached about 31 s. After a 1 s
+  outage the endpoint was back 0.05–2 s after the tower; after a 35 s outage, 10–28 s after it.
 - Keep-alive 5 s, idle timeout 30 s: after an outage over 30 s every connection is dead and
   `conn.closed()` triggers the re-dial; keep-alive defeats the idle timeout, so time out every frame
   read. A dial to an offline peer fails only by timeout (~30 s): wrap it (`connect_timeout`).

@@ -403,14 +403,15 @@ loopback. The iroh snippets behind these facts were also compiled and run in a l
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
-- **Relay map.** The bare-URL constructors assume QAD on UDP 7842. A net report plans QAD probes
-  only for an endpoint with IP sockets on a host with a routed IPv4 interface; there, against a
-  plain-HTTP tower, `online()` took 3.0 s instead of 0.22 s. Relay-only endpoints and loopback-only
-  namespaces pay nothing, so the cost depends on the host. Use `iroh::RelayConfig::new(url, None)`
-  for `http://` towers (`iroh_relay::RelayQuicConfig` for a QAD port): it behaves the same
-  everywhere. Switch off only the captive-portal check (`NetReportConfig::default()` with
-  `captive_portal_check = false`); `NetReportConfig::minimal()` also disables the HTTPS probes, and
-  then no home tower is ever chosen (not online after 30 s).
+- **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
+  plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
+  global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
+  IPv4-only lab host `online()` took 3.0 s instead of 0.22 s. Relay-only endpoints and
+  loopback-only namespaces paid nothing, so the cost depends on the host. Use
+  `iroh::RelayConfig::new(url, None)` for `http://` towers (`iroh_relay::RelayQuicConfig` for a QAD
+  port): it behaves the same everywhere. Switch off only the captive-portal check
+  (`NetReportConfig::default()` with `captive_portal_check = false`); `NetReportConfig::minimal()`
+  also disables the HTTPS probes, and then no home tower is ever chosen (not online after 30 s).
 - **Dial by id.** An `AddressLookup` returning every tower URL for any id makes
   `endpoint.connect(id, ALPN)` work with no other service. All listed relays are tried in parallel
   and the relay need not be in the dialer's own map — current behaviour, not a documented contract.
@@ -425,9 +426,10 @@ loopback. The iroh snippets behind these facts were also compiled and run in a l
   80, captive-portal responder); ACME is tls-alpn-01 on port 443 only and needs `cache_path`; QAD
   needs TLS; `Server::spawn` cannot add HTTP routes. A relay and a separate iroh endpoint can run in
   one process; the relay does not advertise that endpoint's id. iroh-relay does not re-export
-  `RelayUrl`; it comes from `iroh`. `Server::shutdown()` can leave a client that connected just
-  before attached (8 of 180 runs shut down right after the client came online); shutting down at
-  least 1 s after the last connect, or stopping the tower's own runtime, never showed it (observed).
+  `RelayUrl`; it comes from `iroh`. After `Server::shutdown()` right after a client came online,
+  the client still reported itself connected in 8 of 180 runs (whether it could still relay was not
+  tested); it was not observed in 180 runs each when shutting down at least 1 s after the last
+  connect or stopping the tower's own runtime (observations, not guarantees).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
@@ -445,9 +447,10 @@ loopback. The iroh snippets behind these facts were also compiled and run in a l
   `home_relay_status()` was empty with no error, and `network_change()` did not help. Removing and
   re-inserting the tower brought it online in about 220 ms (observed, not documented). Under heavy
   load an endpoint occasionally missed its first report and came online only after 21–24 s.
-  `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. A stopped tower
-  showed as not connected within 51 ms; the reconnect backoff (10 ms–16 s) has jitter, and gaps
-  between attempts reached about 31 s. Keep-alive is 5 s and idle timeout 30 s; a dial to an
+  `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
+  noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
+  called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
+  31 s. Keep-alive is 5 s and idle timeout 30 s; a dial to an
   offline peer, or one whose filter ignores us, fails only by that timeout (30.0 s), and a peer
   killed without closing is noticed after 30.0 s. Two processes on one node key: the relay keeps
   only the newest, and the older one notices nothing (measured with two endpoints in one process).
