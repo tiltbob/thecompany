@@ -33,8 +33,10 @@ The ACME cache holds the tower's TLS key and its ACME account key. The tower cre
 mode 0700, and refuses to start with a cache that the group or others can access, that another
 user owns, or that it cannot write. Under this unit, with the config below, the tower creates
 the cache itself, so those checks pass. They matter when someone else made the directory: a
-cache directory created by hand as root inside the state directory is refused; remove it, and
-the tower creates its own. A `cache_dir` outside the state directory does not work
+cache directory created by hand as root inside the state directory is refused. If it is empty,
+remove it, and the tower creates its own. If it holds a cache, keep it: it contains the tower's
+TLS key and its ACME account key. Repair its owner and its mode instead; the tower's error line
+says which of the two it refused. A `cache_dir` outside the state directory does not work
 under this unit: the service sees the rest of the file system read-only, and its private `/tmp`
 is emptied when it stops.
 
