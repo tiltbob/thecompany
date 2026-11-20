@@ -10,7 +10,9 @@ use std::process::ExitCode;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Parser, Subcommand};
-use numbers_tower::{CertSource, DEFAULT_BIND, TLS_LOG_TARGET, Tower, TowerConfig, config};
+use numbers_tower::{
+    CertSource, DEFAULT_BIND, TLS_LOG_TARGET, Tower, TowerConfig, TowerError, config,
+};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -20,6 +22,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, filter::filter_fn};
 
 const LOG_TARGET: &str = "numbers_tower::cli";
+
+/// The process's exit status on success, and after SIGINT or SIGTERM.
+const EXIT_SUCCESS: u8 = 0;
+/// A failure that may pass when the tower is started again: a listener that could not be
+/// bound, a certificate file that could not be read, a relay that stopped by itself, and every
+/// error not named in [`exit_status`].
+const EXIT_FAILURE: u8 = 1;
+/// A command-line error (clap's convention).
+const EXIT_USAGE: u8 = 2;
+/// A configuration error that no retry can fix: `EX_CONFIG` in `sysexits.h`, which systemd
+/// prints as `CONFIG`. The systemd unit does not restart the tower after it, nor after
+/// [`EXIT_USAGE`].
+const EXIT_CONFIG: u8 = 78;
 
 /// The target of iroh-relay's own events in `src/server.rs`, its ACME events among them.
 const RELAY_SERVER_TARGET: &str = "iroh_relay::server";
@@ -308,7 +323,7 @@ struct Rendered {
 fn render(error: &clap::Error) -> Rendered {
     let fixed = |line: String| Rendered {
         text: format!("tower: {line}\nsee `tower --help`\n"),
-        status: 2,
+        status: EXIT_USAGE,
         to_stdout: false,
     };
     // The argument clap names for this error, when it is ours. For an unknown argument clap
@@ -323,7 +338,7 @@ fn render(error: &clap::Error) -> Rendered {
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         | ErrorKind::DisplayVersion => Rendered {
             text: error.render().to_string(),
-            status: 0,
+            status: EXIT_SUCCESS,
             to_stdout: true,
         },
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
@@ -372,11 +387,56 @@ async fn main() -> ExitCode {
     });
 
     match run(args).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(EXIT_SUCCESS),
         Err(error) => {
             eprintln!("tower: {error}");
-            ExitCode::FAILURE
+            ExitCode::from(exit_status(&*error))
         }
+    }
+}
+
+/// The exit status for an error that ended [`run`]: [`EXIT_CONFIG`] when the configuration
+/// itself is wrong and starting again cannot help, [`EXIT_FAILURE`] otherwise.
+fn exit_status(error: &(dyn Error + Send + Sync + 'static)) -> u8 {
+    // Every error of the config file or the allow file: the file has to be changed. That
+    // includes a file that cannot be read; systemd does not create it in the meantime.
+    if error.is::<config::ConfigError>() {
+        return EXIT_CONFIG;
+    }
+    let Some(error) = error.downcast_ref::<TowerError>() else {
+        // An I/O error of the runtime or of a signal handler, a load task that did not finish.
+        return EXIT_FAILURE;
+    };
+    // `TowerError` is `#[non_exhaustive]`, so the match needs a last arm; a variant added later
+    // counts as a failure that may pass until it is placed here.
+    match error {
+        // Values of the configuration that the tower refuses: the same config gives the same
+        // error at every start.
+        TowerError::NonLoopbackBind(_)
+        | TowerError::InvalidHostname
+        | TowerError::InvalidReloadInterval
+        | TowerError::AcmeNeedsDnsName
+        | TowerError::InvalidAcmeContact
+        | TowerError::InvalidAllowlistEntry { .. }
+        | TowerError::InvalidClientRate(_)
+        | TowerError::InvalidClientBurst => EXIT_CONFIG,
+        // The ACME cache directory is not private, not the tower's own, not a directory, or
+        // cannot be used: the directory or the `cache_dir` that names it has to be changed.
+        TowerError::AcmeCacheNotPrivate
+        | TowerError::AcmeCacheNotOwned
+        | TowerError::AcmeCacheNotADirectory
+        | TowerError::AcmeCacheUnusable(_) => EXIT_CONFIG,
+        // A port that is taken, or certificate files in the middle of a renewal: these can
+        // pass, so a service manager may start the tower again.
+        TowerError::Bind { .. }
+        | TowerError::CertificateFile { .. }
+        | TowerError::KeyFile { .. } => EXIT_FAILURE,
+        // The relay stopped by itself, or did not start or stop for another reason.
+        TowerError::Stopped
+        | TowerError::Start(_)
+        | TowerError::MissingHttpAddress
+        | TowerError::Shutdown(_) => EXIT_FAILURE,
+        _ => EXIT_FAILURE,
     }
 }
 
@@ -453,6 +513,7 @@ fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::io;
     use std::net::SocketAddr;
     use std::path::Path;
 
@@ -460,14 +521,15 @@ mod tests {
     use clap::error::ErrorKind;
     use numbers_tower::DEFAULT_BIND;
 
-    use numbers_tower::{TlsTower, TowerConfig};
+    use numbers_tower::{TlsTower, Tower, TowerConfig, TowerError};
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        AcmeNote, AcmeWatch, Args, Certificate, Command, ERRORS, MessageStart, access_label,
-        acme_filter, port_label, render, shown,
+        AcmeNote, AcmeWatch, Args, Certificate, Command, ERRORS, EXIT_CONFIG, EXIT_FAILURE,
+        EXIT_USAGE, MessageStart, access_label, acme_filter, exit_status, port_label, render,
+        shown,
     };
 
     #[test]
@@ -743,23 +805,42 @@ mod tests {
     /// The systemd unit in `packaging/systemd/`, as shipped.
     const UNIT: &str = include_str!("../../../packaging/systemd/numbers-tower.service");
 
-    /// The values of every `key=` line in the unit, with surrounding white space trimmed.
-    /// Comment lines start with `#` or `;`.
-    fn unit_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
-        unit.lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with('#') && !line.starts_with(';'))
-            .filter_map(|line| line.split_once('='))
-            .filter(|(name, _)| name.trim() == key)
-            .map(|(_, value)| value.trim())
-            .collect()
+    /// The values of the `key=` lines in `[section]` of the unit, trimmed, read as systemd reads
+    /// them for what this unit uses: blank lines and comment lines (`#`, `;`) are skipped, a
+    /// `[name]` line starts a section, and a line that ends in a backslash fails the test
+    /// (systemd would join it with the next line; the unit needs none).
+    fn unit_values<'a>(unit: &'a str, section: &str, key: &str) -> Vec<&'a str> {
+        let mut current = None;
+        let mut values = Vec::new();
+        for line in unit.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            assert!(
+                !line.ends_with('\\'),
+                "a continued line in the unit: {line}"
+            );
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                current = Some(name);
+                continue;
+            }
+            if current != Some(section) {
+                continue;
+            }
+            if let Some((name, value)) = line.split_once('=')
+                && name.trim() == key
+            {
+                values.push(value.trim());
+            }
+        }
+        values
     }
 
     /// The unit's `ExecStart` is a command line this binary accepts. The unit uses no quoting,
     /// escapes or specifiers, so splitting on white space is what systemd does with it.
     #[test]
     fn the_systemd_units_exec_start_parses() {
-        let exec_start = unit_values(UNIT, "ExecStart");
+        let exec_start = unit_values(UNIT, "Service", "ExecStart");
         assert_eq!(exec_start.len(), 1, "exactly one ExecStart line");
         let argv: Vec<&str> = exec_start[0].split_whitespace().collect();
         assert!(
@@ -781,17 +862,117 @@ mod tests {
     #[test]
     fn the_systemd_unit_has_what_the_binary_needs() {
         let has = |key: &str, value: &str| {
-            assert_eq!(unit_values(UNIT, key), vec![value], "{key}={value}");
+            assert_eq!(
+                unit_values(UNIT, "Service", key),
+                vec![value],
+                "[Service] {key}={value}"
+            );
         };
-        // The ACME cache lives under the state directory, and the tower refuses a cache that
-        // the group or others can access.
+        // The documented config keeps the ACME cache, with the tower's keys, in the state
+        // directory; the tower requires mode 0700 when the cache is that directory itself.
         has("StateDirectory", "numbers-tower");
         has("StateDirectoryMode", "0700");
         // The binary exits with a failure when its relay stops by itself and with success on
         // SIGTERM: the first is restarted, a stop is not.
         has("Restart", "on-failure");
+        // A wrong command line or configuration stays wrong: no restart after those statuses.
+        has(
+            "RestartPreventExitStatus",
+            &format!("{EXIT_USAGE} {EXIT_CONFIG}"),
+        );
         // The default listeners are on ports 80 and 443, and the dynamic user is not root.
         has("AmbientCapabilities", "CAP_NET_BIND_SERVICE");
         has("CapabilityBoundingSet", "CAP_NET_BIND_SERVICE");
+    }
+
+    /// The helper reads one section only.
+    #[test]
+    fn unit_values_reads_like_systemd() {
+        let unit = "[Service]\nRestart=on-failure\n# Restart=no\n[X-Notes]\nRestart=always\n";
+        assert_eq!(unit_values(unit, "Service", "Restart"), vec!["on-failure"]);
+        assert_eq!(unit_values(unit, "X-Notes", "Restart"), vec!["always"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a continued line in the unit")]
+    fn unit_values_refuses_a_continued_line() {
+        unit_values(
+            "[Service]\nEnvironment=A=1 \\\nRestart=on-failure\n",
+            "Service",
+            "Restart",
+        );
+    }
+
+    /// Every error of the config file or the allow file is a configuration error.
+    #[test]
+    fn a_config_file_error_exits_with_78() {
+        let error = numbers_tower::config::parse("bogus = 1\n", Path::new("/")).unwrap_err();
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+        assert_eq!(exit_status(&*boxed), EXIT_CONFIG);
+    }
+
+    fn status_of(error: TowerError) -> u8 {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+        exit_status(&*boxed)
+    }
+
+    /// A value of the configuration that the tower refuses is a configuration error.
+    #[test]
+    fn a_refused_config_value_exits_with_78() {
+        assert_eq!(status_of(TowerError::InvalidHostname), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::InvalidAcmeContact), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::InvalidClientBurst), EXIT_CONFIG);
+        let entry = TowerError::InvalidAllowlistEntry {
+            position: 1,
+            source: "not an id".into(),
+        };
+        assert_eq!(status_of(entry), EXIT_CONFIG);
+    }
+
+    /// An ACME cache directory that the tower refuses is a configuration error.
+    #[test]
+    fn a_refused_acme_cache_exits_with_78() {
+        assert_eq!(status_of(TowerError::AcmeCacheNotPrivate), EXIT_CONFIG);
+        assert_eq!(
+            status_of(TowerError::AcmeCacheUnusable(
+                io::ErrorKind::PermissionDenied
+            )),
+            EXIT_CONFIG
+        );
+    }
+
+    /// A port that is taken and an unreadable certificate file can pass: status 1.
+    #[tokio::test]
+    async fn a_taken_port_or_a_missing_certificate_file_exits_with_1() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = taken.local_addr().unwrap();
+        let Err(error) = Tower::spawn(TowerConfig::dev(bind)).await else {
+            panic!("the port is taken");
+        };
+        assert!(matches!(error, TowerError::Bind { .. }), "{error:?}");
+        assert_eq!(status_of(error), EXIT_FAILURE);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tls = TlsTower::new(
+            "tower1.example.com",
+            dir.path().join("missing-cert.pem"),
+            dir.path().join("missing-key.pem"),
+        );
+        let Err(error) = Tower::spawn(TowerConfig::tls(tls)).await else {
+            panic!("the certificate file is missing");
+        };
+        assert!(
+            matches!(error, TowerError::CertificateFile { .. }),
+            "{error:?}"
+        );
+        assert_eq!(status_of(error), EXIT_FAILURE);
+    }
+
+    /// A relay that stopped by itself, and an error that is not the tower's, exit with 1.
+    #[test]
+    fn a_stopped_relay_or_another_error_exits_with_1() {
+        assert_eq!(status_of(TowerError::Stopped), EXIT_FAILURE);
+        let other: Box<dyn std::error::Error + Send + Sync> = Box::new(io::Error::other("x"));
+        assert_eq!(exit_status(&*other), EXIT_FAILURE);
     }
 }

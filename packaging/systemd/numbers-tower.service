@@ -17,6 +17,9 @@ ExecStart=/usr/local/bin/tower serve --config /etc/numbers-tower/tower.toml
 # (systemctl stop). Restart it in the first case only.
 Restart=on-failure
 RestartSec=5s
+# A wrong command line (exit status 2) or configuration (78, EX_CONFIG) stays wrong: the
+# service ends as failed instead of being restarted. Fix it and start the service again.
+RestartPreventExitStatus=2 78
 
 # A user allocated at start and released at stop. It also implies a private /tmp,
 # ProtectSystem=strict, ProtectHome=read-only, NoNewPrivileges=yes, RestrictSUIDSGID=yes and
