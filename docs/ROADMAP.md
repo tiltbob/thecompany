@@ -209,7 +209,8 @@ unlisted station denied.
 | `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`) and `Status.bootstrap_domain: Option<String>`. `Standby` represents a tower whose state is unobserved, including when the home tower state is unavailable. Introduced in API version 2. | #68, Codex |
 | `crates/chief/src/api.rs` | API version 3 defines bounded, live pages of peer-supplied candidate URLs, separate from Status and events. It also defines explicit tower additions and removals, with typed outcomes and refusals. | #109, Codex |
 | `crates/station/src/towers.rs` | Applies explicit tower additions and removals to the remembered and runtime working set as part of domain-backed startup support. | #77, Codex |
-| `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. Per decision 16 (#73), candidate listing and `chief tower add <url>` / `chief tower remove <url>` are #122, which waits for the API of #109 | #80, Claude |
+| `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. | #80, Claude |
+| `crates/chief-cli/src/lib.rs` | `chief tower candidates [--after-peer PEER] [--limit N]` reads one live page. `chief tower add URL` and `chief tower remove URL` request explicit changes and print their outcomes. | #122, Codex |
 | `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` with `StateDirectoryMode=0700` for the ACME cache, `Restart=on-failure` with `RestartPreventExitStatus=2 78` (the binary exits with 78 for a configuration error and 2 for a command-line error, 1 for what can pass), `CAP_NET_BIND_SERVICE`, sandboxing) and an example drop-in for certificate files through `LoadCredential=`, restarted on renewal. A test in the binary reads the unit by section, parses its `ExecStart` with clap and checks the directives the binary needs; `scripts/check-units.sh` (CI) runs `systemd-analyze verify --recursive-errors=no` on the unit alone and with the drop-in, fails on any message, and needs systemd 250 or later (skipped locally without it, a failure in CI). Docs: "Running the tower as a service" (`packaging/systemd/README.md`). | #82, Claude |
 | `packaging/systemd/` | `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented), with the same test in the binary and the same check as the tower's unit; it waits for the station daemon (#53, #79) | #127, Claude |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
@@ -302,9 +303,9 @@ an observed state from an unobserved tower in the station's set. The home tower 
 failing or `Denied { reason }`. Unobserved towers are shown as `Standby`, including when the home
 status is empty, such as after a TLS failure with a certificate the station does not trust. Each
 tower carries its source (`configured`, `remembered`, `srv`, `peer`). `Status` carries the bootstrap
-domain, and the API carries the candidates with the peer's name. `chief status` prints all of it,
-with control characters in peer and tower text replaced with spaces, and whether each peer is
-relayed or direct, as in M1.
+domain. `chief status` prints installed towers and peer links. `chief tower candidates` prints
+one live page of candidate URLs with their supplying peers. A continuation names the exclusive
+boundary for the next page. The CLI cleans peer and tower display text.
 The station caps each cleaned tower error or denial reason at 1,024 UTF-8 bytes before it reports it.
 
 **CLI surface**
@@ -317,8 +318,11 @@ station run                                           # the remembered set; SRV 
 station run --tower https://tower1.example.com --tower https://tower2.example.com
                                                       # pins for this run; no SRV, not remembered
 station run --tower https://127.0.0.1:8443 --tower-ca cert.pem   # trust the certificate in cert.pem
-chief status                                          # towers: state, source, denial, candidates
-chief tower add https://tower3.example.com            # take a candidate into the set
+chief status                                         # installed towers and peer links
+chief tower candidates --limit 10                    # one candidate page
+chief tower candidates --after-peer bob --limit 10   # continue after bob
+chief tower add https://tower3.synthetic.invalid     # add the URL to the set
+chief tower remove https://tower3.synthetic.invalid  # remove the URL from the set
 ```
 
 **Deliberately not in M2:** ACME tested at runtime (it needs port 443 on a public host; #71),

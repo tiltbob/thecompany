@@ -8,7 +8,8 @@
 //! Nothing sleeps, every test is bounded, ids are placeholders (AGENTS.md, hard rule 9).
 
 use chief::api::{
-    ApiError, FailReason, Link, Request, Response, TowerSource, TowerState, TowerStatus,
+    ApiError, FailReason, Link, Request, Response, TOWER_CANDIDATES_PAGE_MAX_GROUPS, TowerSource,
+    TowerState, TowerStatus,
 };
 use chief::client::{
     BindInstance, Client, SUBSCRIPTION_CAPACITY, SocketTransport, Subscription, Transport,
@@ -63,12 +64,16 @@ struct Rig {
 
 /// A socket server in a temporary directory for a fake station with the peer `bob`, and a client.
 async fn rig() -> Rig {
-    let dir = tempfile::tempdir().unwrap();
     let fake = FakeStation::new("STATION-A", "INSTANCE-1");
     Client::new(fake.clone())
         .peer_add("bob", "STATION-B")
         .await
         .unwrap();
+    serve(fake).await
+}
+
+async fn serve(fake: FakeStation) -> Rig {
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("run/station.sock");
     let server = IpcServer::bind(fake.clone(), &socket, IpcConfig::default())
         .await
@@ -537,12 +542,211 @@ async fn the_end_of_the_instance_wins_over_a_line_typed_as_it_ends() {
     .await;
 }
 
-const EVERY_COMMAND: [&[&str]; 9] = [
+const INSTALLED: &str = "https://installed.synthetic.invalid/";
+const CANDIDATE_A: &str = "https://tower-a.synthetic.invalid/";
+const CANDIDATE_B: &str = "https://tower-b.synthetic.invalid/";
+const CANDIDATE_C: &str = "https://tower-c.synthetic.invalid/";
+
+#[tokio::test]
+async fn candidate_pages_through_the_socket_make_one_read_each() {
+    bounded(async {
+        let fake =
+            FakeStation::new_domain_backed("STATION-A", "INSTANCE-1", "team.synthetic.invalid");
+        let setup = Client::new(fake.clone());
+        setup.tower_add(INSTALLED).await.unwrap();
+        fake.set_tower_state(TowerState::Denied {
+            reason: "test refusal".into(),
+        });
+        for (peer, id, urls) in [
+            ("bob", "STATION-B", &[CANDIDATE_C][..]),
+            (
+                "alice",
+                "STATION-AL",
+                &[CANDIDATE_B, INSTALLED, CANDIDATE_A][..],
+            ),
+            ("chris", "STATION-C", &[INSTALLED][..]),
+        ] {
+            setup.peer_add(peer, id).await.unwrap();
+            fake.receive_tower_candidates(peer, id, urls).unwrap();
+        }
+        let rig = serve(fake).await;
+        let initial = rig.fake.status();
+        let calls = rig.fake.requests().len();
+        let page_alice = concat!(
+            "candidate alice https://tower-b.synthetic.invalid/\n",
+            "candidate alice https://tower-a.synthetic.invalid/\n",
+        );
+        let page_bob = "candidate bob https://tower-c.synthetic.invalid/\n";
+        for (options, after_peer, limit, expected) in [
+            (
+                &[][..],
+                None,
+                TOWER_CANDIDATES_PAGE_MAX_GROUPS,
+                format!("{page_alice}{page_bob}"),
+            ),
+            (
+                &["--limit", "1"][..],
+                None,
+                1,
+                format!("{page_alice}next-after-peer alice\n"),
+            ),
+            (
+                &["--limit", "1", "--after-peer", "alice"][..],
+                Some("alice"),
+                1,
+                page_bob.to_owned(),
+            ),
+            (
+                &["--limit", "0"][..],
+                None,
+                0,
+                "next-after-peer \"\"\n".to_owned(),
+            ),
+            (
+                &["--limit", "0", "--after-peer", "a!"][..],
+                Some("a!"),
+                0,
+                "next-after-peer a!\n".to_owned(),
+            ),
+            (
+                &["--limit", "0", "--after-peer", "bob"][..],
+                Some("bob"),
+                0,
+                String::new(),
+            ),
+        ] {
+            let mut args = vec!["tower", "candidates"];
+            args.extend_from_slice(options);
+            assert_eq!(
+                exec(&rig.client, &args).await,
+                (Exit::Done, expected, String::new()),
+                "{args:?}",
+            );
+            let recorded = rig.fake.requests();
+            assert_eq!(
+                recorded.last(),
+                Some(&Request::TowerCandidates {
+                    after_peer: after_peer.map(str::to_owned),
+                    limit
+                }),
+            );
+        }
+        assert_eq!(rig.fake.requests().len() - calls, 6);
+        assert_eq!(rig.fake.status(), initial);
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tower_mutation_outcomes_through_the_socket() {
+    bounded(async {
+        let rig = serve(FakeStation::new_domain_backed(
+            "STATION-A",
+            "INSTANCE-1",
+            "team.synthetic.invalid",
+        ))
+        .await;
+        const TYPED: &str = "HTTPS://Tower-A.SYNTHETIC.INVALID.:443";
+        for (subcommand, text, request) in [
+            (
+                "add",
+                "added https://tower-a.synthetic.invalid/\n",
+                Request::TowerAdd { url: TYPED.into() },
+            ),
+            (
+                "add",
+                "https://tower-a.synthetic.invalid/ is already in the set\n",
+                Request::TowerAdd { url: TYPED.into() },
+            ),
+            (
+                "remove",
+                "removed https://tower-a.synthetic.invalid/\n",
+                Request::TowerRemove { url: TYPED.into() },
+            ),
+            (
+                "remove",
+                "https://tower-a.synthetic.invalid/ is not in the set\n",
+                Request::TowerRemove { url: TYPED.into() },
+            ),
+        ] {
+            let before = rig.fake.requests().len();
+            assert_eq!(
+                exec(&rig.client, &["tower", subcommand, TYPED]).await,
+                (Exit::Done, text.to_owned(), String::new()),
+            );
+            assert_eq!(&rig.fake.requests()[before..], &[request]);
+        }
+
+        let setup = Client::new(rig.fake.clone());
+        for index in 0..8 {
+            setup
+                .tower_add(&format!("https://installed-{index}.synthetic.invalid/"))
+                .await
+                .unwrap();
+        }
+        let before = rig.fake.requests().len();
+        assert_eq!(
+            exec(&rig.client, &["tower", "add", CANDIDATE_A]).await,
+            (
+                Exit::Failed,
+                String::new(),
+                "the tower set is full (maximum 8)\n".into()
+            ),
+        );
+        assert_eq!(
+            &rig.fake.requests()[before..],
+            &[Request::TowerAdd {
+                url: CANDIDATE_A.into()
+            }]
+        );
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pinned_tower_calls_through_the_socket_report_refusals_and_invalid_urls() {
+    bounded(async {
+        let rig = rig().await;
+        let before = rig.fake.requests().len();
+        for subcommand in ["add", "remove"] {
+            assert_eq!(
+                exec(&rig.client, &["tower", subcommand, FAKE_TOWER_URL]).await,
+                (
+                    Exit::Failed,
+                    String::new(),
+                    "this station uses pinned towers for this run\n".into()
+                ),
+            );
+            assert_eq!(
+                exec(
+                    &rig.client,
+                    &["tower", subcommand, "http://tower.synthetic.invalid/"]
+                )
+                .await,
+                (
+                    Exit::Failed,
+                    String::new(),
+                    "invalid url: plain HTTP tower URLs require a loopback IP address\n".into()
+                ),
+            );
+        }
+        assert_eq!(rig.fake.requests().len() - before, 4);
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+const EVERY_COMMAND: [&[&str]; 12] = [
     &["id"],
     &["status"],
     &["peer", "add", "bob", "STATION-B"],
     &["peer", "ls"],
     &["peer", "rm", "bob"],
+    &["tower", "candidates"],
+    &["tower", "add", CANDIDATE_A],
+    &["tower", "remove", CANDIDATE_A],
     &["send", "bob", "hi"],
     &["log"],
     &["log", "bob"],
