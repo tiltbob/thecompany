@@ -20,8 +20,9 @@ nothing in `/etc`. The unit does not use `ConfigurationDirectory=`: the files mu
 before the first start anyway, and the tower takes the config path from `ExecStart`.
 
 The service runs as a user that systemd allocates when it starts (`DynamicUser=yes`). It sees
-the file system read-only, except its state directory and a private `/tmp`, and no home
-directories; the rest of its sandbox is under [The sandbox](#the-sandbox).
+the file system read-only, except its state directory, a private `/tmp` and the host's
+`/dev/shm`, and no home directories; the rest of its sandbox is under
+[The sandbox](#the-sandbox).
 `StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
 `/var/lib/private/numbers-tower`, which only root can reach from outside the service. Inside
 the service that directory belongs to the service's user and has mode 0700
@@ -143,8 +144,9 @@ WARN numbers_tower::cli: ACME: the cache directory could not be read or written;
 ```
 
 The state directory is not usable. With this unit and the config above that should not
-happen: check whether the unit or `cache_dir` was changed. Until it is fixed, every restart
-orders a new certificate, and Let's Encrypt's rate limits soon stop that.
+happen: check whether the unit or `cache_dir` was changed. If neither was, see
+[When the sandbox refuses something](#when-the-sandbox-refuses-something). Until it is fixed,
+every restart orders a new certificate, and Let's Encrypt's rate limits soon stop that.
 
 ```text
 WARN numbers_tower::cli: ACME: a certificate step failed
@@ -254,17 +256,19 @@ from the service what a relay does not need. In practice the tower:
   `clone3(2)` is refused with `ENOSYS` and libc falls back to `clone(2)`, while systemd 250
   does not cover `clone3(2)`;
 - sees a private `/dev` with only `null`, `zero`, `full`, `random`, `urandom` and the TTY
-  devices;
+  devices, read-only except `/dev/pts` and the host's `/dev/shm` (and `/dev/mqueue` and
+  `/dev/hugepages` where the host has them), which stay writable;
 - cannot make memory writable and executable at once;
 - can make only the system calls of systemd's `@system-service` set, and only through the
   architecture systemd was built for: a call outside the set fails with "permission denied"
   (`EPERM`), except that systemd 255 answers a call newer than itself with `ENOSYS`, and a call
-  through another architecture's entry point (i386 on x86-64) kills the tower (`SIGSYS`);
+  through another architecture's entry point (i386 on x86-64) ends the thread that made it
+  (`SIGSYS`);
 - sees no process of another user in `/proc`, and none of its files about the kernel
   (`/proc/sys`, `/proc/net`, `/proc/meminfo` and the like);
 - creates files that only its own user can read (`UMask=0077`); a file that exists already
   keeps its mode, so an ACME cache written under an earlier unit keeps its 0644 files, also
-  after a renewal, which rewrites them in place.
+  after a renewal, which rewrites the certificate file in place.
 
 Each setting in the unit has a comment that says what it does. The unit needs systemd 250 or
 later: `ProcSubset=pid` together with `ProtectKernelTunables=yes` or `ProtectKernelLogs=yes`
@@ -305,15 +309,17 @@ the tower logged `tower: cannot use the ACME cache directory (read-only filesyst
 medium)` and stopped with status 78. A path that the sandbox hides (in `/proc` or `/dev`) is
 "not found" for the service. A socket of another address family than IPv4, IPv6 and local
 (`RestrictAddressFamilies=`) fails with "Address family not supported by protocol"
-(`EAFNOSUPPORT`). glibc's name lookup tries a netlink socket for a name with several addresses
-and carries on without it, so seeing this in a trace is expected.
+(`EAFNOSUPPORT`). glibc's name lookup tries a netlink socket for a name with several addresses,
+and for every name when the caller asks only for the address families the host has (as `getent`
+does), and carries on without it, so seeing this in a trace is expected.
 
 A filter that kills instead of answering `EPERM` (the default when `SystemCallErrorNumber=` is
 not set) shows differently: there is no line from the tower, systemd logs
 `Main process exited, code=killed, status=31/SYS`, and `systemctl status` shows
-`(code=killed, signal=SYS)`. This unit answers `EPERM`, so expect the first form, except for a
-call through another architecture's entry point: `SystemCallArchitectures=native` kills that
-one whatever `SystemCallErrorNumber=` says.
+`(code=killed, signal=SYS)`. This unit answers `EPERM`, so expect the first form. A call through
+another architecture's entry point is the exception: `SystemCallArchitectures=native` ends the
+thread that made it, whatever `SystemCallErrorNumber=` says. In a test with two threads, a call
+from the second thread ended only that thread; the process went on and systemd logged nothing.
 
 On the ACME client's path the cause is not shown. A refusal while the client resolves the Let's
 Encrypt name, connects to it or writes the cache shows only as a repeating `ACME: a certificate
@@ -335,10 +341,13 @@ sudo systemd-run --wait --pipe --quiet "${p[@]}" getent ahosts acme-staging-v02.
 ```
 
 It should list the same addresses as `getent ahosts acme-staging-v02.api.letsencrypt.org` run
-directly (with `production = true` the name is `acme-v02.api.letsencrypt.org`). If it does not,
-or if the order keeps failing while DNS and port 443 are fine, take settings out one at a time
-as described below, starting with `SystemCallFilter=`, `MemoryDenyWriteExecute=` and
-`RestrictAddressFamilies=`.
+directly (with `production = true` the name is `acme-v02.api.letsencrypt.org`). On a host with
+no IPv6 address other than `::1`, the sandboxed lookup also lists IPv6 addresses that the direct
+one leaves out: `getent` asks for the address families the host has, which glibc finds out
+through a netlink socket; the sandbox refuses that socket, and glibc then assumes both families.
+Compare the IPv4 addresses on such a host. If they differ, or if the order keeps failing while
+DNS and port 443 are fine, take settings out one at a time as described below, starting with
+`SystemCallFilter=`, `MemoryDenyWriteExecute=` and `RestrictAddressFamilies=`.
 
 ### Taking one setting out on one host
 
