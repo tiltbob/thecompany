@@ -119,8 +119,10 @@
 //!    message therefore contains none of these characters, so it is a single line also for a
 //!    consumer that splits on Unicode line breaks: U+000A to U+000D, U+001C to U+001E and U+0085
 //!    are control characters, and U+2028 and U+2029 are in the set. An outgoing body is logged as
-//!    the frontend sent it (rule 7). [`TowerState::Failing`] and [`TowerState::Denied`] carry
-//!    display text: show it, never match on it.
+//!    the frontend sent it (rule 7). The station uses [`clean_tower_display`] for the display
+//!    text in [`TowerState::Failing`] and [`TowerState::Denied`]. It limits each cleaned field
+//!    to a UTF-8 prefix of at most [`TOWER_TEXT_MAX_BYTES`] bytes before replying or publishing
+//!    an event. Show the text without matching on it.
 //! 10. **Peer book.** Peer names follow [`check_peer_name`] and are compared byte for byte.
 //!     [`Request::PeerAdd`] creates the peer or appends the station to an existing one and pushes
 //!     [`Event::Peer`]; adding a station the peer already has changes nothing and pushes nothing.
@@ -172,6 +174,9 @@ pub const API_VERSION: u32 = 2;
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
 pub const BODY_MAX_BYTES: usize = 16 * 1024;
+
+/// The largest tower error or denial text a station reports, in bytes of cleaned UTF-8.
+pub const TOWER_TEXT_MAX_BYTES: usize = 1024;
 
 /// The longest [`Message::id`], in bytes (64). An id is 1 to this many ASCII letters, digits,
 /// underscores or hyphens. Equal to the chat protocol's cap.
@@ -365,13 +370,13 @@ pub enum TowerState {
     Connected,
     /// The last attempt failed; the station keeps trying.
     Failing {
-        /// Why, as display text (rule 9).
+        /// Cleaned display text of at most [`TOWER_TEXT_MAX_BYTES`] bytes (rule 9).
         error: String,
     },
     /// The tower refused this station. Trying again does not help until the tower's policy
     /// changes.
     Denied {
-        /// Why, as display text (rule 9).
+        /// Cleaned display text of at most [`TOWER_TEXT_MAX_BYTES`] bytes (rule 9).
         reason: String,
     },
     /// The tower's connection state is unknown. This can happen for a tower other
@@ -624,8 +629,8 @@ impl std::error::Error for ApiError {}
 /// Unicode's Bidi_Control characters (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
 /// Every other `char` is kept.
 ///
-/// With [`clean`], the one definition of rule 9: the station core, the fake and any frontend that
-/// checks or cleans text again call these two rather than keeping their own list.
+/// This predicate defines the set for [`clean`] and [`clean_tower_display`], so stations and
+/// frontends can apply rule 9 without a separate list.
 pub fn is_replaced(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -652,6 +657,22 @@ pub fn clean(text: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Replaces rule 9 characters with spaces and returns the longest cleaned prefix that fits in
+/// [`TOWER_TEXT_MAX_BYTES`] bytes. The prefix ends at a UTF-8 character boundary.
+///
+/// This is a producer-side limit for tower display text. The wire form is unchanged.
+pub fn clean_tower_display(text: &str) -> String {
+    let mut prefix = String::with_capacity(text.len().min(TOWER_TEXT_MAX_BYTES));
+    for c in text.chars() {
+        let c = if is_replaced(c) { ' ' } else { c };
+        if prefix.len() + c.len_utf8() > TOWER_TEXT_MAX_BYTES {
+            break;
+        }
+        prefix.push(c);
+    }
+    prefix
 }
 
 /// Checks a peer name: 1 to [`PEER_NAME_MAX_BYTES`] ASCII letters, digits, `.`, `_` and `-`,
@@ -683,7 +704,7 @@ pub fn check_peer_name(name: &str) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean, is_replaced};
+    use super::{TOWER_TEXT_MAX_BYTES, clean, clean_tower_display, is_replaced};
     use std::borrow::Cow;
 
     /// Rule 9's set, written out.
@@ -734,5 +755,36 @@ mod tests {
             let one = c.to_string();
             assert_eq!(clean(&one), " ");
         }
+    }
+
+    #[test]
+    fn tower_display_keeps_ordinary_text_and_json_punctuation() {
+        let text = "warning: \"café\" \\路径 e\u{0301} 🧭";
+        assert_eq!(clean_tower_display(text), text);
+        assert!(clean_tower_display("").is_empty());
+    }
+
+    #[test]
+    fn tower_display_ends_at_the_longest_fitting_character_prefix() {
+        let head = "a".repeat(TOWER_TEXT_MAX_BYTES - 2);
+        assert_eq!(
+            clean_tower_display(&format!("{head}éx")),
+            format!("{head}é")
+        );
+        assert_eq!(clean_tower_display(&format!("{head}界x")), head);
+    }
+
+    #[test]
+    fn tower_display_caps_bytes_after_replacing_multibyte_characters() {
+        let separators = "\u{2028}\u{202E}".repeat((TOWER_TEXT_MAX_BYTES - 2) / 2);
+        let input = format!("{separators}éx");
+        let spaces = " ".repeat(TOWER_TEXT_MAX_BYTES - 2);
+        assert_eq!(clean_tower_display(&input), format!("{spaces}é"));
+
+        let head = "a".repeat(TOWER_TEXT_MAX_BYTES - 1);
+        assert_eq!(
+            clean_tower_display(&format!("{head}\u{2028}")),
+            format!("{head} ")
+        );
     }
 }

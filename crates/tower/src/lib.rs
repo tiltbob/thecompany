@@ -291,13 +291,16 @@ pub enum TowerError {
     AcmeCacheNotADirectory,
     /// The ACME cache directory could not be checked, created or written by the tower's user;
     /// the kind of I/O error says why, for example `PermissionDenied` for a directory the
-    /// tower cannot write to, or `InvalidInput` for an empty path. The error names no path.
+    /// tower cannot write to, `InvalidInput` for an empty path, or `AlreadyExists` when every
+    /// name the write probe may use is taken. The error names no path.
     #[error("cannot use the ACME cache directory ({0})")]
     AcmeCacheUnusable(std::io::ErrorKind),
-    /// The ACME cache directory belongs to another user than the tower's.
+    /// The ACME cache directory belongs to another user than the tower's (on unix: its owner
+    /// is not the process's effective user id).
     ///
-    /// It must be private to, owned by and writable for the tower's user. The error names no
-    /// path and no user.
+    /// It must be private to, owned by and writable for the tower's user. The owner is checked
+    /// before anything is created in the directory, so a refused directory is left as it was.
+    /// The error names no path and no user.
     #[error("the ACME cache directory must belong to the tower's user")]
     AcmeCacheNotOwned,
     /// The relay stopped by itself, without being asked to: one of its listeners or its ACME

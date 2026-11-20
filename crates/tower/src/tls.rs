@@ -135,8 +135,10 @@ pub enum CertSource {
     /// just before the ACME client starts: an empty path is refused; a missing directory is
     /// created (on unix with mode 0700, and so is every missing directory above it); then the
     /// directory is checked as it is, also after a create: a path that is not a directory, and
-    /// on unix one that the group or others can access or that another user owns, is refused,
-    /// and a file is created in it and removed again to see that the tower can write there.
+    /// on unix one that the group or others can access or whose owner is not the tower's
+    /// effective user, is refused before anything is created in it. Last, a file with a name
+    /// of its own (`.numbers-tower-write-probe-<pid>-<n>`) is created in it and removed again
+    /// to see that the tower can write there; no other entry is ever removed.
     /// The ACME client does not report a cache it cannot use: it would serve its certificate
     /// from memory and register a new account and order a new certificate at every restart,
     /// and soon hit Let's Encrypt's rate limits. A systemd unit that provides the directory with
@@ -456,9 +458,12 @@ fn is_acme_domain(name: &str) -> bool {
     canonical_host(name).is_some_and(|host| ip_literal(&host).is_none() && host.contains('.'))
 }
 
-/// The name of the file that [`prepare_acme_cache`] creates and removes to see that the tower
-/// can write to the cache directory.
+/// The prefix of the file that [`prepare_acme_cache`] creates and removes to see that the tower
+/// can write to the cache directory: the probe is named `<prefix>-<pid>-<n>`.
 const ACME_CACHE_PROBE: &str = ".numbers-tower-write-probe";
+
+/// How many probe names (`n` from 0) [`probe_acme_cache`] tries before it gives up.
+const ACME_CACHE_PROBE_NAMES: u32 = 8;
 
 /// Makes sure the ACME cache directory exists, is private to the tower's user, belongs to that
 /// user and can be written by it, before the ACME client is started (it would create the
@@ -467,12 +472,14 @@ const ACME_CACHE_PROBE: &str = ".numbers-tower-write-probe";
 /// restart).
 ///
 /// An empty path is refused: the ACME client would write both keys into the working
-/// directory. On unix: a missing directory is created with mode 0700, and so is every missing
-/// directory above it; an existing one must not be accessible to the group or to others; a
-/// path that exists and is not a directory is refused. Then, everywhere, a file named
-/// [`ACME_CACHE_PROBE`] is created (`create_new`) and removed again; any failure is
-/// [`TowerError::AcmeCacheUnusable`]. On unix the directory must have the same owner as that
-/// file, the tower's user. The path is followed if it is a symbolic link.
+/// directory. A missing directory is created (on unix with mode 0700, and so is every missing
+/// directory above it), and the checks below run on what is there afterwards, created or not.
+/// A path that exists and is not a directory is refused. On unix, a directory the group or
+/// others can access is refused, and so is one whose owner is not the tower's effective user;
+/// both checks come before anything is created in the directory, so nothing in a refused
+/// directory is touched. Last, [`probe_acme_cache`] creates a file of its own in the
+/// directory and removes it again; any failure is [`TowerError::AcmeCacheUnusable`]. The path
+/// is followed if it is a symbolic link.
 pub(crate) fn prepare_acme_cache(dir: &Path) -> Result<(), TowerError> {
     let unusable = |error: std::io::Error| TowerError::AcmeCacheUnusable(error.kind());
     if dir.as_os_str().is_empty() {
@@ -499,54 +506,44 @@ pub(crate) fn prepare_acme_cache(dir: &Path) -> Result<(), TowerError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(TowerError::AcmeCacheNotPrivate);
         }
-    }
-    let probe_owner = probe_acme_cache(dir).map_err(unusable)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != probe_owner {
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
             return Err(TowerError::AcmeCacheNotOwned);
         }
     }
     #[cfg(not(unix))]
-    let _ = (metadata, probe_owner);
-    Ok(())
+    let _ = metadata;
+    probe_acme_cache(dir).map_err(unusable)
 }
 
-/// Creates and removes [`ACME_CACHE_PROBE`] in `dir`, and returns the owner of the file it
-/// created (on unix its uid; elsewhere 0). A probe left behind by a process that died in
-/// between is removed first.
-fn probe_acme_cache(dir: &Path) -> std::io::Result<u32> {
-    let probe = dir.join(ACME_CACHE_PROBE);
-    let create = || {
-        std::fs::OpenOptions::new()
+/// Creates a file named `<ACME_CACHE_PROBE>-<pid>-<n>` in `dir` exclusively (`create_new`) and
+/// removes it again, through the path it created. A name that is taken is left alone and the
+/// next `n` is tried; when all [`ACME_CACHE_PROBE_NAMES`] are taken this fails with
+/// `AlreadyExists`. It never removes an entry it did not create: a probe that an earlier
+/// process left behind (it died between the create and the remove) stays. Such a file is
+/// empty, carries the tower's own prefix and is harmless, and a later start, with another
+/// process id, uses another name.
+fn probe_acme_cache(dir: &Path) -> std::io::Result<()> {
+    let pid = std::process::id();
+    for n in 0..ACME_CACHE_PROBE_NAMES {
+        let probe = dir.join(format!("{ACME_CACHE_PROBE}-{pid}-{n}"));
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&probe)
-    };
-    let file = match create() {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(&probe)?;
-            create()?
+        {
+            Ok(file) => {
+                drop(file);
+                return std::fs::remove_file(&probe);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
-        result => result?,
-    };
-    let metadata = file.metadata();
-    drop(file);
-    std::fs::remove_file(&probe)?;
-    let metadata = metadata?;
-    #[cfg(unix)]
-    let owner = std::os::unix::fs::MetadataExt::uid(&metadata);
-    #[cfg(not(unix))]
-    let owner = {
-        let _ = metadata;
-        0
-    };
-    Ok(owner)
+    }
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
 #[cfg(test)]
@@ -951,20 +948,71 @@ mod acme_cache_tests {
         root
     }
 
+    /// The names in `dir`, sorted, with each file's content (the fixtures are text).
+    fn listing(dir: &Path) -> Vec<(String, String)> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let content = std::fs::read(entry.path()).unwrap_or_default();
+                let content = String::from_utf8_lossy(&content).into_owned();
+                (entry.file_name().into_string().unwrap(), content)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The probe removes its own file and nothing else: the old fixed name, a probe name of
+    /// another process and a probe name of this process with `n = 0`, all non-empty, are still
+    /// there with their content afterwards, and nothing new is left.
     #[test]
     fn the_write_probe_leaves_no_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         prepare_acme_cache(dir.path()).unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-        // A probe left behind by a process that died is removed too.
-        std::fs::write(dir.path().join(super::ACME_CACHE_PROBE), "").unwrap();
+
+        let probe = super::ACME_CACHE_PROBE;
+        let pid = std::process::id();
+        for (name, content) in [
+            (probe.to_owned(), "old fixed name"),
+            (
+                format!("{probe}-{}-0", pid.wrapping_add(1)),
+                "another process",
+            ),
+            (format!("{probe}-{pid}-0"), "this process, taken"),
+        ] {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let before = listing(dir.path());
         prepare_acme_cache(dir.path()).unwrap();
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(listing(dir.path()), before);
+    }
+
+    /// When every probe name of this process is taken, the probe fails and removes none.
+    #[test]
+    fn a_probe_with_every_name_taken_fails_and_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid = std::process::id();
+        for n in 0..super::ACME_CACHE_PROBE_NAMES {
+            let name = format!("{}-{pid}-{n}", super::ACME_CACHE_PROBE);
+            std::fs::write(dir.path().join(name), "taken").unwrap();
+        }
+        let before = listing(dir.path());
+        assert!(matches!(
+            prepare_acme_cache(dir.path()),
+            Err(TowerError::AcmeCacheUnusable(
+                std::io::ErrorKind::AlreadyExists
+            ))
+        ));
+        assert_eq!(listing(dir.path()), before);
     }
 
     /// A directory the tower cannot write to is refused. Root can write to a 0500 directory,
-    /// so as root the probe passes; CI runs this as an unprivileged user.
+    /// so as root (as on a developer's container) only the first branch runs and the probe
+    /// passes; CI runs as an unprivileged user and checks the refusal.
     #[test]
     fn a_cache_directory_the_tower_cannot_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -984,11 +1032,12 @@ mod acme_cache_tests {
         }
     }
 
-    /// A private, writable directory that another user owns is refused. Only root can give a
-    /// directory away, so this runs as root only; as another user the probe already refuses
-    /// such a directory (see the test above).
+    /// A private directory that another user owns is refused before anything in it is
+    /// touched: its entries, among them one with the old fixed probe name, are unchanged. Only
+    /// root can give a directory away, so this runs as root only (not in CI); as another user
+    /// the owner check refuses such a directory the same way, before the probe.
     #[test]
-    fn a_cache_directory_another_user_owns_is_refused() {
+    fn a_cache_directory_another_user_owns_is_refused_untouched() {
         let dir = tempfile::tempdir().unwrap();
         if !running_as_root(dir.path()) {
             return;
@@ -996,11 +1045,32 @@ mod acme_cache_tests {
         let cache = dir.path().join("acme");
         std::fs::create_dir(&cache).unwrap();
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(cache.join(super::ACME_CACHE_PROBE), "sentinel").unwrap();
+        std::fs::write(cache.join("cached_account_x"), "another user's key").unwrap();
         std::os::unix::fs::chown(&cache, Some(65534), Some(65534)).unwrap();
+        let before = listing(&cache);
+        // Creating and removing a file changes the directory's modification time, so an
+        // unchanged time shows that no probe was made either.
+        let modified = std::fs::metadata(&cache).unwrap().modified().unwrap();
         assert!(matches!(
             prepare_acme_cache(&cache),
             Err(TowerError::AcmeCacheNotOwned)
         ));
+        assert_eq!(listing(&cache), before);
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(
+            before,
+            vec![
+                (super::ACME_CACHE_PROBE.to_owned(), "sentinel".to_owned()),
+                (
+                    "cached_account_x".to_owned(),
+                    "another user's key".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]
