@@ -70,7 +70,7 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 - CI: `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
   `cargo test --workspace`; per-package checks that `--workspace` would mask through feature
   unification — `cargo check -p numbers` with the exact iroh features the plan assumes
-  (`default-features = false, features = ["tls-ring"]`, so far only read), and later
+  (`default-features = false, features = ["tls-ring"]`), and later
   `cargo tree -p <pkg> -e normal,build` for the confinement rule.
 - `CLAUDE.md`: build and test commands plus the hard rules — agent confinement; the harness-credential
   rule; towers never hold keys; one station per identity; frontends hold no network state; libraries
