@@ -238,9 +238,10 @@ connection while that hello is pending is refused immediately with code `0`. A s
 outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
 If the fallback also loses and no open link, incoming hello or shared dial remains, the send
 returns `Disconnected` even if the deadline has time left. A send that shares a failed dial
-receives that dial's error under the same conditions. In direct-only multithreaded restart tests,
-iroh could redial the peer's old address immediately after a stall close. M1 relies on the tower
-path for recovery in this case. [#120](https://github.com/tiltbob/thecompany/issues/120)
+receives that dial's error under the same conditions. When the direct-only restart tests were run
+on a multi-thread runtime, iroh could redial the peer's old address immediately after a stall
+close. M1 relies on the tower path for recovery in this case.
+[#120](https://github.com/tiltbob/thecompany/issues/120)
 
 If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
 lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
@@ -254,8 +255,10 @@ authorization refusal, `409` for replacement, and `0` for ordinary closure. At i
 deadline, the dialer reports `Timeout` and closes any pending connection with `0`. During setup,
 a remote `400` or `403` ends the dial as `BadHello` or `NotAllowed`, respectively. A remote `409`
 uses the winner and fallback rules above. Other 32-bit application close codes are classified as
-`Disconnected`. Either end of an admitted link can open a bidirectional chat stream with the
-header `{"proto":"chat","v":1}`, followed by one message.
+`Disconnected`. During the hello exchange, a close without an application code, such as a
+transport-level close, or with a code above 32 bits ends the dial as `BadHello`, because every I/O
+failure of the hello exchange is mapped to it. Either end of an admitted link can open a
+bidirectional chat stream with the header `{"proto":"chat","v":1}`, followed by one message.
 Each JSON frame has a four-byte big-endian length and a payload limit of 64 KiB.
 
 A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
