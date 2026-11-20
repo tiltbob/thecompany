@@ -441,19 +441,22 @@ n0-dns-resolver, hence the direct dependency. `SrvRecordData { priority, weight,
 ```rust
 use iroh::RelayUrl;
 use n0_dns_resolver::{DnsResolver, Error, SrvRecordData};
+use numbers::canonical_tower_url;
 
 pub async fn lookup(domain: &str) -> Result<Vec<RelayUrl>, LocateError> {
     let name = format!("_numbers._tcp.{}.", domain.trim_end_matches('.')); // FQDN: no search list
-    let recs: Vec<SrvRecordData> = match DnsResolver::system_with_fallback().lookup_srv(name).await {
+    let resolver = DnsResolver::builder().use_system_config().build();
+    let recs: Vec<SrvRecordData> = match resolver.lookup_srv(name).await {
         Ok(recs) => recs,                          // NODATA is Ok(vec![])
         Err(Error::NxDomain { .. }) => Vec::new(), // non_exhaustive: `{ .. }` required
         Err(err) => return Err(LocateError::Dns(err)),
     };
     let mut urls: Vec<RelayUrl> = recs
         .iter()
-        .map(|r| (r.target.trim_end_matches('.'), r.port))
+        .map(|r| (r.target.as_str(), r.port))
         .filter(|(host, _)| !host.is_empty())     // target "." arrives as "": not available
-        .filter_map(|(host, port)| format!("https://{host}.:{port}").parse().ok())
+        .filter_map(|(host, port)| canonical_tower_url(&format!("https://{host}:{port}")).ok())
+        .filter_map(|url| url.parse().ok())
         .collect();
     urls.sort();
     urls.dedup();
@@ -462,11 +465,12 @@ pub async fn lookup(domain: &str) -> Result<Vec<RelayUrl>, LocateError> {
 }
 ```
 
-- Query `_numbers._tcp` (the first review used an older label). Build `https://{target}.:{port}` once
-  and use it everywhere (`RelayUrl` compares textually; `url` drops port 443); leave user `--tower`
-  URLs untouched; unit-test this one function.
+- Query `_numbers._tcp` (the first review used an older label). `RelayUrl` compares textually.
+  Canonicalise both SRV targets and explicit `--tower` URLs with `numbers::canonical_tower_url`.
+  The URL parser drops port 443 and lowercases DNS names. Numbers also removes a DNS trailing dot.
+  The pinned rustls name parser similarly strips a single trailing dot before SNI.
 - Priority and weight are ignored; SRV-located towers are always `https`, QAD on UDP 7842.
-- `system_with_fallback()` asks Cloudflare, Google and Quad9 when system DNS fails, so a split-horizon
-  zone looks like NXDOMAIN: build without the fallback or document it. On Apple it reads SCDynamicStore.
+- `system_with_fallback()` asks Cloudflare, Google and Quad9 when system DNS fails. Use the system
+  configuration alone so split-horizon queries stay on system DNS. On Apple it reads SCDynamicStore.
 - SRV only bootstraps: a running station applies tower-set changes with `insert_relay` /
   `remove_relay`, and `TowerLookup` reads the same shared `RelayMap`.

@@ -160,6 +160,7 @@ by id through the towers, and iroh moves the connection to a direct path when it
   and metadata only.
 - **Same set everywhere.** With no better address, dialing tries every tower in the set at once, so
   all nodes must use the same small set (two or three). SRV priority and weight are ignored.
+  `TowerSet` caps the set at eight unique canonical URLs. Each entry carries its own QAD setting.
 - **Not an open relay.** A production tower admits only listed node ids and rate-limits each client:
   a static list in M2, fed from the roster in M3 (verifiable against the genesis hash, no secret).
   This is hygiene run by an untrusted party, not a security boundary.
@@ -429,6 +430,8 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
+  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
+  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
@@ -494,8 +497,10 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
 - **SRV (M2).** `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
   `SrvRecordData {priority, weight, port, target}`. Query the FQDN with a trailing dot; targets come
   back without one; NXDOMAIN is `Err(Error::NxDomain {..})`, an empty answer is `Ok(vec![])`.
-  `RelayUrl` equality is textual, so canonicalise once. SRV-located towers are always `https`. The
-  system resolver falls back to public resolvers unless that is disabled.
+  `RelayUrl` equality is textual. Use `canonical_tower_url` for explicit, SRV, remembered and
+  peer-passed tower URLs. It removes the DNS trailing dot and default port and keeps the root slash.
+  SRV-located towers are always `https`. The system resolver falls back to public resolvers unless
+  that is disabled.
 - **Claude Code and API keys.** There is no login command that reads an API key. The CLI takes one
   from `ANTHROPIC_API_KEY` (an interactive session asks once whether to use it and remembers the
   answer; `-p` always uses it) or from the output of the shell command the `apiKeyHelper` setting

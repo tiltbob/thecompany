@@ -64,6 +64,7 @@ async fn bind_direct() -> (Endpoint, Arc<Authorizer>) {
     bind(EndpointConfig {
         towers: TowerSet::default(),
         ip_transport: IpTransport::LoopbackOnly,
+        ..EndpointConfig::default()
     })
     .await
 }
@@ -252,6 +253,7 @@ async fn simultaneous_sends_finish_in_both_directions_over_the_relay() {
             let relay_config = EndpointConfig {
                 towers: checked(TowerSet::from_url(tower.url()), "parse tower URL"),
                 ip_transport: IpTransport::RelayOnly,
+                ..EndpointConfig::default()
             };
             let (first, first_auth) = bind(relay_config.clone()).await;
             let (second, second_auth) = bind(relay_config).await;

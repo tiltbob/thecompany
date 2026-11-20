@@ -8,7 +8,7 @@ use numbers_tower::{Tower, TowerConfig};
 use tokio::sync::mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel};
 use tokio::time::timeout;
 
-use super::{Endpoint, EndpointConfig, IpTransport};
+use super::{DnsConfig, Endpoint, EndpointBindError, EndpointConfig, IpTransport, TlsRoots};
 use crate::{Authorizer, TowerSet, generate_node_key};
 
 const ALPN: &[u8] = b"test/endpoint/0";
@@ -24,6 +24,30 @@ impl ProtocolHandler for ObserveAccept {
 }
 
 #[tokio::test]
+async fn bind_rejects_unsupported_tls_and_dns_settings() {
+    let key = generate_node_key();
+    let policy = Arc::new(Authorizer::new(&[ALPN], &[]));
+    for tls_roots in [TlsRoots::WebPkiPlus(vec![]), TlsRoots::CustomOnly(vec![])] {
+        let config = EndpointConfig {
+            tls_roots,
+            ..EndpointConfig::default()
+        };
+        assert!(matches!(
+            Endpoint::bind(&key, config, policy.clone()).await,
+            Err(EndpointBindError::UnsupportedTlsRoots)
+        ));
+    }
+    let config = EndpointConfig {
+        dns: DnsConfig::Nameserver((Ipv4Addr::LOCALHOST, 53).into()),
+        ..EndpointConfig::default()
+    };
+    assert!(matches!(
+        Endpoint::bind(&key, config, policy).await,
+        Err(EndpointBindError::UnsupportedDns)
+    ));
+}
+
+#[tokio::test]
 async fn router_ignores_unknown_relayed_peer_before_handshake() {
     timeout(Duration::from_secs(45), async {
         let tower = Tower::spawn(TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into()))
@@ -32,6 +56,7 @@ async fn router_ignores_unknown_relayed_peer_before_handshake() {
         let config = EndpointConfig {
             towers: TowerSet::from_url(tower.url()).expect("parse loopback tower URL"),
             ip_transport: IpTransport::RelayOnly,
+            ..EndpointConfig::default()
         };
         let callee = Endpoint::bind(
             &generate_node_key(),

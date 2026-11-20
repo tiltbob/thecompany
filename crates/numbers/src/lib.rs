@@ -11,7 +11,8 @@ pub mod proto;
 pub mod towers;
 
 pub use endpoint::{
-    Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+    DnsConfig, Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+    TlsRoots,
 };
 pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
 pub use identity::{NodeId, generate_node_key, node_id};
@@ -19,4 +20,4 @@ pub use link::{
     IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate, SendError,
     ShutdownError,
 };
-pub use towers::{TowerSet, TowerSetError};
+pub use towers::{Qad, TowerEntry, TowerSet, TowerSetError, canonical_tower_url};
