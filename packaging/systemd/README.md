@@ -135,7 +135,8 @@ WARN numbers_tower::cli: ACME: a certificate order failed; the tower retries wit
 ```
 
 Let's Encrypt did not issue the certificate. Check that the host name resolves to this host
-and that port 443 is reachable from the internet; the tower keeps trying.
+and that port 443 is reachable from the internet; the tower keeps trying. If both are fine, see
+[When the sandbox refuses something](#when-the-sandbox-refuses-something).
 
 ```text
 WARN numbers_tower::cli: ACME: the cache directory could not be read or written; certificates are not kept across restarts
@@ -248,17 +249,22 @@ from the service what a relay does not need. In practice the tower:
 
 - cannot change kernel settings under `/proc/sys` and `/sys`, load kernel modules, read the
   kernel log, change control groups, set the clock or change the host name;
-- cannot create namespaces, use realtime scheduling or change its execution domain
-  (`personality(2)`);
+- cannot create or enter namespaces through `unshare(2)`, `clone(2)` or `setns(2)`, use realtime
+  scheduling or change its execution domain (`personality(2)`); from systemd 251 on,
+  `clone3(2)` is refused with `ENOSYS` and libc falls back to `clone(2)`, while systemd 250
+  does not cover `clone3(2)`;
 - sees a private `/dev` with only `null`, `zero`, `full`, `random`, `urandom` and the TTY
   devices;
 - cannot make memory writable and executable at once;
 - can make only the system calls of systemd's `@system-service` set, and only through the
-  architecture systemd was built for; another call fails with "permission denied" (`EPERM`),
-  except that systemd 255 answers a call newer than itself with `ENOSYS`;
+  architecture systemd was built for: a call outside the set fails with "permission denied"
+  (`EPERM`), except that systemd 255 answers a call newer than itself with `ENOSYS`, and a call
+  through another architecture's entry point (i386 on x86-64) kills the tower (`SIGSYS`);
 - sees no process of another user in `/proc`, and none of its files about the kernel
   (`/proc/sys`, `/proc/net`, `/proc/meminfo` and the like);
-- creates files that only its own user can read (`UMask=0077`).
+- creates files that only its own user can read (`UMask=0077`); a file that exists already
+  keeps its mode, so an ACME cache written under an earlier unit keeps its 0644 files, also
+  after a renewal, which rewrites them in place.
 
 Each setting in the unit has a comment that says what it does. The unit needs systemd 250 or
 later: `ProcSubset=pid` together with `ProtectKernelTunables=yes` or `ProtectKernelLogs=yes`
@@ -273,7 +279,8 @@ systemd-analyze security numbers-tower
 It prints one line per setting and ends with the overall level. Under systemd 255 this unit
 gives `Overall exposure level for numbers-tower.service: 1.6 OK`, with and without the
 certificate drop-in; the unit before the sandbox gave `5.4 MEDIUM`. Most lines still marked
-`✗` are about the network and `CAP_NET_BIND_SERVICE`, which a relay needs; the others are
+`✗` are about the network and `CAP_NET_BIND_SERVICE`, which a relay needs. `DeviceAllow=` is
+marked for the read access to real-time clocks that `ProtectClock=yes` adds. The others are
 settings the unit does not take, such as `PrivateUsers=` and leaving `@privileged` and
 `@resources` out of the filter.
 
@@ -287,6 +294,7 @@ drop-in that took `bind` out of the filter (`SystemCallFilter=~bind`), the journ
 ```text
 tower: cannot bind the plain-HTTP listener (permission denied)
 numbers-tower.service: Main process exited, code=exited, status=1/FAILURE
+numbers-tower.service: Failed with result 'exit-code'.
 numbers-tower.service: Scheduled restart job, restart counter is at 1.
 ```
 
@@ -295,19 +303,55 @@ and `(code=exited, status=1/FAILURE)`, and the tower was started again every 5 s
 write to a read-only path is refused the same way: with `cache_dir` outside the state directory
 the tower logged `tower: cannot use the ACME cache directory (read-only filesystem or storage
 medium)` and stopped with status 78. A path that the sandbox hides (in `/proc` or `/dev`) is
-"not found" for the service.
+"not found" for the service. A socket of another address family than IPv4, IPv6 and local
+(`RestrictAddressFamilies=`) fails with "Address family not supported by protocol"
+(`EAFNOSUPPORT`). glibc's name lookup tries a netlink socket for a name with several addresses
+and carries on without it, so seeing this in a trace is expected.
 
 A filter that kills instead of answering `EPERM` (the default when `SystemCallErrorNumber=` is
 not set) shows differently: there is no line from the tower, systemd logs
 `Main process exited, code=killed, status=31/SYS`, and `systemctl status` shows
-`(code=killed, signal=SYS)`. This unit answers `EPERM`, so expect the first form.
+`(code=killed, signal=SYS)`. This unit answers `EPERM`, so expect the first form, except for a
+call through another architecture's entry point: `SystemCallArchitectures=native` kills that
+one whatever `SystemCallErrorNumber=` says.
+
+On the ACME client's path the cause is not shown. A refusal while the client resolves the Let's
+Encrypt name, connects to it or writes the cache shows only as a repeating `ACME: a certificate
+order failed; the tower retries with a growing delay`, `ACME: a certificate step failed` or
+`ACME: the cache directory could not be read or written; certificates are not kept across
+restarts`, and the service stays active. The same lines come from DNS, firewall or Let's
+Encrypt trouble, so check those first (see [Start](#start)). The tests did not place a real
+order under the sandbox. To check name resolution under the unit's own sandbox lines (not those
+of its drop-ins), turn them into properties:
+
+```bash
+mapfile -t p < <(sed -n -E 's/^((DynamicUser|NoNewPrivileges|Protect[A-Za-z]+|Restrict[A-Za-z]+|PrivateDevices|LockPersonality|MemoryDenyWriteExecute|SystemCall[A-Za-z]+|ProcSubset|UMask)=.*)/--property=\1/p' /etc/systemd/system/numbers-tower.service)
+```
+
+and look the name up in a transient service with them:
+
+```bash
+sudo systemd-run --wait --pipe --quiet "${p[@]}" getent ahosts acme-staging-v02.api.letsencrypt.org
+```
+
+It should list the same addresses as `getent ahosts acme-staging-v02.api.letsencrypt.org` run
+directly (with `production = true` the name is `acme-v02.api.letsencrypt.org`). If it does not,
+or if the order keeps failing while DNS and port 443 are fine, take settings out one at a time
+as described below, starting with `SystemCallFilter=`, `MemoryDenyWriteExecute=` and
+`RestrictAddressFamilies=`.
 
 ### Taking one setting out on one host
 
 If a refusal looks like the sandbox's, take the one setting out with a drop-in, restart, and see
 whether the error goes away. An empty value resets a list such as `SystemCallFilter=`; a yes/no
 setting takes `no`, and one with values takes its default (`ProcSubset=all`,
-`ProtectProc=default`). For the system-call filter:
+`ProtectProc=default`). Three settings cannot be taken out this way while `DynamicUser=yes` is
+set: systemd keeps `NoNewPrivileges=yes` and `ProtectSystem=strict` whatever a drop-in says,
+and turns `ProtectHome=no` into `ProtectHome=read-only`.
+`systemctl show -p NoNewPrivileges -p ProtectSystem -p ProtectHome numbers-tower` shows the
+values in effect. A refusal that stays with such a drop-in does not rule those settings out.
+
+For the system-call filter:
 
 ```bash
 sudo install -d -m 0755 /etc/systemd/system/numbers-tower.service.d
