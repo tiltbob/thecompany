@@ -89,14 +89,21 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/numbers/src/towers.rs` | `TowerSet`: canonical URL list with a QAD setting per tower. M1 takes one explicit URL |
 | `crates/numbers/src/endpoint.rs` | builds the iroh `Endpoint` from `presets::Minimal`: relay map with an explicit config per tower, `TowerLookup` (an `AddressLookup` mapping any node id to the tower URLs, so dialing needs only an id), port mapping off, lowered stream caps, a relay-only switch for tests |
 | `crates/numbers/src/gate.rs` | the one authorization point: an `Authorizer` that maps a node id and protocol to a caller (a peer name in M1, a roster entry later) or a refusal; a pre-handshake filter that ignores relayed attempts from ids it does not know and demands address validation from direct ones; the `after_handshake` hook; close codes |
-| `crates/numbers/src/link.rs` | ALPN `numbers/0`; a hello frame each way (`v`, with `network` and `head` empty until M3); one link per peer — either side opens streams on it, and if both dialed, the one dialed by the lower node id is kept; `StreamHeader {proto, v}`; stream dispatch; timeouts from config |
-| `crates/numbers/src/proto/chat.rs` | `ChatMessage {id, sent_at_ms, body}` answered by `Ack` / `Nack`; one stream per message; 16 KiB body cap; the receiver dedupes on (peer, id); the sender's id and time are untrusted |
+| `crates/numbers/src/link.rs` | Authenticated ALPN `numbers/0` with a version 1 hello each way and empty `network` and `head` fields. Either peer can open streams. Simultaneous dials keep the connection initiated by the lower node id. Configured deadlines cover dial, hello and chat. |
+| `crates/numbers/src/proto/` | Version 1 hello and typed stream headers. One chat per stream with a typed `Ack` or `Nack`. Bodies use padded standard base64 and decode to at most 16 KiB. `ReceiptWindow` tracks accepted messages by local peer name and message id. |
 | `crates/chief/src/api.rs` | the station API: `Request`, `Response`, `Event`, `ApiError`, `Status`, `Peer {name, stations: [{station_id, link}]}`, `Message {seq, rev, id, peer, direction, body, at_ms, status}`; FFI-exportable types only |
 | `crates/chief/src/client.rs` | `Transport` (methods return `impl Future + Send`; static dispatch), `SocketTransport`, `Client` with typed methods, a concrete `Subscription` whose `next()` is cancel-safe |
 | `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; strips control characters from peer text; usable in-process as a `Transport` |
 | `crates/station/src/ipc.rs` | the socket server (rules below); hello `{api: 1}` answered with the station's API version, the station id and a per-start instance id; one connection per call or subscription; read deadlines on calls, never on an open subscription |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
 | `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
+
+The receiving station uses one in-memory FIFO for the newest 1,000 first receipts across all
+peers. Its key is the local peer name and the message id, so retries from different stations of
+the same peer share a receipt. The receiving actor records a new receipt, logs the message and
+publishes its event as one operation before acknowledging it. Retries get another ACK without
+adding a log entry, publishing a new event or changing FIFO order. The window starts empty after
+a restart. [Decision #65](https://github.com/tiltbob/thecompany/issues/65)
 
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when

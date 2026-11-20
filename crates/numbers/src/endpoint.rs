@@ -127,6 +127,10 @@ impl Endpoint {
     pub fn authorizer(&self) -> &Authorizer {
         &self.gate.authorizer
     }
+
+    pub(crate) fn authorizer_handle(&self) -> Arc<Authorizer> {
+        Arc::clone(&self.gate.authorizer)
+    }
 }
 
 impl fmt::Debug for Endpoint {

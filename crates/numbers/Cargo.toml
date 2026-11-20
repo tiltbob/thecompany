@@ -6,16 +6,19 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 numbers-base.workspace = true
 iroh.workspace = true
 iroh-relay.workspace = true
 n0-future.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]
 numbers-tower.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

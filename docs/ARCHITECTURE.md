@@ -190,6 +190,23 @@ of roster proofs. Control messages are length-prefixed JSON frames (size-capped,
 unknown fields tolerated); bulk data is raw stream bytes. One link instead of one ALPN per feature
 keeps authorization in one place and hides from the tower which feature is in use.
 
+In M1, the `numbers/0` dialer opens a bidirectional stream and each end sends a hello with
+`v: 1`, `network: ""` and `head: ""`. Each side validates its peer's hello before dispatching
+chat. Either end can then open a bidirectional chat stream with the header
+`{"proto":"chat","v":1}`, followed by one message. Each JSON frame has a four-byte big-endian
+length and a payload limit of 64 KiB.
+
+A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
+letters, digits, underscores or hyphens and reports its own time in Unix milliseconds. The
+receiver treats both as peer input. The body is padded standard base64 on the wire and decodes
+to at most 16 KiB of UTF-8. The receiver replies with `{"type":"ack"}` or a
+`{"type":"nack","reason":"…"}` containing a fixed reason code. The receiving actor acknowledges
+the message after deciding whether it is a new message or a retry.
+
+`connect_timeout` bounds each dial and hello together. `send_deadline` bounds the send, including
+any shared dial, retry and wait for a reply. The receiver also applies a deadline to each incoming
+chat stream.
+
 ### Stations and the chief's frontends
 
 The station is the node; frontends hold no network state.

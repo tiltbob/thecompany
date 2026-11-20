@@ -20,6 +20,7 @@ numbers-tower = { path = "crates/tower" }
 iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
 iroh-relay = { version = "1.5", default-features = false, features = ["tls-ring"] }
 
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 n0-future = "0.3"
 # Safe Unix syscalls (`geteuid`, `openat`, `linkat`) without `unsafe`. Each crate picks the modules
