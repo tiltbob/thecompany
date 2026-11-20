@@ -7,7 +7,9 @@
 //!
 //! Nothing sleeps, every test is bounded, ids are placeholders (AGENTS.md, hard rule 9).
 
-use chief::api::{ApiError, FailReason, Link, Request, Response, TowerState};
+use chief::api::{
+    ApiError, FailReason, Link, Request, Response, TowerSource, TowerState, TowerStatus,
+};
 use chief::client::{
     BindInstance, Client, SUBSCRIPTION_CAPACITY, SocketTransport, Subscription, Transport,
     subscription,
@@ -301,6 +303,65 @@ async fn status_and_the_peer_book_through_the_socket() {
             (
                 Exit::Done,
                 "bob STATION-B relayed\n".to_owned(),
+                String::new()
+            )
+        );
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_shows_every_tower_state_and_source_through_the_socket() {
+    bounded(async {
+        let rig = rig().await;
+        let tower = |url: &str, state, source| TowerStatus {
+            url: url.to_owned(),
+            state,
+            source,
+        };
+        rig.fake.set_towers(vec![
+            tower(
+                "https://tower-a.example.invalid/",
+                TowerState::Connected,
+                Some(TowerSource::Srv),
+            ),
+            tower(
+                "https://tower-b.example.invalid/",
+                TowerState::Standby,
+                Some(TowerSource::Remembered),
+            ),
+            tower(
+                "https://tower-c.example.invalid/",
+                TowerState::Failing {
+                    error: "connection refused".to_owned(),
+                },
+                Some(TowerSource::Configured),
+            ),
+            tower(
+                "https://tower-d.example.invalid/",
+                TowerState::Denied {
+                    reason: "not allowed".to_owned(),
+                },
+                Some(TowerSource::Peer),
+            ),
+            tower(FAKE_TOWER_URL, TowerState::Connecting, None),
+        ]);
+        rig.fake
+            .set_bootstrap_domain(Some("team.example.invalid".to_owned()));
+        assert_eq!(
+            exec(&rig.client, &["status"]).await,
+            (
+                Exit::Done,
+                "domain team.example.invalid\n\
+                 tower https://tower-a.example.invalid/ connected (srv)\n\
+                 tower https://tower-b.example.invalid/ standby (remembered)\n\
+                 tower https://tower-c.example.invalid/ failing (configured): connection refused\n\
+                 tower https://tower-d.example.invalid/ denied (peer): this station is not on \
+                 this tower's list (not allowed)\n\
+                 tower http://127.0.0.1:3340/ connecting\n\
+                 peer bob STATION-B down\n"
+                    .to_owned(),
                 String::new()
             )
         );

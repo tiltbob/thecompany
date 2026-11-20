@@ -11,7 +11,8 @@
 //! ```text
 //! chief [--station PATH] <command>
 //!   id                             this station's id
-//!   status                         the state of each tower, then the link to each peer station
+//!   status                         the bootstrap domain, the state and source of each tower, then
+//!                                  the link to each peer station
 //!   peer add <name> <station-id>   adds a station to a peer; prints the peer as stored
 //!   peer ls                        one line per peer station
 //!   peer rm <name>                 removes a peer
@@ -138,11 +139,25 @@
 //!
 //! - A change of an outgoing message (`chat` only): `<seq> -> <peer> now (<status>)`, without the
 //!   body. Its second field is an arrow, where a message line has a time.
-//! - `status`: `tower <url> <state>` per tower, with the state `connecting`, `connected`,
-//!   `standby` (a tower of the station's set whose state is not observed), `failing: <error>` or
-//!   `denied: <reason>`; then `peer <name> <station-id> <link>` per peer station, with the link
-//!   `down`, `relayed` or `direct`. `no towers` stands for an empty list of towers, `no peers` for
-//!   an empty peer book.
+//! - `status`: first `domain <domain>`, only when the station knows the DNS domain it bootstraps
+//!   its towers from (SRV). Then `tower <url> <state>[ (<source>)][: <detail>]` per tower, in the
+//!   station's order. The state is `connecting`, `connected`, `standby` (a tower of the station's
+//!   set whose state is not observed), `failing` or `denied`. The source, in parentheses, says how
+//!   the station learned of the tower: `configured`, `remembered`, `srv` or `peer`; a station that
+//!   does not say has no parentheses. A failing tower's detail is its error; a denied tower's is
+//!   `this station is not on this tower's list`, followed by the tower's reason in parentheses.
+//!   An error or reason that is empty once cleaned and trimmed is left out, with its colon or
+//!   parentheses, so no line ends in a space or a colon. Then `peer <name> <station-id> <link>`
+//!   per peer station, with the link `down`, `relayed` or `direct`. `no towers` stands for an
+//!   empty list of towers, `no peers` for an empty peer book:
+//!
+//!   ```text
+//!   domain team.example.invalid
+//!   tower https://tower-a.example.invalid/ connected (srv)
+//!   tower https://tower-c.example.invalid/ failing (configured): connection refused
+//!   tower https://tower-d.example.invalid/ denied (peer): this station is not on this tower's list (not allowed)
+//!   peer bob STATION-B relayed
+//!   ```
 //! - `peer ls` and `peer add`: `<name> <station-id> <link>` per peer station; `peer ls` says
 //!   `no peers` when the book is empty.
 //! - `peer rm`: `removed <name>`. `send`: `delivered to <peer>`. An empty `log`: `no messages`.
@@ -166,7 +181,7 @@
 
 use chief::api::{
     ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message,
-    MessageStatus, Peer, TowerState, clean,
+    MessageStatus, Peer, TowerSource, TowerState, TowerStatus, clean,
 };
 use chief::client::{BindInstance, Client};
 use chief::follow::LogUpdate;
@@ -240,7 +255,14 @@ pub struct Cli {
 pub enum Command {
     /// Print this station's id, to hand to the other chief
     Id,
-    /// Show the state of each tower, then the link to each peer station
+    /// Show the bootstrap domain, each tower's state and source, then each peer station's link
+    ///
+    /// The first line is "domain <domain>" when the station knows the DNS domain it finds its
+    /// towers through. Then one line per tower: "tower <url> <state>", the source in parentheses
+    /// when the station reports it (configured, remembered, srv or peer), and, after a colon, the
+    /// error of a failing tower, or "this station is not on this tower's list" for a denied one,
+    /// with the tower's reason in parentheses. Then one line per peer station: "peer <name>
+    /// <station-id> <link>".
     Status,
     /// Manage the peer book
     Peer {
@@ -576,14 +598,53 @@ fn link_label(link: Link) -> &'static str {
     }
 }
 
-fn tower_label(state: &TowerState) -> String {
-    match state {
-        TowerState::Connecting => "connecting".to_owned(),
-        TowerState::Connected => "connected".to_owned(),
-        TowerState::Standby => "standby".to_owned(),
-        TowerState::Failing { error } => format!("failing: {error}"),
-        TowerState::Denied { reason } => format!("denied: {reason}"),
+fn source_label(source: TowerSource) -> &'static str {
+    match source {
+        TowerSource::Configured => "configured",
+        TowerSource::Remembered => "remembered",
+        TowerSource::Srv => "srv",
+        TowerSource::Peer => "peer",
     }
+}
+
+/// What `status` says about a tower that refused this station, before the tower's own reason.
+const DENIED_SENTENCE: &str = "this station is not on this tower's list";
+
+/// `text` with rule 9 applied ([`clean`]) and white space trimmed at both ends; `None` when
+/// nothing is left, so that a line never ends in a space, a colon or an empty parenthesis.
+fn shown_text(text: &str) -> Option<String> {
+    let text = clean(text);
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// One tower as a line of `status`, before [`say`] cleans it:
+/// `tower <url> <state>[ (<source>)][: <detail>]` (see the module docs).
+fn tower_line(tower: &TowerStatus) -> String {
+    let (state, detail) = match &tower.state {
+        TowerState::Connecting => ("connecting", None),
+        TowerState::Connected => ("connected", None),
+        TowerState::Standby => ("standby", None),
+        TowerState::Failing { error } => ("failing", shown_text(error)),
+        TowerState::Denied { reason } => (
+            "denied",
+            Some(match shown_text(reason) {
+                Some(reason) => format!("{DENIED_SENTENCE} ({reason})"),
+                None => DENIED_SENTENCE.to_owned(),
+            }),
+        ),
+    };
+    let mut line = format!("tower {} {state}", tower.url);
+    if let Some(source) = tower.source {
+        line.push_str(" (");
+        line.push_str(source_label(source));
+        line.push(')');
+    }
+    if let Some(detail) = detail {
+        line.push_str(": ");
+        line.push_str(&detail);
+    }
+    line
 }
 
 /// `<name> <station-id> <link>`, one per station of `peer`.
@@ -645,14 +706,14 @@ async fn status<T: BindInstance>(client: &Client<T>, out: &mut dyn Write) -> Out
     let status = client.status().await?;
     // The peers of the instance whose towers are shown, or none.
     let peers = client.bound_to(&status.instance_id).peers().await?;
+    if let Some(domain) = status.bootstrap_domain.as_deref().and_then(shown_text) {
+        say(out, &format!("domain {domain}"))?;
+    }
     if status.towers.is_empty() {
         say(out, "no towers")?;
     }
     for tower in &status.towers {
-        say(
-            out,
-            &format!("tower {} {}", tower.url, tower_label(&tower.state)),
-        )?;
+        say(out, &tower_line(tower))?;
     }
     if peers.is_empty() {
         say(out, "no peers")?;
