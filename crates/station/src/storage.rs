@@ -32,6 +32,12 @@ const OPEN_PRIVATE: OFlags = OFlags::NOFOLLOW
     .union(OFlags::NOCTTY)
     .union(OFlags::CLOEXEC);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_STARTUP_SYNC: Cell<bool> = const { Cell::new(false) };
+    static STARTUP_SYNCS: Cell<u32> = const { Cell::new(0) };
+}
+
 /// Names are sorted for snapshots. Each peer's stations stay in insertion order.
 pub(crate) type PeerBook = BTreeMap<String, Vec<NodeId>>;
 
@@ -81,6 +87,8 @@ pub(super) enum StorageError {
     AlreadyRunning,
     #[error("could not take the station data-directory lock")]
     TakeLock,
+    #[error("could not sync the station data directory")]
+    SyncDataDir,
     #[error("could not load or create node.key; check its owner, permissions and validity")]
     NodeKey,
     #[error(
@@ -113,8 +121,15 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
-    /// Acquires the lock without creating or reading the node key.
+    /// Acquires the lock and syncs the checked directory before loading station records.
     pub(crate) fn lock(data_dir: &Path) -> Result<Self, StorageError> {
+        Self::lock_with_sync(data_dir, startup_sync)
+    }
+
+    fn lock_with_sync(
+        data_dir: &Path,
+        sync_dir: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<Self, StorageError> {
         let path = if data_dir.as_os_str().is_empty() {
             Path::new(".")
         } else {
@@ -137,12 +152,17 @@ impl Storage {
 
         let lock = open_lock(&dir)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Self {
-                dir,
-                _lock: lock,
-                #[cfg(test)]
-                fail_peer_sync: Cell::default(),
-            }),
+            Ok(()) => {
+                // Flush pending metadata from a previous process. This cannot recover an old
+                // writeback error that has already been reported.
+                sync_dir(&dir).map_err(|_| StorageError::SyncDataDir)?;
+                Ok(Self {
+                    dir,
+                    _lock: lock,
+                    #[cfg(test)]
+                    fail_peer_sync: Cell::default(),
+                })
+            }
             Err(TryLockError::WouldBlock) => Err(StorageError::AlreadyRunning),
             Err(TryLockError::Error(_)) => Err(StorageError::TakeLock),
         }
@@ -154,13 +174,13 @@ impl Storage {
             .map_err(|_| StorageError::NodeKey)
     }
 
-    pub(crate) fn load_peers(&self, own_id: NodeId) -> Result<PeerBook, StorageError> {
+    pub(crate) fn load_peers(&self, own_id: NodeId) -> Result<Option<PeerBook>, StorageError> {
         let Some(bytes) = self.read_record(RecordFile::Peers)? else {
-            return Ok(PeerBook::new());
+            return Ok(None);
         };
         let disk: DiskBook = serde_json::from_slice(&bytes)
             .map_err(|_| StorageError::InvalidPeers("expected a versioned peer book"))?;
-        disk.into_book(own_id)
+        disk.into_book(own_id).map(Some)
     }
 
     /// Any error means the rename did not happen. Both successful outcomes commit the new book.
@@ -247,6 +267,17 @@ impl Storage {
             Err(_) => SaveOutcome::DurabilityUncertain,
         })
     }
+}
+
+fn startup_sync(dir: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_STARTUP_SYNC.replace(false) {
+        return Err(io::ErrorKind::Other.into());
+    }
+    dir.sync_all()?;
+    #[cfg(test)]
+    STARTUP_SYNCS.set(STARTUP_SYNCS.get() + 1);
+    Ok(())
 }
 
 fn open_lock(dir: &File) -> Result<File, StorageError> {
