@@ -1159,6 +1159,51 @@ async fn tower_text_is_normalised_in_status_and_its_event() {
     );
 }
 
+/// Line breaks and reordering that are not control characters, and a C1 control character.
+const WIDER: &str = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{061C}f\u{200E}g\u{9B}h\u{200B}";
+/// `WIDER` as rule 9 leaves it: each replaced by one space; U+200B stays.
+const WIDER_CLEAN: &str = "a b c d e f g h\u{200B}";
+
+#[tokio::test]
+async fn the_wider_rule_9_set_is_replaced_in_bodies_and_tower_text() {
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let got = fake.receive("bob", WIDER).unwrap();
+    assert_eq!(got.body, WIDER_CLEAN);
+    // In the log page and in the event.
+    let page = c.log(None, None, 10).await.unwrap();
+    assert_eq!(page.messages, vec![got.clone()]);
+    assert_eq!(c.message(got.seq).await.unwrap().body, WIDER_CLEAN);
+    fake.set_tower_state(TowerState::Failing {
+        error: WIDER.into(),
+    });
+    let failing = c.status().await.unwrap();
+    assert_eq!(
+        failing.towers[0].state,
+        TowerState::Failing {
+            error: WIDER_CLEAN.into()
+        }
+    );
+    fake.set_tower_state(TowerState::Denied {
+        reason: WIDER.into(),
+    });
+    let denied = c.status().await.unwrap();
+    assert_eq!(
+        denied.towers[0].state,
+        TowerState::Denied {
+            reason: WIDER_CLEAN.into()
+        }
+    );
+    assert_eq!(
+        queued(&mut events),
+        vec![
+            Event::Message { message: got },
+            Event::Status { status: failing },
+            Event::Status { status: denied }
+        ]
+    );
+}
+
 #[tokio::test]
 async fn invalid_incoming_fixtures_are_refused_and_change_nothing() {
     let (fake, c) = with_peers().await;

@@ -23,7 +23,7 @@ use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
     LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
     PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
-    check_peer_name,
+    check_peer_name, clean,
 };
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
@@ -212,15 +212,15 @@ impl FakeStation {
     /// Sets the state of the one tower and pushes [`Event::Status`].
     ///
     /// The text in the state (the `error` of [`TowerState::Failing`], the `reason` of
-    /// [`TowerState::Denied`]) came from outside, so every control character in it is replaced with
-    /// a space (rule 9) before it is stored and before the event is pushed.
+    /// [`TowerState::Denied`]) came from outside, so every character of rule 9 in it is replaced
+    /// with a space ([`crate::api::clean`]) before it is stored and before the event is pushed.
     pub fn set_tower_state(&self, tower: TowerState) {
         let tower = match tower {
             TowerState::Failing { error } => TowerState::Failing {
-                error: scrub(&error),
+                error: clean(&error).into_owned(),
             },
             TowerState::Denied { reason } => TowerState::Denied {
-                reason: scrub(&reason),
+                reason: clean(&reason).into_owned(),
             },
             other @ (TowerState::Connecting | TowerState::Connected) => other,
         };
@@ -262,14 +262,14 @@ impl FakeStation {
     }
 
     /// Logs a message from `peer` with a new id (rule 8) and pushes its event, as a station does
-    /// with a message that arrived from a peer's station. Every control character in `body` is
-    /// replaced with a space (rule 9).
+    /// with a message that arrived from a peer's station. Every character of rule 9 in `body` is
+    /// replaced with a space ([`crate::api::clean`]).
     ///
     /// It follows the limits a station applies to what arrives, and a refused message changes
     /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
     /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
     /// peer not in the book; [`ApiError::Invalid`] with field `body` for a body over
-    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). An empty body is
+    /// [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are replaced). An empty body is
     /// accepted: only [`Request::Send`] has a lower bound (rule 7), and a peer may send an empty
     /// body. Only a message that
     /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
@@ -295,8 +295,8 @@ impl FakeStation {
     /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
     /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
     /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
-    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before control characters are replaced;
-    /// an empty body is accepted); and only then the duplicate check of rule 8.
+    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are
+    /// replaced; an empty body is accepted); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -711,7 +711,7 @@ impl State {
             peer,
             id,
             Direction::Incoming,
-            scrub(body),
+            clean(body).into_owned(),
             MessageStatus::Received,
         )))
     }
@@ -922,13 +922,6 @@ fn is_message_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Rule 9: every control character replaced with a space.
-fn scrub(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 /// Wakes its own task once and returns `Pending`, then is ready: one turn back to the runtime.
