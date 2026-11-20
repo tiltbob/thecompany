@@ -131,12 +131,22 @@ pub enum CertSource {
     /// stores them, with the certificate, in `cache_dir` (files named `cached_account_<hash>`
     /// and `cached_cert_<hash>`), written with the process's default file permissions. Those
     /// are the tower's own keys (its TLS key and its ACME account key), so the directory must
-    /// be private to the tower's user. On unix, [`Tower::spawn`] makes sure of it just before
-    /// the ACME client starts: a missing directory is created with mode 0700 (and every missing
-    /// directory above it); an existing one that the group or others can access, or a path
-    /// that is not a directory, is refused. A systemd unit that provides the directory with
-    /// `StateDirectory=` therefore needs `StateDirectoryMode=0700`. Without the cache every
-    /// restart would order a new certificate and soon hit Let's Encrypt's rate limits.
+    /// be private to, owned by and writable for the tower's user. [`Tower::spawn`] checks that
+    /// just before the ACME client starts: an empty path is refused; a missing directory is
+    /// created (on unix with mode 0700, and so is every missing directory above it); then the
+    /// directory is checked as it is, also after a create: a path that is not a directory, and
+    /// on unix one that the group or others can access or that another user owns, is refused,
+    /// and a file is created in it and removed again to see that the tower can write there.
+    /// The ACME client does not report a cache it cannot use: it would serve its certificate
+    /// from memory and register a new account and order a new certificate at every restart,
+    /// and soon hit Let's Encrypt's rate limits. A systemd unit that provides the directory with
+    /// `StateDirectory=` therefore needs `StateDirectoryMode=0700`.
+    ///
+    /// The check is a check of the moment: the ACME client opens the cache again by its path
+    /// later. So the path and every directory above it must stay in place and under the
+    /// control of the tower's user or root; the tower cannot protect against someone who can
+    /// replace one of them after the check. And whatever is already in an existing cache (an
+    /// account key, a certificate and its key) is trusted as it is.
     ///
     /// [`Tower::spawn`]: crate::Tower::spawn
     #[non_exhaustive]
@@ -398,7 +408,7 @@ pub(crate) async fn cert_config(
             let host = canonical_host(&tls.hostname).ok_or(TowerError::InvalidHostname)?;
             // Let's Encrypt issues certificates for DNS names under a public suffix only: at
             // least two labels, and never an IP literal.
-            if ip_literal(&host).is_some() || !host.contains('.') {
+            if !is_acme_domain(&host) {
                 return Err(TowerError::AcmeNeedsDnsName);
             }
             if !is_acme_contact(contact) {
@@ -425,50 +435,116 @@ fn is_acme_contact(contact: &str) -> bool {
     let Some(address) = contact.strip_prefix("mailto:") else {
         return false;
     };
+    // Printable ASCII only: no control character, no white space, nothing outside ASCII.
+    if !address
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b',' | b'?'))
+    {
+        return false;
+    }
     let Some((local, domain)) = address.split_once('@') else {
         return false;
     };
-    !local.is_empty()
-        && !domain.is_empty()
-        && !domain.contains('@')
-        && !address
-            .chars()
-            .any(|c| c.is_whitespace() || c == ',' || c == '?')
+    !local.is_empty() && !domain.contains('@') && is_acme_domain(domain)
 }
 
-/// Makes sure the ACME cache directory exists and is private to the tower's user, before the
-/// ACME client is started (it would create the directory and its key files with the process's
-/// default modes).
+/// Whether `name` is a DNS name an ACME certificate or contact can use: a valid host name of
+/// at least two labels, not an IP literal.
+fn is_acme_domain(name: &str) -> bool {
+    canonical_host(name).is_some_and(|host| ip_literal(&host).is_none() && host.contains('.'))
+}
+
+/// The name of the file that [`prepare_acme_cache`] creates and removes to see that the tower
+/// can write to the cache directory.
+const ACME_CACHE_PROBE: &str = ".numbers-tower-write-probe";
+
+/// Makes sure the ACME cache directory exists, is private to the tower's user, belongs to that
+/// user and can be written by it, before the ACME client is started (it would create the
+/// directory and its key files with the process's default modes, and it does not report a
+/// cache it cannot use: it serves the certificate from memory and orders a new one at every
+/// restart).
 ///
-/// On unix: a missing directory is created with mode 0700, and so is every missing directory
-/// above it; an existing one must not be accessible to the group or to others; a path that
-/// exists and is not a directory is refused. Elsewhere a missing directory is created and no
-/// mode is checked. The path is followed if it is a symbolic link.
+/// An empty path is refused: the ACME client would write both keys into the working
+/// directory. On unix: a missing directory is created with mode 0700, and so is every missing
+/// directory above it; an existing one must not be accessible to the group or to others; a
+/// path that exists and is not a directory is refused. Then, everywhere, a file named
+/// [`ACME_CACHE_PROBE`] is created (`create_new`) and removed again; any failure is
+/// [`TowerError::AcmeCacheUnusable`]. On unix the directory must have the same owner as that
+/// file, the tower's user. The path is followed if it is a symbolic link.
 pub(crate) fn prepare_acme_cache(dir: &Path) -> Result<(), TowerError> {
     let unusable = |error: std::io::Error| TowerError::AcmeCacheUnusable(error.kind());
+    if dir.as_os_str().is_empty() {
+        return Err(TowerError::AcmeCacheUnusable(
+            std::io::ErrorKind::InvalidInput,
+        ));
+    }
     match std::fs::metadata(dir) {
-        Ok(metadata) if !metadata.is_dir() => Err(TowerError::AcmeCacheNotADirectory),
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(TowerError::AcmeCacheNotPrivate);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = metadata;
-            Ok(())
-        }
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true);
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder.create(dir).map_err(unusable)
+            builder.create(dir).map_err(unusable)?;
         }
-        Err(error) => Err(unusable(error)),
+        Err(error) => return Err(unusable(error)),
     }
+    // Checked again after a create too: what the create left (under the umask, or raced by
+    // someone else) is not assumed to be what was asked for.
+    let metadata = std::fs::metadata(dir).map_err(unusable)?;
+    if !metadata.is_dir() {
+        return Err(TowerError::AcmeCacheNotADirectory);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(TowerError::AcmeCacheNotPrivate);
+        }
+    }
+    let probe_owner = probe_acme_cache(dir).map_err(unusable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != probe_owner {
+            return Err(TowerError::AcmeCacheNotOwned);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (metadata, probe_owner);
+    Ok(())
+}
+
+/// Creates and removes [`ACME_CACHE_PROBE`] in `dir`, and returns the owner of the file it
+/// created (on unix its uid; elsewhere 0). A probe left behind by a process that died in
+/// between is removed first.
+fn probe_acme_cache(dir: &Path) -> std::io::Result<u32> {
+    let probe = dir.join(ACME_CACHE_PROBE);
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+    };
+    let file = match create() {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&probe)?;
+            create()?
+        }
+        result => result?,
+    };
+    let metadata = file.metadata();
+    drop(file);
+    std::fs::remove_file(&probe)?;
+    let metadata = metadata?;
+    #[cfg(unix)]
+    let owner = std::os::unix::fs::MetadataExt::uid(&metadata);
+    #[cfg(not(unix))]
+    let owner = {
+        let _ = metadata;
+        0
+    };
+    Ok(owner)
 }
 
 #[cfg(test)]
@@ -503,14 +579,19 @@ mod tests {
             };
             assert!(
                 debug.contains(expected) && !debug.contains(other),
-                "{debug}"
+                "the configuration names the wrong ACME directory"
             );
-            assert!(debug.contains(r#"["tower1.example.com"]"#), "{debug}");
-            assert!(!debug.contains("Tower1"), "{debug}");
-            assert!(debug.contains(r#"["mailto:ops@example.com"]"#), "{debug}");
+            assert!(
+                debug.contains(r#"["tower1.example.com"]"#) && !debug.contains("Tower1"),
+                "the domain is not the canonical host name"
+            );
+            assert!(
+                debug.contains(r#"["mailto:ops@example.com"]"#),
+                "the contact is missing"
+            );
             assert!(
                 debug.contains(&format!("cache_path: Some({:?})", cache)),
-                "{debug}"
+                "the cache path is missing"
             );
         }
         assert!(!cache.exists());
@@ -545,18 +626,42 @@ mod tests {
             "mailto:a@b@example.com",
             "mailto:ops @example.com",
             "mailto:ops@example.com,dev@example.com",
+            "mailto:ops@example.com,dev",
+            // A comma or a question mark in the local part, where only the ASCII rule sees it.
+            "mailto:ops,dev@example.com",
+            "mailto:ops?x@example.com",
             "mailto:ops@example.com?subject=hi",
             "mailto:ops@example.com\n",
+            "mailto:ops@example.com\u{1b}[31m",
+            "mailto:öps@example.com",
+            "mailto:ops@localhost",
+            "mailto:ops@[127.0.0.1]",
+            "mailto:ops@127.0.0.1",
+            "mailto:<ops@example.com>",
+            "mailto:ops@example.com#x",
+            "mailto:ops@-example.com",
         ] {
             let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
             let Err(error) = cert_config(&tls).await else {
-                panic!("accepted an ACME contact without mailto");
+                panic!("accepted an invalid ACME contact");
             };
             assert!(matches!(error, TowerError::InvalidAcmeContact));
             // The message names `mailto:` itself; a longer contact must not appear in it.
             if contact.len() > "mailto:".len() {
                 assert!(!format!("{error} {error:?}").contains(contact));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_acme_source_accepts_a_plain_mailto_contact() {
+        for contact in [
+            "mailto:ops@example.com",
+            "mailto:first.last+tower@mail.example.com",
+            "mailto:ops@Example.COM.",
+        ] {
+            let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
+            assert!(cert_config(&tls).await.is_ok(), "{contact}");
         }
     }
 
@@ -590,9 +695,9 @@ mod tests {
         );
         for text in [format!("{tls:?}"), format!("{tls:#?}")] {
             for marker in ["qzx-name", "qzx-contact", "qzx-cache"] {
-                assert!(!text.contains(marker), "{text}");
+                assert!(!text.contains(marker), "Debug shows {marker}");
             }
-            assert!(text.contains("Acme"), "{text}");
+            assert!(text.contains("Acme"), "Debug does not name the source");
         }
     }
 
@@ -780,9 +885,12 @@ mod tests {
             format!("{config:#?}"),
         ] {
             for marker in ["qzx-name", "qzx-cert-dir", "qzx-key-dir"] {
-                assert!(!text.contains(marker), "{text}");
+                assert!(!text.contains(marker), "Debug shows {marker}");
             }
-            assert!(text.contains("127.0.0.1:44443"), "{text}");
+            assert!(
+                text.contains("127.0.0.1:44443"),
+                "Debug does not show the bind address"
+            );
         }
     }
 }
@@ -827,6 +935,78 @@ mod acme_cache_tests {
                 Err(TowerError::AcmeCacheNotPrivate)
             ));
         }
+    }
+
+    /// Whether this test runs as root: the uid of a file it creates.
+    fn running_as_root(dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let file = dir.join("whoami");
+        std::fs::write(&file, "").unwrap();
+        let root = std::fs::metadata(&file).unwrap().uid() == 0;
+        std::fs::remove_file(&file).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_write_probe_leaves_no_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_acme_cache(dir.path()).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // A probe left behind by a process that died is removed too.
+        std::fs::write(dir.path().join(super::ACME_CACHE_PROBE), "").unwrap();
+        prepare_acme_cache(dir.path()).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A directory the tower cannot write to is refused. Root can write to a 0500 directory,
+    /// so as root the probe passes; CI runs this as an unprivileged user.
+    #[test]
+    fn a_cache_directory_the_tower_cannot_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = running_as_root(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = prepare_acme_cache(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if root {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(TowerError::AcmeCacheUnusable(
+                    std::io::ErrorKind::PermissionDenied
+                ))
+            ));
+        }
+    }
+
+    /// A private, writable directory that another user owns is refused. Only root can give a
+    /// directory away, so this runs as root only; as another user the probe already refuses
+    /// such a directory (see the test above).
+    #[test]
+    fn a_cache_directory_another_user_owns_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        if !running_as_root(dir.path()) {
+            return;
+        }
+        let cache = dir.path().join("acme");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::chown(&cache, Some(65534), Some(65534)).unwrap();
+        assert!(matches!(
+            prepare_acme_cache(&cache),
+            Err(TowerError::AcmeCacheNotOwned)
+        ));
+    }
+
+    #[test]
+    fn an_empty_cache_path_is_refused() {
+        assert!(matches!(
+            prepare_acme_cache(Path::new("")),
+            Err(TowerError::AcmeCacheUnusable(
+                std::io::ErrorKind::InvalidInput
+            ))
+        ));
     }
 
     #[test]

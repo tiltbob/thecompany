@@ -191,6 +191,17 @@ impl fmt::Debug for Listed {
     }
 }
 
+/// The reason a [`TowerError::Bind`] shows: the kind of I/O error, or, when the kind says
+/// nothing, the operating system's text for the error code (`strerror` and the number only).
+fn bind_reason(kind: std::io::ErrorKind, os_code: Option<i32>) -> String {
+    let says_nothing =
+        kind == std::io::ErrorKind::Other || kind.to_string() == "uncategorized error";
+    match os_code {
+        Some(code) if says_nothing => std::io::Error::from_raw_os_error(code).to_string(),
+        _ => kind.to_string(),
+    }
+}
+
 /// One of a tower's listeners, as an error names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -278,10 +289,17 @@ pub enum TowerError {
     /// The ACME cache path exists and is not a directory. The error names no path.
     #[error("the ACME cache path is not a directory")]
     AcmeCacheNotADirectory,
-    /// The ACME cache directory could not be checked or created; the kind of I/O error says
-    /// why. The error names no path.
+    /// The ACME cache directory could not be checked, created or written by the tower's user;
+    /// the kind of I/O error says why, for example `PermissionDenied` for a directory the
+    /// tower cannot write to, or `InvalidInput` for an empty path. The error names no path.
     #[error("cannot use the ACME cache directory ({0})")]
     AcmeCacheUnusable(std::io::ErrorKind),
+    /// The ACME cache directory belongs to another user than the tower's.
+    ///
+    /// It must be private to, owned by and writable for the tower's user. The error names no
+    /// path and no user.
+    #[error("the ACME cache directory must belong to the tower's user")]
+    AcmeCacheNotOwned,
     /// The relay stopped by itself, without being asked to: one of its listeners or its ACME
     /// client ended. See [`Tower::stopped`].
     #[error("the tower's relay stopped by itself")]
@@ -290,17 +308,26 @@ pub enum TowerError {
     /// `AddrInUse` (the port is taken) or `PermissionDenied` (a privileged port without the
     /// right to bind it).
     ///
-    /// The message names the listener, never its address. A listener the relay had already
-    /// bound can stay bound until the runtime runs again: a caller that retries at once on the
-    /// same ports can see "address in use". `Tower::spawn` yields once before returning the
-    /// error, which is usually enough; there is no stronger promise.
-    #[error("cannot bind the {listener} ({kind})")]
+    /// The message names the listener, never its address. When the kind says nothing (an
+    /// uncategorized or other error), it shows the operating system's own text for the error
+    /// code instead, for example "Address family not supported by protocol (os error 97)" for
+    /// an IPv6 address on a host without IPv6; that text names no address, port or path.
+    ///
+    /// A listener the relay had already bound is released when the runtime runs the relay's
+    /// aborted tasks. On a current-thread runtime that happens during the one yield
+    /// `Tower::spawn` makes before it returns this error. On a multi-thread runtime (what
+    /// `#[tokio::main]` gives) those listeners are usually still bound when `Tower::spawn`
+    /// returns and are freed shortly afterwards, so a caller that retries at once on the same
+    /// ports can see `AddrInUse`. There is no stronger promise.
+    #[error("cannot bind the {listener} ({})", bind_reason(*.kind, *.os_code))]
     #[non_exhaustive]
     Bind {
         /// Which listener.
         listener: Listener,
         /// The kind of I/O error.
         kind: std::io::ErrorKind,
+        /// The operating system's error code, when there was one.
+        os_code: Option<i32>,
     },
     /// An entry of [`TowerConfig::allow`] is not a valid endpoint id.
     ///
@@ -430,16 +457,19 @@ fn spawn_error(error: &SpawnError, tls: bool) -> TowerError {
         SpawnError::BindTlsListener { source, .. } => TowerError::Bind {
             listener: Listener::Http,
             kind: source.kind(),
+            os_code: source.raw_os_error(),
         },
         SpawnError::BindTcpListener { source, .. } => TowerError::Bind {
             listener: if tls { Listener::Https } else { Listener::Http },
             kind: source.kind(),
+            os_code: source.raw_os_error(),
         },
         SpawnError::QuicSpawn { source, .. } => {
             match Error::source(source).and_then(|cause| cause.downcast_ref::<std::io::Error>()) {
                 Some(cause) => TowerError::Bind {
                     listener: Listener::AddressDiscovery,
                     kind: cause.kind(),
+                    os_code: cause.raw_os_error(),
                 },
                 None => start("address discovery could not start"),
             }
@@ -477,9 +507,11 @@ impl Tower {
     /// tokio's blocking pool; a regular file on a mount that stops answering blocks that read,
     /// and then this call does not return.
     ///
-    /// If iroh-relay fails to bind a port (it is taken, for example), a listener it had already
-    /// bound is released only when the runtime next runs its aborted tasks. This call yields once
-    /// before returning that error, as a best effort; see [`TowerError::Start`].
+    /// If iroh-relay fails to bind a port (it is taken, for example), this call returns
+    /// [`TowerError::Bind`] after one yield. A listener the relay had already bound is released
+    /// only when the runtime runs the relay's aborted tasks: on a current-thread runtime during
+    /// that yield, on a multi-thread runtime usually shortly after this call returns; see
+    /// [`TowerError::Bind`].
     pub async fn spawn(config: TowerConfig) -> Result<Self, TowerError> {
         if config.tls.is_none() && !config.bind.ip().is_loopback() {
             return Err(TowerError::NonLoopbackBind(config.bind));
@@ -616,7 +648,12 @@ impl Tower {
     /// accept loop (address discovery ends on a UDP receive error), the ACME client, or a task
     /// that panicked. Nothing listens after that. This future stays pending while the tower
     /// runs; it never asks the relay to stop. It is cancel-safe: dropping it leaves the tower
-    /// running, and [`Tower::shutdown`] works afterwards, also after it returned.
+    /// running, and [`Tower::shutdown`] works afterwards.
+    ///
+    /// Once this returned, a flag keeps [`Tower::shutdown`] from awaiting the ended supervisor
+    /// again; it then only stops the certificate reload task. No test reaches that path, since
+    /// iroh-relay offers no way to make the relay stop from outside, and the `tower` binary
+    /// never calls `shutdown` after `stopped` returned.
     pub async fn stopped(&mut self) -> TowerError {
         if !self.relay_ended {
             // The supervisor's own result names no more than which task ended; it is dropped.
@@ -815,6 +852,92 @@ mod tests {
             out.push(char::from(ALPHABET[((buffer << (5 - bits)) & 31) as usize]));
         }
         out
+    }
+
+    /// The public builder with an empty cache path is refused before the relay starts. Safe even
+    /// if that regressed: the HTTP port is taken, so iroh-relay's start fails before this
+    /// current-thread runtime ever polls the ACME task it spawns, and no ACME request is made.
+    #[tokio::test]
+    async fn an_acme_tower_with_an_empty_cache_path_is_refused() {
+        timeout(Duration::from_secs(10), async {
+            let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let tls = TlsTower::acme("tower1.example.com", "mailto:ops@example.com", "")
+                .https_bind((Ipv4Addr::LOCALHOST, 0).into())
+                .qad_bind(None);
+            let config = TowerConfig::tls(tls).bind(taken.local_addr().unwrap());
+            let result = Tower::spawn(config).await;
+            assert!(matches!(
+                result,
+                Err(TowerError::AcmeCacheUnusable(
+                    std::io::ErrorKind::InvalidInput
+                ))
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `spawn` checks an existing cache directory before the relay starts. Safe without the
+    /// network: if the check were skipped, the taken HTTP port would fail iroh-relay's start
+    /// before this current-thread runtime polls the ACME task it spawns, so no ACME request is
+    /// made either way; the error would then be `Bind`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_acme_tower_with_a_cache_others_can_read_is_refused_before_binding() {
+        use std::os::unix::fs::PermissionsExt;
+        timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("acme");
+            std::fs::create_dir(&cache).unwrap();
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let tls = TlsTower::acme("tower1.example.com", "mailto:ops@example.com", &cache)
+                .https_bind((Ipv4Addr::LOCALHOST, 0).into())
+                .qad_bind(None);
+            let config = TowerConfig::tls(tls).bind(taken.local_addr().unwrap());
+            let result = Tower::spawn(config).await;
+            assert!(matches!(result, Err(TowerError::AcmeCacheNotPrivate)));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A configuration refused for another reason leaves a missing cache directory missing:
+    /// the cache check, which creates it, runs after every other check. Nothing binds.
+    #[tokio::test]
+    async fn a_refused_acme_tower_does_not_create_its_cache_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("acme");
+        let tls = TlsTower::acme("tower1.example.com", "mailto:ops@example.com", &cache)
+            .https_bind((Ipv4Addr::LOCALHOST, 0).into())
+            .qad_bind(None);
+        let config = TowerConfig::tls(tls)
+            .bind((Ipv4Addr::LOCALHOST, 0).into())
+            .client_rate(0);
+        let result = Tower::spawn(config).await;
+        assert!(matches!(result, Err(TowerError::InvalidClientRate(0))));
+        assert!(!cache.exists(), "the cache directory was created");
+    }
+
+    /// A kind that says something is shown as it is; an uncategorized one is replaced by the
+    /// operating system's text for its code.
+    #[test]
+    fn a_bind_error_shows_the_os_text_when_the_kind_says_nothing() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            super::bind_reason(ErrorKind::AddrInUse, Some(98)),
+            "address in use"
+        );
+        let no_family = Error::from_raw_os_error(97);
+        assert_eq!(
+            super::bind_reason(no_family.kind(), Some(97)),
+            no_family.to_string()
+        );
+        assert!(super::bind_reason(no_family.kind(), Some(97)).contains("os error 97"));
+        assert_eq!(
+            super::bind_reason(no_family.kind(), None),
+            no_family.kind().to_string()
+        );
     }
 
     #[test]
