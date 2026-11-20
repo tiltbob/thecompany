@@ -38,8 +38,7 @@ async fn bind(config: EndpointConfig, authorizer: &Arc<Authorizer>) -> Endpoint 
     let key = generate_node_key();
     let endpoint = Endpoint::bind(&key, config, Arc::clone(authorizer))
         .await
-        .ok()
-        .expect("bind endpoint");
+        .unwrap_or_else(|_| panic!("bind endpoint"));
     assert!(endpoint.iroh().id() == node_id(&key));
     endpoint
 }
@@ -49,12 +48,9 @@ async fn start_tower() -> (Tower, EndpointConfig) {
         bind: (Ipv4Addr::LOCALHOST, 0).into(),
     })
     .await
-    .ok()
-    .expect("start loopback tower");
+    .unwrap_or_else(|_| panic!("start loopback tower"));
     let config = EndpointConfig {
-        towers: TowerSet::from_url(tower.url())
-            .ok()
-            .expect("parse tower URL"),
+        towers: TowerSet::from_url(tower.url()).unwrap_or_else(|_| panic!("parse tower URL")),
         ip_transport: IpTransport::RelayOnly,
     };
     (tower, config)
@@ -128,7 +124,10 @@ async fn require_remote_refusal(result: Result<Connection, ConnectError>) {
 async fn authorized_endpoints_dial_by_id_through_the_tower() {
     timeout(TEST_TIMEOUT, async {
         let (tower, config) = start_tower().await;
-        let relay = tower.url().parse().ok().expect("parse relay URL");
+        let relay = tower
+            .url()
+            .parse()
+            .unwrap_or_else(|_| panic!("parse relay URL"));
         let first_auth = Arc::new(Authorizer::new(&[ALPN], &[]));
         let second_auth = Arc::new(Authorizer::new(&[ALPN], &[]));
         let first = bind(config.clone(), &first_auth).await;
@@ -146,8 +145,8 @@ async fn authorized_endpoints_dial_by_id_through_the_tower() {
             first.iroh().connect(second_id, ALPN),
             second.iroh().connect(first_id, ALPN),
         );
-        let first_dial = first_dial.ok().expect("first bare-id dial succeeds");
-        let second_dial = second_dial.ok().expect("second bare-id dial succeeds");
+        let first_dial = first_dial.unwrap_or_else(|_| panic!("first bare-id dial succeeds"));
+        let second_dial = second_dial.unwrap_or_else(|_| panic!("second bare-id dial succeeds"));
         assert!(first_receipts.recv().await == Some(second_id));
         assert!(second_receipts.recv().await == Some(first_id));
         require_relay_path(&first_dial, &relay).await;
@@ -237,7 +236,9 @@ async fn outgoing_dial_to_unknown_peer_closes_with_not_allowed() {
         // hook's close even if it overtakes the callee's handshake.
         let accept = async {
             let incoming = callee.iroh().accept().await.expect("incoming connection");
-            let accepting = incoming.accept().ok().expect("accept direct connection");
+            let accepting = incoming
+                .accept()
+                .unwrap_or_else(|_| panic!("accept direct connection"));
             match accepting.await {
                 Ok(connection) => require_not_allowed(connection.closed().await),
                 Err(ConnectingError::ConnectionError { source, .. }) => require_not_allowed(source),
