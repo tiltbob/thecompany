@@ -37,7 +37,7 @@ use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
-/// The URL of the fake's one tower.
+/// The URL of the one tower a new fake has ([`FakeStation::new`]).
 pub const FAKE_TOWER_URL: &str = "http://127.0.0.1:3340/";
 
 /// How many messages the fake keeps by default, like the station: the newest 1,000.
@@ -211,20 +211,12 @@ impl FakeStation {
         self.state().outcome = outcome;
     }
 
-    /// Sets the state of the one tower and pushes [`Event::Status`].
+    /// Sets the state of every tower in the list to `tower` and pushes [`Event::Status`].
     ///
     /// The `error` of [`TowerState::Failing`] and the `reason` of [`TowerState::Denied`] are
     /// cleaned and bounded with [`clean_tower_display`] before being stored or sent in an event.
     pub fn set_tower_state(&self, tower: TowerState) {
-        let tower = match tower {
-            TowerState::Failing { error } => TowerState::Failing {
-                error: clean_tower_display(&error),
-            },
-            TowerState::Denied { reason } => TowerState::Denied {
-                reason: clean_tower_display(&reason),
-            },
-            other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
-        };
+        let tower = clean_tower_state(tower);
         let mut state = self.state();
         for t in &mut state.status.towers {
             t.state = tower.clone();
@@ -236,10 +228,11 @@ impl FakeStation {
     /// Replaces the whole list of towers, in the given order, and pushes [`Event::Status`]. An
     /// empty list is allowed: the status then has no towers.
     ///
-    /// The text in it came from outside, so every character of rule 9 in each `url`, each `error`
-    /// of [`TowerState::Failing`] and each `reason` of [`TowerState::Denied`] is replaced with a
-    /// space ([`crate::api::clean`]) before it is stored and before the event is pushed. The
-    /// sources are stored as given.
+    /// The text in it came from outside. Before it is stored and before the event is pushed, every
+    /// character of rule 9 in each `url` is replaced with a space ([`clean`]), and each `error` of
+    /// [`TowerState::Failing`] and each `reason` of [`TowerState::Denied`] is cleaned and bounded
+    /// with [`clean_tower_display`], as [`FakeStation::set_tower_state`] does. The sources are
+    /// stored as given.
     ///
     /// The bootstrap domain is left as it is. The fake treats the first tower of the list as the
     /// home tower: a [`FakeStation::restart`] puts it back in [`TowerState::Connecting`] and every
@@ -251,17 +244,7 @@ impl FakeStation {
             .into_iter()
             .map(|tower| TowerStatus {
                 url: clean(&tower.url).into_owned(),
-                state: match tower.state {
-                    TowerState::Failing { error } => TowerState::Failing {
-                        error: clean(&error).into_owned(),
-                    },
-                    TowerState::Denied { reason } => TowerState::Denied {
-                        reason: clean(&reason).into_owned(),
-                    },
-                    other @ (TowerState::Connecting
-                    | TowerState::Connected
-                    | TowerState::Standby) => other,
-                },
+                state: clean_tower_state(tower.state),
                 source: tower.source,
             })
             .collect();
@@ -934,6 +917,21 @@ impl State {
             self.finish(message.seq, status)?;
         }
         Ok(Response::Message { message })
+    }
+}
+
+/// `state` with the `error` of [`TowerState::Failing`] and the `reason` of [`TowerState::Denied`]
+/// cleaned and bounded with [`clean_tower_display`]: what [`FakeStation::set_tower_state`] and
+/// [`FakeStation::set_towers`] store.
+fn clean_tower_state(state: TowerState) -> TowerState {
+    match state {
+        TowerState::Failing { error } => TowerState::Failing {
+            error: clean_tower_display(&error),
+        },
+        TowerState::Denied { reason } => TowerState::Denied {
+            reason: clean_tower_display(&reason),
+        },
+        other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
     }
 }
 
