@@ -28,3 +28,6 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+# The confinement lint (hard rule 1; the types are listed in clippy.toml). Denied here, not left to
+# `-D warnings`, so a blanket `allow(warnings)` cannot lower it: that only reaches lints at warn level.
+disallowed_types = "deny"

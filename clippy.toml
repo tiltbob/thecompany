@@ -1,10 +1,16 @@
-# The only clippy.toml in the workspace: clippy uses the first one it finds walking up and never
-# merges. crates/safehouse gets its own in M5.
+# The only clippy config in the workspace until crates/safehouse/clippy.toml (M5). Clippy uses the
+# first clippy.toml or .clippy.toml it finds walking up from a crate's directory (or
+# CLIPPY_CONF_DIR) and never merges, so a second file anywhere under crates/ silently drops the
+# confinement lint for every crate below it. scripts/check-lints.sh guards this in CI.
+
+# Covers #[test] functions and items under #[cfg(test)]. Helper functions in an integration test
+# file (tests/*.rs) are covered only if the file starts with `#![cfg(test)]`.
 allow-unwrap-in-tests = true
 
 disallowed-types = [
     { path = "std::process::Command", reason = "agent confinement: only the safehouse crate spawns processes (AGENTS.md, hard rule 1)" },
     # allow-invalid: the path exists only when something enables tokio's `process` feature. Without
-    # it clippy would warn that the path is unreachable in every crate that links tokio.
+    # the flag clippy warns that the path is unreachable in each crate whose build loads tokio
+    # (today `numbers`, through iroh). That warning never fails clippy, even under -D warnings.
     { path = "tokio::process::Command", reason = "agent confinement: only the safehouse crate spawns processes (AGENTS.md, hard rule 1)", allow-invalid = true },
 ]

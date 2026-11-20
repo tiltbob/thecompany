@@ -385,7 +385,8 @@ depends on `chief` for the API types, never the reverse.
 
 ## Appendix: verified facts the first milestones rely on
 
-Read from published sources, not compiled.
+Read from published sources, not compiled, except the dependency line, which CI builds
+(`cargo check -p numbers`).
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
   (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and

@@ -5,20 +5,12 @@
 //! first). It takes iroh without default features; see the dependency notes in
 //! `docs/ARCHITECTURE.md`.
 
-/// The ALPN every numbers link is opened with. The trailing digit is the link protocol version.
-pub const ALPN: &[u8] = b"numbers/0";
-
 /// A node's id: the public half of its node key.
 pub type NodeId = iroh::EndpointId;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn alpn_is_versioned() {
-        assert_eq!(ALPN, b"numbers/0");
-    }
 
     #[test]
     fn node_id_round_trips_through_its_string_form() {
