@@ -1,5 +1,6 @@
-//! The hello exchange and one-request chat streams.
+//! The hello exchange and dispatch of one-request streams.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{
@@ -10,10 +11,11 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason, WireChatMessage};
-use crate::proto::{CHAT_PROTOCOL, Hello, HelloEcho, StreamHeader};
+use crate::proto::{CHAT_PROTOCOL, Hello, HelloEcho, StreamHeader, TOWERS_PROTOCOL};
 use crate::{CLOSE_NOT_ALLOWED, Protocol};
 
-use super::{CLOSE_LINK, IncomingChat, Peer, SendError, Shared, lock};
+use super::tower_exchange::write_tower_reply;
+use super::{CLOSE_LINK, EstablishedConnection, IncomingChat, Peer, SendError, Shared, lock};
 
 pub(super) fn close_code(reason: &ConnectionError) -> Option<u32> {
     match reason {
@@ -142,19 +144,39 @@ fn read_failure(error: FrameError) -> SendError {
     }
 }
 
-pub(super) async fn receive_chat(
+pub(super) async fn receive_stream(
     shared: &Shared,
-    peer: &Peer,
-    connection: &Connection,
+    peer: &Arc<Peer>,
+    connection: &Arc<EstablishedConnection>,
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
     let budget = shared.config.send_deadline;
     let response = async {
-        let reply = chat_reply(shared, peer, connection, &mut recv, budget).await?;
-        write_frame(&mut send, &reply, WIRE_FRAME_MAX)
+        let header: StreamHeader = read_frame(&mut recv, WIRE_FRAME_MAX, Some(budget))
             .await
             .map_err(|_| CLOSE_LINK)?;
+        if header.proto == TOWERS_PROTOCOL
+            && let Some(exchange) = &shared.towers
+        {
+            write_tower_reply(
+                exchange, shared, peer, connection, header.v, &mut send, &mut recv,
+            )
+            .await?;
+        } else {
+            let reply = chat_reply(
+                shared,
+                peer,
+                &connection.transport,
+                header,
+                &mut recv,
+                budget,
+            )
+            .await?;
+            write_frame(&mut send, &reply, WIRE_FRAME_MAX)
+                .await
+                .map_err(|_| CLOSE_LINK)?;
+        }
         let _ = send.finish();
         Ok(())
     };
@@ -171,12 +193,10 @@ async fn chat_reply(
     shared: &Shared,
     peer: &Peer,
     connection: &Connection,
+    header: StreamHeader,
     recv: &mut RecvStream,
     budget: Duration,
 ) -> Result<ChatReply, u32> {
-    let header: StreamHeader = read_frame(recv, WIRE_FRAME_MAX, Some(budget))
-        .await
-        .map_err(|_| CLOSE_LINK)?;
     if let Err(reason) = header.validate_chat() {
         return Ok(ChatReply::Nack(reason));
     }

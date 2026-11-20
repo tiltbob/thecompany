@@ -1,8 +1,8 @@
 //! The station core, usable in-process through the same API as a local-socket client.
 //!
 //! One actor owns the network runtime and persistent state. Releasing its data-dir lock is the
-//! last step of shutdown, after the endpoint has closed. Frontend handles only submit API
-//! requests and subscribe to events.
+//! last step of shutdown, after the endpoint has closed. Frontend handles submit API requests,
+//! subscribe to events, and can observe when the station stops accepting requests.
 //!
 //! - [`ipc`] (Unix): the local-socket server, generic over any `chief` transport.
 
@@ -47,7 +47,9 @@ pub struct StationConfig {
     pub tower_url: String,
     /// Which IP sockets the endpoint binds. Use `RelayOnly` to disable direct paths.
     pub ip_transport: IpTransport,
-    /// Budget for connecting to one peer station.
+    /// Budget for one dial and its application hello. A retry can use more of the send budget.
+    /// When trying several stations, the sender reserves this duration for each later candidate
+    /// when its remaining send budget permits.
     pub connect_timeout: Duration,
     /// Total budget for one send across all candidate stations.
     pub send_deadline: Duration,
@@ -177,20 +179,18 @@ impl Station {
             }],
             bootstrap_domain: None,
         };
-        let (network, incoming) = Link::start(
-            endpoint,
-            LinkConfig {
-                connect_timeout: config.connect_timeout,
-                send_deadline: config.send_deadline,
-            },
-        );
+        let link_config = LinkConfig {
+            connect_timeout: config.connect_timeout,
+            send_deadline: config.send_deadline,
+        };
+        let (network, incoming) = Link::start(endpoint, link_config);
         let actor = Actor::new(
             storage,
             own_id,
             book,
             authorizer,
             status,
-            config.send_deadline,
+            link_config,
             network.handle(),
         );
         let (commands, receive) = mpsc::channel(COMMAND_CAPACITY);
@@ -232,6 +232,16 @@ impl Drop for Station {
 #[derive(Clone, Debug)]
 pub struct StationHandle {
     commands: mpsc::Sender<Command>,
+}
+
+impl StationHandle {
+    /// Waits until the actor closes or drops its request receiver. This is cancel-safe.
+    ///
+    /// The receiver closes before orderly teardown finishes. Use [`Station::shutdown`] to
+    /// wait for the actor to finish and the data-dir lock to be released.
+    pub async fn closed(&self) {
+        self.commands.closed().await;
+    }
 }
 
 impl Transport for StationHandle {

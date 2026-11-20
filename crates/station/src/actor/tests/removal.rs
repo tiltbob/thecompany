@@ -101,13 +101,11 @@ async fn station(data_dir: &Path) -> Fixture {
         "bind removal test station",
     );
     let address = EndpointAddr::new(own_id).with_ip_addr(endpoint.iroh().bound_sockets()[0]);
-    let (link, _incoming) = Link::start(
-        endpoint,
-        LinkConfig {
-            connect_timeout: CASE_BUDGET,
-            send_deadline: SEND_BUDGET,
-        },
-    );
+    let config = LinkConfig {
+        connect_timeout: CASE_BUDGET,
+        send_deadline: SEND_BUDGET,
+    };
+    let (link, _incoming) = Link::start(endpoint, config);
     let status = Status {
         station_id: own_id.to_string(),
         instance_id: "removal".to_owned(),
@@ -120,7 +118,7 @@ async fn station(data_dir: &Path) -> Fixture {
         PeerBook::new(),
         authorizer,
         status,
-        SEND_BUDGET,
+        config,
         link.handle(),
     );
     let (_, events) = subscription(SUBSCRIPTION_CAPACITY);

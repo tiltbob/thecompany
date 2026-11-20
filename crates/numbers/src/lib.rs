@@ -19,12 +19,12 @@ pub mod towers;
 pub use bootstrap::{DnsLocator, LocateError, LocateFuture, Locator};
 pub use endpoint::{
     DnsConfig, Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
-    TlsRoots,
+    TlsRoots, TowerControl, TowerControlError, TowerState, TowerStatus,
 };
 pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
 pub use identity::{NodeId, generate_node_key, node_id};
 pub use link::{
-    IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate, SendError,
-    ShutdownError,
+    IncomingChat, IncomingTowers, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate,
+    SendError, ShutdownError, TowerExchange,
 };
 pub use towers::{MAX_TOWERS, Qad, TowerEntry, TowerSet, TowerSetError, canonical_tower_url};

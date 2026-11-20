@@ -262,12 +262,12 @@ async fn wait_for_close(conn: &Connection) {
     );
 }
 
-async fn rebind_after_shutdown(socket: SocketAddr) {
+async fn rebind_after_shutdown(socket: SocketAddr) -> UdpSocket {
     checked(
         timeout(Duration::from_secs(1), async {
             loop {
                 match UdpSocket::bind(socket) {
-                    Ok(_) => break,
+                    Ok(socket) => break socket,
                     Err(error) if error.kind() == ErrorKind::AddrInUse => {
                         sleep(Duration::from_millis(10)).await;
                     }
@@ -277,7 +277,7 @@ async fn rebind_after_shutdown(socket: SocketAddr) {
         })
         .await,
         "link socket remained bound after shutdown",
-    );
+    )
 }
 
 struct HeldHello {
@@ -1261,7 +1261,7 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
 
             checked(link.shutdown().await, "stop link with a surviving handle");
             assert_eq!(handle.path(peer_id), LinkPath::Down);
-            rebind_after_shutdown(local_socket).await;
+            drop(rebind_after_shutdown(local_socket).await);
             peer.iroh().close().await;
         })
         .await,

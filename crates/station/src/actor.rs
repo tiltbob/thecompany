@@ -9,7 +9,7 @@ use chief::api::{
 };
 use chief::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, subscription};
 use iroh::{Watcher, endpoint::RelayStatus};
-use numbers::link::{IncomingChat, Link, LinkHandle, LinkPath, PathUpdate};
+use numbers::link::{IncomingChat, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate};
 use numbers::proto::CHAT_PROTOCOL;
 use numbers::proto::chat::{ChatMessage, ChatReply, NackReason, ReceiptWindow};
 use numbers::{Authorizer, NodeId, Protocol};
@@ -45,7 +45,7 @@ pub(super) struct Actor {
     book_uncertain: bool,
     authorizer: Arc<Authorizer>,
     status: Status,
-    send_deadline: Duration,
+    link_config: LinkConfig,
     links: LinkHandle,
     paths: HashMap<NodeId, PeerLink>,
     history: History,
@@ -62,7 +62,7 @@ impl Actor {
         book: PeerBook,
         authorizer: Arc<Authorizer>,
         status: Status,
-        send_deadline: Duration,
+        link_config: LinkConfig,
         links: LinkHandle,
     ) -> Self {
         Self {
@@ -72,7 +72,7 @@ impl Actor {
             book_uncertain: false,
             authorizer,
             status,
-            send_deadline,
+            link_config,
             links,
             paths: HashMap::new(),
             history: History::default(),
@@ -318,7 +318,7 @@ impl Actor {
             return Err(internal("the station has too many sends in progress"));
         }
         let deadline = Instant::now()
-            .checked_add(self.send_deadline)
+            .checked_add(self.link_config.send_deadline)
             .ok_or_else(|| internal("could not set the send deadline"))?;
         let id = new_id().map_err(|_| internal("could not generate a message id"))?;
         let mut stations = stations.clone();
@@ -337,10 +337,14 @@ impl Actor {
             body: message.body.clone(),
         };
         let link = self.links.clone();
+        let connect_timeout = self.link_config.connect_timeout;
         let seq = message.seq;
-        let worker = self
-            .jobs
-            .spawn(async move { (seq, deliver(link, stations, chat, deadline).await) });
+        let worker = self.jobs.spawn(async move {
+            (
+                seq,
+                deliver(link, stations, chat, deadline, connect_timeout).await,
+            )
+        });
         self.pending.insert(
             seq,
             Pending {
@@ -503,23 +507,29 @@ async fn deliver(
     stations: Vec<NodeId>,
     chat: ChatMessage,
     deadline: Instant,
+    connect_timeout: Duration,
 ) -> MessageStatus {
-    let outcome = timeout_at(deadline, async {
-        for id in stations {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match link.send(id, chat.clone()).await {
-                Ok(ChatReply::Ack) => return Some(MessageStatus::Delivered),
-                Ok(ChatReply::Nack(NackReason::Unavailable)) | Err(_) => continue,
-                Ok(ChatReply::Nack(_)) => return Some(failed(FailReason::Refused)),
-            }
+    let mut stations = stations.into_iter();
+    while let Some(id) = stations.next() {
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
         }
-        None
-    })
-    .await;
-    if let Ok(Some(status)) = outcome {
-        return status;
+        // Leave one dial budget per later candidate when time permits. The current
+        // candidate can still use one dial budget, capped by the original deadline.
+        let later_count = u32::try_from(stations.len()).unwrap_or(u32::MAX);
+        let reservation = connect_timeout.saturating_mul(later_count);
+        let allowance = remaining
+            .saturating_sub(reservation)
+            .max(connect_timeout)
+            .min(remaining);
+        // Tokio polls the send before its timer, preserving a ready reply on a late poll.
+        match timeout_at(now + allowance, link.send(id, chat.clone())).await {
+            Ok(Ok(ChatReply::Ack)) => return MessageStatus::Delivered,
+            Ok(Ok(ChatReply::Nack(NackReason::Unavailable))) | Ok(Err(_)) | Err(_) => {}
+            Ok(Ok(ChatReply::Nack(_))) => return failed(FailReason::Refused),
+        }
     }
     // With no conclusive reply, report NoAnswer at the original deadline.
     sleep_until(deadline).await;

@@ -155,15 +155,16 @@ again. So a station watches its home tower (below).
   it was configured with and the ones it remembered across restarts; and only then the SRV record
   again. A changed SRV record therefore matters to newcomers and to a node that has lost every
   tower, not to a running network.
-- **Towers named by a peer are candidates, not part of the set.** Stations exchange their working
-  tower sets over an established link. What a peer sends is checked, kept as candidates with the
-  peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
-  and never passes one on; a chief may take one into the set with an explicit command (decided in
-  #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
-- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
-  tower that is not connected, for some seconds, and never while the home tower is connected. Then
-  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
-  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+- **Towers named by a peer are candidates.** Stations exchange the HTTPS
+  entries of their working tower sets over an established link. What a peer sends is checked,
+  kept as candidates with the peer's name, and shown. A station never connects to a candidate,
+  never adds one to its relay map and never passes one on. A chief may take one into the set
+  with an explicit command (decided in #73). Automatic use would be an exception to hard rule 8
+  and is the owner's to grant.
+- **A station watches its home tower.** After some seconds with no home or a disconnected home,
+  it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
+  configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
+  connected home alone. A tower that denies the station is marked and shown with the reason. It
   is taken out of the relay map only if another tower of the set is not marked denied; if it is
   the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
@@ -245,9 +246,14 @@ After an outgoing dial ends in `Timeout` or `Disconnected`, each waiting send wi
 start or join one fresh dial within its original deadline. This applies to the send that started
 the failed dial as well. An already open link can serve the send, and a pending incoming hello
 can make a new outgoing dial unnecessary. Authorization refusals and bad hellos keep their own
-errors. On a direct-only link, iroh can still redial the peer's old address immediately after a
-stall close if it resolves the peer before processing the connection close. The fresh dial can
-look up the new address once iroh clears the old path. M1's tower path also allows recovery.
+errors. If the link redials before iroh processes the close, iroh sends the dial's packets only to
+the old address while that path is still selected. Processing the last connection's close clears
+the selected path, so a subsequent resolution can start an address lookup. `numbers` installs
+`TowerLookup`, which supplies relay URLs. In M1 a peer that restarts on a new port is reached
+again through a tower or by dialing in. The direct-only restart test uses a stale in-memory
+lookup for the first redial. It publishes the new address after that redial's
+first packet, so the first dial times out regardless of whether iroh has cleared the selected
+path yet. The shared dial timeout tests check recovery and the retry limit directly.
 [#120](https://github.com/tiltbob/thecompany/issues/120)
 
 If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
@@ -296,7 +302,8 @@ across short sends and resets when new authenticated frames arrive. A send that 
 a stall can close the connection only if its remaining budget exceeds the window. A later send
 can use the same observation to close and redial if the connection is still current and has made
 no progress for the full window. QUIC replenishes credits in batches. A crash with 14 unanswered
-sends can exhaust those credits on loopback.
+sends can exhaust those credits on loopback. An opt-in tower announcement takes one of those
+credits, so 13 unanswered chat sends can exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
 
 A quiet link can take a keepalive to transmit its queued `STREAMS_BLOCKED` frame. Both sides
@@ -317,6 +324,27 @@ leaves delivery uncertain because an earlier attempt can still be accepted. The 
 up to 16 concurrent incoming streams per link and applies `send_deadline` to each stream,
 including waiting for the actor's reply. It refuses unauthorized chat on an established link by
 resetting the stream with code `403`. A full or closed chat mailbox returns `unavailable`.
+
+An opt-in M2 link opens one `{"proto":"towers","v":1}` stream in each direction per admitted
+transport. It sends the HTTPS projection captured at admission in a `towers` array of `{url,
+qad_port}` entries. The whole list contains at most eight distinct canonical HTTPS root URLs.
+A missing or null QAD port means off. Receivers ignore unknown fields in the request and its
+entries. A list that violates the tower rules is rejected whole. Framed replies are
+`{"type":"ack"}` or `{"type":"nack","reason":"…"}` with reason `invalid_towers`,
+`unsupported_version` or `unavailable`. A chat-only link replies `unknown_protocol`. The tower
+stream needs its own authorization after the link hello. Refusal resets the stream with code
+`403`, and malformed frames reset it with code `0`. Replacement starts a new attempt even if the
+path is the same. An attempt ends on a reply, connection closure or deadline, and sends never
+retry or dial.
+
+Tower receives share the 16-stream limit and deadline. One tower stream per transport can read a
+body or wait for mailbox space or the actor. A further recognized tower stream receives
+`unavailable`. Slow headers and flow-controlled replies still use slots within the shared limit
+and deadline. The separate mailbox holds up to 32 snapshots. ACK follows the station's
+whole-snapshot commit while the exact admitted connection and peer remain current. A queued
+snapshot can still commit after its sender's deadline if that lease remains current. The native
+link treats received URLs as data. The station is responsible for retaining committed candidate
+snapshots across ordinary disconnects.
 
 ### Stations and the chief's frontends
 
@@ -634,9 +662,17 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  took it out of the map but left the home connection and the status as they were. A tower that
-  denies an endpoint can still become its home when another tower is
-  in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
+  took it out of the map but left the home connection and the raw status as they were. The same
+  can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
+  and `home_relay_status()` reports the actual home. The `numbers::Endpoint` runs a task that
+  follows `home_relay_status()` between `tower_states()` calls and clears its remembered failure
+  on an observed connection or home change.
+  Iroh's latest-value watcher can coalesce brief transitions. A map change requests a full net
+  report even when `insert_relay` keeps the same configuration, so a nudge needs no removal.
+  If a report is already running, a periodic tick or a minor network change can replace that
+  pending request with an incremental report. A tower that denies an endpoint can still become
+  its home when another tower is in the map (17 of 30) and keeps it; `remove_relay` of the denying
+  tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about

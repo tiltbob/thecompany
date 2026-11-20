@@ -1,6 +1,7 @@
-//! Authenticated, bidirectional links and chat stream dispatch.
+//! Authenticated, bidirectional links and typed stream dispatch.
 
 mod streams;
+mod tower_exchange;
 
 #[cfg(test)]
 mod close_wait_tests;
@@ -16,18 +17,24 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, ConnectionError, FrameStats, RecvStream, SendStream, Side};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::endpoint::QUIC_KEEPALIVE;
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
+use crate::proto::towers::TowerAnnouncement;
 use crate::proto::{CHAT_PROTOCOL, Hello};
-use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
+use crate::{
+    Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, TowerSet, generate_node_key,
+};
 
 use self::streams::{
-    close_code, exchange_hello, read_chat_reply, receive_chat, write_chat_request,
+    close_code, exchange_hello, read_chat_reply, receive_stream, write_chat_request,
 };
+use self::tower_exchange::{TowerProtocol, announce};
+
+pub use self::tower_exchange::{IncomingTowers, TowerExchange};
 
 /// The ALPN of the numbers link.
 pub const LINK_ALPN: &[u8] = b"numbers/0";
@@ -39,7 +46,7 @@ const STREAM_LIMIT: usize = 16;
 const MAILBOX_CAPACITY: usize = 32;
 const STREAM_CREDIT_MARGIN: Duration = Duration::from_secs(1);
 
-/// Time budgets for a link and its chat operations.
+/// Time budgets for a link and its stream operations.
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
@@ -148,6 +155,25 @@ impl Link {
     /// This performs no network wait. Call from a Tokio runtime with time enabled.
     pub fn start(endpoint: Endpoint, config: LinkConfig) -> (Self, mpsc::Receiver<IncomingChat>) {
         let (shared, receive) = Shared::new(&endpoint, config);
+        (Self::spawn(endpoint, shared), receive)
+    }
+
+    /// Starts chat and the opt-in tower exchange, seeded before the router starts.
+    ///
+    /// Enable [`crate::proto::TOWERS_PROTOCOL`] in the endpoint's stream authorizer. Each
+    /// admitted transport makes one bounded announcement attempt, including replacements.
+    /// This performs no network wait. Call from a Tokio runtime with time enabled.
+    pub fn start_with_towers(
+        endpoint: Endpoint,
+        config: LinkConfig,
+        working_set: &TowerSet,
+    ) -> (Self, mpsc::Receiver<IncomingChat>, TowerExchange) {
+        let (towers, exchange) = TowerProtocol::new(working_set);
+        let (shared, receive) = Shared::with_towers(&endpoint, config, Some(towers));
+        (Self::spawn(endpoint, shared), receive, exchange)
+    }
+
+    fn spawn(endpoint: Endpoint, shared: Arc<Shared>) -> Self {
         let workers = Arc::new(Mutex::new(Some(Workers {
             endpoint: endpoint.iroh().clone(),
             tasks: JoinSet::new(),
@@ -157,14 +183,11 @@ impl Link {
             .router_builder()
             .accept(LINK_ALPN, IncomingLinks(Arc::clone(&shared)))
             .spawn();
-        (
-            Self {
-                shared,
-                workers,
-                router,
-            },
-            receive,
-        )
+        Self {
+            shared,
+            workers,
+            router,
+        }
     }
 
     /// Gets a handle for station operations.
@@ -175,7 +198,7 @@ impl Link {
         }
     }
 
-    /// Closes links and the incoming mailbox, then waits for the workers and router.
+    /// Closes links and incoming mailboxes, then waits for the workers and router.
     pub async fn shutdown(self) -> Result<(), ShutdownError> {
         self.shared.stop();
         let workers = lock(&self.workers).take();
@@ -425,12 +448,21 @@ struct Shared {
     config: LinkConfig,
     authorizer: Arc<Authorizer>,
     incoming: Mutex<Option<mpsc::Sender<IncomingChat>>>,
+    towers: Option<TowerProtocol>,
     paths: broadcast::Sender<PathUpdate>,
     registry: Mutex<Registry>,
 }
 
 impl Shared {
     fn new(endpoint: &Endpoint, config: LinkConfig) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
+        Self::with_towers(endpoint, config, None)
+    }
+
+    fn with_towers(
+        endpoint: &Endpoint,
+        config: LinkConfig,
+        towers: Option<TowerProtocol>,
+    ) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
         let (incoming, receive) = mpsc::channel(MAILBOX_CAPACITY);
         let (paths, _) = broadcast::channel(MAILBOX_CAPACITY);
         let shared = Arc::new(Self {
@@ -439,6 +471,7 @@ impl Shared {
             config,
             authorizer: endpoint.authorizer_handle(),
             incoming: Mutex::new(Some(incoming)),
+            towers,
             paths,
             registry: Mutex::default(),
         });
@@ -483,6 +516,9 @@ impl Shared {
             peer.revoke(&self.paths);
         }
         lock(&self.incoming).take();
+        if let Some(towers) = &self.towers {
+            towers.close();
+        }
     }
 
     fn hello(&self) -> Hello {
@@ -539,9 +575,11 @@ impl Shared {
                 transport: connection.clone(),
                 admitted_at: Instant::now(),
                 replaced_locally: AtomicBool::new(false),
+                tower_receive: Semaphore::new(1),
             }),
             path,
             stream_credit_wait: None,
+            tower_announcement: self.towers.as_ref().map(TowerProtocol::snapshot),
         });
         publish_path(&self.paths, peer.id, old_path, path);
         DialResult::Ready
@@ -671,6 +709,8 @@ struct Active {
     connection: Arc<EstablishedConnection>,
     path: LinkPath,
     stream_credit_wait: Option<StreamCreditWait>,
+    // This snapshot belongs to this admission even if the working set changes before drive.
+    tower_announcement: Option<Arc<TowerAnnouncement>>,
 }
 
 struct StreamCreditWait {
@@ -693,6 +733,7 @@ struct EstablishedConnection {
     admitted_at: Instant,
     // Read and written under the peer lock, including after removal from the active slot.
     replaced_locally: AtomicBool,
+    tower_receive: Semaphore,
 }
 
 async fn wait_for_close(
@@ -1001,6 +1042,26 @@ impl ProtocolHandler for IncomingLinks {
 }
 
 async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
+    let (lease, snapshot) = {
+        let mut state = peer.state();
+        let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.matches(&connection))
+        else {
+            return;
+        };
+        (
+            Arc::clone(&active.connection),
+            active.tower_announcement.take(),
+        )
+    };
+    let mut announcing = snapshot.is_some();
+    let mut outgoing = pin!(async {
+        if let Some(snapshot) = snapshot {
+            announce(&shared, &peer, &lease, snapshot).await;
+        }
+    });
     let mut path_events = connection.path_events();
     let mut streams = FuturesUnordered::new();
     // The installed connection's path can change between admission and subscription.
@@ -1009,6 +1070,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
         tokio::select! {
             biased;
             _ = connection.closed() => break,
+            () = &mut outgoing, if announcing => announcing = false,
             event = path_events.next() => {
                 if event.is_none() {
                     break;
@@ -1018,7 +1080,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
             _ = streams.next(), if !streams.is_empty() => {}
             incoming = connection.accept_bi(), if streams.len() < STREAM_LIMIT => {
                 let Ok((send, recv)) = incoming else { break };
-                streams.push(receive_chat(&shared, &peer, &connection, send, recv));
+                streams.push(receive_stream(&shared, &peer, &lease, send, recv));
             },
         }
     }
@@ -1090,22 +1152,31 @@ mod tests {
     use super::*;
     use crate::{EndpointConfig, IpTransport, generate_node_key};
 
+    mod dial_retry;
+
     async fn loopback_endpoint() -> Endpoint {
+        endpoint_with_streams(&[CHAT_PROTOCOL]).await
+    }
+
+    pub(super) async fn endpoint_with_streams(streams: &'static [&'static str]) -> Endpoint {
         let endpoint = Endpoint::bind(
             &generate_node_key(),
             EndpointConfig {
                 ip_transport: IpTransport::LoopbackOnly,
                 ..EndpointConfig::default()
             },
-            Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL])),
+            Arc::new(Authorizer::new(&[LINK_ALPN], streams)),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("bind a loopback endpoint"));
         endpoint.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
         endpoint
     }
 
-    async fn connect(dialer: &Endpoint, listener: &Endpoint) -> (Connection, Connection) {
+    pub(super) async fn connect(
+        dialer: &Endpoint,
+        listener: &Endpoint,
+    ) -> (Connection, Connection) {
         let socket = listener.iroh().bound_sockets()[0];
         let address = iroh::EndpointAddr::new(listener.iroh().id()).with_ip_addr(socket);
         let (client, server) = tokio::join!(dialer.iroh().connect(address, LINK_ALPN), async {
@@ -1316,6 +1387,7 @@ mod tests {
             assert!(
                 shared.admit(&peer, &mut peer.state(), &server, None, [1; 16]) == DialResult::Ready
             );
+            let lease = Arc::clone(&peer.state().active.as_ref().unwrap().connection);
 
             let chat = ChatMessage {
                 id: "probe".into(),
@@ -1348,7 +1420,7 @@ mod tests {
                 },
                 async {
                     let (send, recv) = server.accept_bi().await.unwrap();
-                    receive_chat(&shared, &peer, &server, send, recv).await;
+                    receive_stream(&shared, &peer, &lease, send, recv).await;
                 }
             );
             assert_eq!(reply, Ok(ChatReply::Nack(NackReason::Unavailable)));
