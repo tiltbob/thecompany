@@ -141,33 +141,56 @@ the name you give the person behind a station.
 ### Towers
 
 A tower embeds an `iroh-relay` server. Every node keeps a connection to one tower; a node is dialed
-by id through the towers, and iroh moves the connection to a direct path when it can.
+by id through the towers, and iroh moves the connection to a direct path when it can. When that
+tower dies, iroh moves the node to another tower only after about two net reports (41–49 s), and a
+connection relayed through the dead tower does not move: it ends at the idle timeout and is dialed
+again. So a station watches its home tower (below).
 
 - **SRV only bootstraps.** A newcomer resolves `_numbers._tcp.<domain>` (SRV) to
   `https://target:port` to reach its first tower; `--tower <url>` does the same by hand for
   development and tests. A node that is already on the network finds towers and other nodes through
-  the network first, in this order: paths and addresses it already holds; what the network tells it —
-  the tower set (remembered across restarts, passed on by peers, and from M3 a signed roster
-  statement carried in invites) and other nodes' signed address records, which any connected node
-  can pass on; then every tower in the known set; and only then the SRV record again. A changed SRV
-  record therefore matters to newcomers and to a node that has lost every tower, not to a running
-  network.
+  the network first, in this order: paths and addresses it already holds; what the network tells it,
+  which is other nodes' signed address records, passed on by any connected node, and from M3 a
+  signed roster statement carried in invites; then every tower in its own set, which is the towers
+  it was configured with and the ones it remembered across restarts; and only then the SRV record
+  again. A changed SRV record therefore matters to newcomers and to a node that has lost every
+  tower, not to a running network.
+- **Towers named by a peer are candidates, not part of the set.** Stations exchange their working
+  tower sets over an established link. What a peer sends is checked, kept as candidates with the
+  peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
+  and never passes one on; a chief may take one into the set with an explicit command (decided in
+  #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
+- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
+  tower that is not connected, for some seconds, and never while the home tower is connected. Then
+  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
+  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+  is taken out of the relay map only if another tower of the set is not marked denied; if it is
+  the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
+  does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
+  only when the set changes or at a long interval. The station limits its own attempts; it does not
+  control iroh's own retries (decided in #74, built in #78).
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
   candidate addresses and make it send a few UDP probes. It cannot read, alter or impersonate member
   traffic or stored data, and can never become a member. DNSSEC or pinning would protect availability
   and metadata only.
-- **Same set everywhere.** With no better address, dialing tries every tower in the set at once, so
-  all nodes must use the same small set (two or three). SRV priority and weight are ignored.
-- **Not an open relay.** A production tower admits only listed node ids and rate-limits each client:
-  a static list in M2, fed from the roster in M3 (verifiable against the genesis hash, no secret).
-  This is hygiene run by an untrusted party, not a security boundary.
+- **Same set everywhere.** With no better address, dialing tries every tower in the set at once.
+  Towers do not forward to each other, so a dialer reaches a peer only through a tower both of them
+  can reach; all nodes therefore use the same small set (two or three). SRV priority and weight are
+  ignored.
+- **Not an open relay.** A production tower relays only for listed node ids and rate-limits each
+  client: a static list in M2, fed from the roster in M3 (verifiable against the genesis hash, no
+  secret). The list covers relaying only: an unlisted node can still use the tower's address
+  discovery and latency probe. Removing an id does not end its open connection; the tower has to
+  disconnect it. The rate limit slows a client down without errors. This is hygiene run by an
+  untrusted party, not a security boundary.
 - **Its own endpoint.** The relay server cannot host extra routes, so from M3 a tower also runs an
   iroh endpoint with its own node key. Members reach its services there, authenticated by node id:
   the roster feed first, storage from M4. Towers also use it to pull blocks from each other.
 - **Direct paths across NATs need the production tower.** Address discovery (QAD, UDP 7842) requires
-  TLS. M1's plain-HTTP dev tower relays, and gives direct paths only on the same host.
+  TLS, and a relay-only node runs none. M1's plain-HTTP dev tower relays, and gives direct paths
+  only on the same host.
 
 ### Link and protocols
 
@@ -421,6 +444,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   port): it behaves the same everywhere. Switch off only the captive-portal check
   (`NetReportConfig::default()` with `captive_portal_check = false`); `NetReportConfig::minimal()`
   also disables the HTTPS probes, and then no home tower is ever chosen (not online after 30 s).
+  Against a TLS tower, a configured QAD port that is closed costs the same 3.0 s at every first
+  report. The map in `RelayMode::Custom(map)` is shared: `insert_relay` / `remove_relay` on the
+  endpoint change it, so a lookup can read the same map.
 - **Dial by id.** An `AddressLookup` returning every tower URL for any id makes
   `endpoint.connect(id, ALPN)` work with no other service. All listed relays are tried in parallel
   and the relay need not be in the dialer's own map — current behaviour, not a documented contract.
@@ -431,11 +457,18 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   bound address (`http_url()` is test-utils only). Defaults are `AllowAll` and no rate limit: set
   `relay.limits.client_rx` and, in M2, an `AccessControl` (its `on_connect` sees the authenticated
   endpoint id). `iroh::RelayConfig` (client) is a different type from
-  `iroh_relay::server::RelayConfig`. In TLS mode the server also binds a plain-HTTP listener (port
-  80, captive-portal responder); ACME is tls-alpn-01 on port 443 only and needs `cache_path`; QAD
-  needs TLS; `Server::spawn` cannot add HTTP routes. A relay and a separate iroh endpoint can run in
-  one process; the relay does not advertise that endpoint's id. iroh-relay does not re-export
-  `RelayUrl`; it comes from `iroh`. After `Server::shutdown()` right after a client came online,
+  `iroh_relay::server::RelayConfig`. In TLS mode the server also binds a plain-HTTP listener on
+  `RelayConfig::http_bind_addr` that cannot be turned off and answers only `/generate_204`; ACME is
+  tls-alpn-01 on the HTTPS port only and needs `cache_path` (source reading); QAD needs TLS;
+  `Server::spawn` cannot add HTTP routes. The allowlist (`AccessControl`, `Access::Deny { reason }`)
+  gates `/relay` only: a denied endpoint still used QAD and the `/ping` probe. Removing an id from
+  the list does not disconnect it; `relay_service().clients().disconnect(id, None)` does (21–22 ms).
+  The rate limit (`ClientRateLimit`, live through `set_client_rate_limit`) only slows the sender
+  (64 KiB/s gave 34–35 KiB/s each way for an echo, no error, no status change) and is counted in
+  `bytes_rx_ratelimited_total`; `Limits::accept_conn_limit` and `accept_conn_burst` are declared
+  but not implemented. A relay and a separate iroh endpoint can run in one process; the relay does
+  not advertise that endpoint's id. iroh-relay does not re-export `RelayUrl`; it comes from `iroh`.
+  After `Server::shutdown()` right after a client came online,
   the client still reported itself connected in 8 of 180 runs (whether it could still relay was not
   tested); it was not observed in 180 runs each when shutting down at least 1 s after the last
   connect or stopping the tower's own runtime (observations, not guarantees).
@@ -454,8 +487,20 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   comes only from a net report, which re-runs every 20–26 s or when the relay map changes. With its
   tower down at start, an endpoint came online 14–24 s after the tower did; meanwhile
   `home_relay_status()` was empty with no error, and `network_change()` did not help. Removing and
-  re-inserting the tower brought it online in about 220 ms (observed, not documented). Under heavy
+  re-inserting the tower brought it online in about 220 ms (observed, not documented); with a
+  second tower down as well, 18–24 s waiting and 0.4–0.8 s with the remove and insert. Under heavy
   load an endpoint occasionally missed its first report and came online only after 21–24 s.
+  `home_relay_status()` lists the home tower only. After the home tower stopped, an endpoint moved
+  to the second tower after 41–49 s, because the report after a successful one plans no HTTPS probe
+  (`ProbePlan::with_last_report`); `network_change()` did not help, QAD (TLS towers) made it
+  22–28 s, and removing and re-inserting the dead tower made it 0.2–0.4 s (observed, not
+  documented). Home moves back to a recovered tower only if it is clearly faster (hysteresis; 6 of
+  25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
+  the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
+  the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
+  took it out of the map but left the home connection and the status as they were. A tower that
+  denies an endpoint can still become its home when another tower is
+  in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
@@ -475,11 +520,32 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107
   or 103 bytes. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
   stream type and does not propagate cancellation, hence the pull-style `Subscription::next()`.
-- **SRV (M2).** `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
-  `SrvRecordData {priority, weight, port, target}`. Query the FQDN with a trailing dot; targets come
-  back without one; NXDOMAIN is `Err(Error::NxDomain {..})`, an empty answer is `Ok(vec![])`.
-  `RelayUrl` equality is textual, so canonicalise once. SRV-located towers are always `https`. The
-  system resolver falls back to public resolvers unless that is disabled.
+- **Bootstrap (M2).** The record is SRV (decision 13, settled in #38); it was measured against a
+  DNS server on 127.0.0.1. `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
+  `SrvRecordData {priority, weight, port, target}`; targets come back without a trailing dot;
+  NXDOMAIN is `Err(Error::NxDomain {..})`, an empty answer is `Ok(vec![])`, and a silent server
+  `Err(Error::Timeout {..})` after 6.0 s. That is the resolver's budget for one UDP nameserver
+  query, a constant; a lookup over several nameservers can take longer, so the caller sets its own
+  deadline. Positive answers are cached for their TTL (source; measured: a second lookup sent no
+  query, and after `clear_cache()` the next one did), negative ones are not. The resolver logs each
+  name and its records at debug level. A fresh `n0_dns_resolver` builder has no public
+  fallback; `iroh::dns::DnsResolver::with_nameserver` keeps one, so iroh's resolver for the tower
+  host names is built with `.disable_fallback()`. `https://host.:port/` works but is a different
+  `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. An endpoint
+  bound with the URLs from the SRV answer came online through a TLS tower named by the record in
+  227–284 ms (bind to online; the lookup was done before the timed part).
+- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
+  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
+  `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
+  explicitly and no process-wide default was installed or needed. The resolver fails at once on a
+  missing, unreadable or non-PEM key file, but accepts a certificate file that holds no PEM
+  certificate (an empty chain; `Server::spawn` succeeds), so a tower checks that file itself (found
+  while building the tower, #70). A test endpoint trusts the
+  certificate with `iroh::tls::CaTlsConfig::custom_roots` (an empty list fails `bind()`) and came
+  online in 223–325 ms. An endpoint that does not trust it never chooses a home tower: empty
+  status, no error, `online()` pending. QAD ran when the relay map carried the tower's QAD port
+  (the tower's `qad_connections` counter shows it); relay-only endpoints and hosts without a
+  routed interface run none.
 - **Claude Code and API keys.** There is no login command that reads an API key. The CLI takes one
   from `ANTHROPIC_API_KEY` (an interactive session asks once whether to use it and remembers the
   answer; `-p` always uses it) or from the output of the shell command the `apiKeyHelper` setting
