@@ -4,6 +4,8 @@
 //! local socket. [`Client`] gives any transport typed methods. A subscription is a pair made by
 //! [`subscription`]: the transport keeps the [`EventSink`] and pushes events into it; the frontend
 //! pulls them from the [`Subscription`]. The rules both sides keep are in [`crate::api`].
+//!
+//! The attach order for a live view of the log is [`Client::follow_log`] in [`crate::follow`].
 
 use crate::api::{
     ApiError, Event, LogPage, Message, MessageStatus, Peer, Request, Response, Status,
@@ -30,6 +32,9 @@ pub trait Transport: Send + Sync + 'static {
     /// [`ApiError`]: the station's refusal, passed through unchanged, or the transport's own
     /// failure ([`ApiError::NotRunning`], [`ApiError::IncompatibleApi`],
     /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`]).
+    ///
+    /// Dropping the future does not take the request back: the station may still carry it out, as
+    /// after a lost answer (rule 12 in [`crate::api`]).
     fn call(&self, request: Request) -> impl Future<Output = Result<Response, ApiError>> + Send;
 
     /// Opens a subscription to live events from now on; earlier events are not replayed.
@@ -364,6 +369,12 @@ impl<T: Transport> Client<T> {
     /// [`Client::message`]. If the re-read message has another `id` than the one sent, the station
     /// restarted and the `seq` names another message: that gives [`ApiError::Disconnected`], as does
     /// a subscription that ends first. Other errors of the calls are passed through.
+    ///
+    /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
+    /// [`crate::api`]), and an outcome that arrives as an event is returned. But every
+    /// [`Event::Resync`] makes it re-read the message, and once the message has left the log that
+    /// re-read gives [`ApiError::MessageNotFound`], which is returned: whether or not the gap hid
+    /// the outcome's event, and also when the outcome has not happened yet.
     ///
     /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
     /// call in a timeout.

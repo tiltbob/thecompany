@@ -52,7 +52,10 @@
 //!    applied before it answered a snapshot call is in that snapshot. Events for changes that the
 //!    snapshot already holds are harmless: rule 2 skips the messages, and the full-state events
 //!    arrive in order, so the state is right again once the client has read the events queued so
-//!    far.
+//!    far. A frontend that must know that its subscription and its snapshots come from one
+//!    instance (rule 1) reads [`Request::Status`] before (a) and again after (b): an instance id
+//!    never comes back, so two equal ids mean that one instance answered everything in between.
+//!    [`crate::client::Client::follow_log`] does this.
 //! 4. **Event order.** One subscription delivers events in the order in which the station applied
 //!    the changes. The station pushes the events of a change before it answers the call that caused
 //!    it. In-process, the event is therefore queued before the answer arrives. Over the socket, calls
@@ -77,27 +80,42 @@
 //!    so that asking again with a higher limit makes progress. A peer name nobody has gives an
 //!    empty page with `None`, not an error: a removed peer's messages stay in the log. Clients
 //!    accept pages shorter than `limit`.
-//! 7. **Outgoing messages.** [`Request::Send`] fails with [`ApiError::PeerNotFound`] for an unknown
-//!    peer and with [`ApiError::Invalid`] (field `body`) for an empty body or one over
-//!    [`BODY_MAX_BYTES`]. Otherwise the station logs the message as [`Direction::Outgoing`] with
-//!    [`MessageStatus::Sending`] and rev 0, pushes its event, and answers with it. Exactly one
-//!    change follows, to a final status, with rev 1: [`MessageStatus::Delivered`] (a station of the
-//!    peer acknowledged it), or [`MessageStatus::Failed`] with [`FailReason::NoAnswer`] (no
-//!    answer before the send deadline), [`FailReason::Refused`] (a station of the peer refused it)
-//!    or [`FailReason::PeerRemoved`] (the peer was removed first). A final status never changes. A
-//!    client accepts a final status already in the answer to `Send`.
+//! 7. **Outgoing messages.** [`Request::Send`] checks the peer first, then the body: it fails with
+//!    [`ApiError::PeerNotFound`] for an unknown peer, then with [`ApiError::Invalid`] (field
+//!    `body`) for an empty body or one over [`BODY_MAX_BYTES`]. Otherwise the station logs the
+//!    message as [`Direction::Outgoing`] with [`MessageStatus::Sending`] and rev 0, pushes its
+//!    event, and answers with it. Exactly one change follows, to a final status, with rev 1:
+//!    [`MessageStatus::Delivered`] (a station of the peer acknowledged it), or
+//!    [`MessageStatus::Failed`] with [`FailReason::NoAnswer`] (no answer before the send
+//!    deadline), [`FailReason::Refused`] (a station of the peer refused it) or
+//!    [`FailReason::PeerRemoved`] (the peer was removed first). While the station keeps running, it
+//!    always pushes that one event, with the whole message at rev 1 and its final status, also when
+//!    the message has left the log meanwhile (rule 1; only when 1,000 newer messages entered the log
+//!    first); the log then no longer holds it, and [`Request::Message`] for its `seq` gives
+//!    [`ApiError::MessageNotFound`]. If the station stops first, its subscriptions end (rule 11)
+//!    and no outcome is promised for a send that was still `Sending`. A final status never changes.
+//!    A client accepts a final status already in the answer to `Send`.
 //! 8. **Incoming messages.** The station logs a message from a peer as [`Direction::Incoming`] with
 //!    [`MessageStatus::Received`] and rev 0, with [`Message::at_ms`] set to the time it arrived, and
-//!    pushes its event. A message the station has already logged (same peer, same id) is not logged
-//!    again and produces no event. Incoming messages never change.
-//! 9. **Text from outside.** The station strips control characters from every string that came from
-//!    a peer or a tower before a frontend sees it (AGENTS.md, hard rule 8). [`TowerState::Failing`]
-//!    and [`TowerState::Denied`] carry display text: show it, never match on it.
+//!    pushes its event. It refuses, and does not log, a message whose id does not have the form of
+//!    [`Message::id`]. The station remembers the newest [`RECEIPT_WINDOW`] accepted messages by
+//!    peer and id, across all peers. A message whose peer and id are among them is acknowledged to
+//!    the sender again, is not logged again and produces no event. Older ones are forgotten, so a
+//!    message resent after that many newer ones is logged as a new message, and a restart forgets
+//!    them all. Incoming messages never change.
+//! 9. **Text from outside.** Before a frontend sees a string that came from a peer or a tower, the
+//!    station replaces every control character in it with a space: every `char` for which
+//!    `char::is_control` is true (C0, DEL and C1, so newline, carriage return, tab and escape too).
+//!    M1 messages are therefore single lines (AGENTS.md, hard rule 8). [`TowerState::Failing`] and
+//!    [`TowerState::Denied`] carry display text: show it, never match on it.
 //! 10. **Peer book.** Peer names follow [`check_peer_name`] and are compared byte for byte.
 //!     [`Request::PeerAdd`] creates the peer or appends the station to an existing one and pushes
 //!     [`Event::Peer`]; adding a station the peer already has changes nothing and pushes nothing.
-//!     A station that belongs to another peer gives [`ApiError::StationTaken`]; the station's own
-//!     id gives [`ApiError::Invalid`] (field `station_id`). [`Request::PeerRemove`] fails the
+//!     Its checks run in this order: the name ([`check_peer_name`], [`ApiError::Invalid`] with
+//!     field `name`); the form of the station id ([`ApiError::Invalid`], field `station_id`; what
+//!     a valid id looks like is the station's to say); the station's own id
+//!     ([`ApiError::Invalid`], field `station_id`); a station that belongs to another peer
+//!     ([`ApiError::StationTaken`]). [`Request::PeerRemove`] fails the
 //!     peer's outgoing messages that are still `Sending` (rule 7, with their events), closes its
 //!     links and pushes [`Event::PeerRemoved`]. Any change of a link pushes [`Event::Peer`] with the
 //!     whole peer.
@@ -106,6 +124,12 @@
 //!     then `None`, and `None` on every later call. It never resumes. To go on, the client
 //!     subscribes again, follows rule 3 and compares [`Status::instance_id`] with the one it held
 //!     (rule 1). While the station shuts down, calls fail with [`ApiError::Stopping`].
+//! 12. **A call without an answer.** A call that ends with [`ApiError::Disconnected`] or
+//!     [`ApiError::Timeout`], or whose caller stopped waiting for it, may still have been carried
+//!     out. The station finishes a change it has accepted whether or not anyone still waits for
+//!     the answer, and pushes the change's events as always. A frontend that needs to know reads
+//!     the state again (the log, the peer book) before it repeats a change; a repeated
+//!     [`Request::Send`] is a second message.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -121,11 +145,19 @@ use std::fmt;
 /// `#[serde(default)]`, so that code which knows it also reads JSON without it. A new variant of
 /// any enum, a renamed, removed or retyped field, and a new required field all change
 /// `API_VERSION`.
+///
+/// Version 1 is not final until the first station that implements it is released with M1. Until
+/// then its rules are being completed, and clarifications of them do not change the number; from
+/// that release on, the rule above applies as written.
 pub const API_VERSION: u32 = 1;
 
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
 pub const BODY_MAX_BYTES: usize = 16 * 1024;
+
+/// The longest [`Message::id`], in bytes (64). An id is 1 to this many ASCII letters, digits,
+/// underscores or hyphens. Equal to the chat protocol's cap.
+pub const MESSAGE_ID_MAX_BYTES: usize = 64;
 
 /// The longest peer name, in bytes. See [`check_peer_name`].
 pub const PEER_NAME_MAX_BYTES: usize = 32;
@@ -137,6 +169,10 @@ pub const LOG_PAGE_MAX_MESSAGES: u32 = 1000;
 /// `serde_json::to_vec(&message).len()` over the page (rule 6 in the [module docs](self)). It keeps
 /// a [`Response::Log`] well under the local socket's 1 MiB frame cap.
 pub const LOG_PAGE_MAX_BYTES: usize = 512 * 1024;
+
+/// How many accepted incoming messages the station remembers, by peer and id, to recognise a
+/// message that is sent again (rule 8 in the [module docs](self)).
+pub const RECEIPT_WINDOW: usize = 1000;
 
 /// A call to the station. The station answers each with exactly one [`Response`], named on each
 /// variant, or with an [`ApiError`].
@@ -340,12 +376,18 @@ pub struct Message {
     pub rev: u32,
     /// The chat message id both stations share, as text. Opaque to frontends. The sending station
     /// makes it; the receiving station uses it to drop duplicates (rule 8).
+    ///
+    /// Its form: 1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters, digits, underscores (`_`) or hyphens
+    /// (`-`). A station refuses a message from a peer whose id has another form, so a frontend
+    /// never sees one.
     pub id: String,
     /// The peer's name when the message entered the log. It stays when the peer is removed.
     pub peer: String,
     /// Whether this station sent or received the message.
     pub direction: Direction,
-    /// The text. In an incoming message, stripped of control characters (rule 9).
+    /// The text, at most [`BODY_MAX_BYTES`] bytes. In an incoming message, every control
+    /// character is replaced by a space (rule 9), and the text may be empty: only
+    /// [`Request::Send`] has a lower bound.
     pub body: String,
     /// When this station logged the message, by its own clock, in unix milliseconds. For an
     /// incoming message that is when it arrived; the sender's clock is never used.
@@ -461,10 +503,12 @@ pub enum ApiError {
         /// What failed, as display text.
         detail: String,
     },
-    // Produced by the socket server.
-    /// The station could not decode the request.
+    // Produced by the socket: its server, or its client for a request it cannot send.
+    /// The request could not be carried to the station: the socket server could not decode it,
+    /// or the socket transport refused, before sending anything, a request too large for one
+    /// frame.
     BadRequest {
-        /// The decoder's message.
+        /// What was wrong, as display text. It never quotes the request.
         detail: String,
     },
     // Produced by the client side of a transport.
