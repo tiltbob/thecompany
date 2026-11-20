@@ -1033,3 +1033,192 @@ async fn a_message_held_during_a_reread_at_a_higher_rev_than_the_page_comes_afte
     expected.push((false, 258, 1));
     assert_eq!(ready(&mut f), expected);
 }
+
+// An end or a gap that a call's own completion makes ready wins over its answer.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Status,
+    Log,
+}
+
+type Act = Box<dyn FnOnce(&FakeStation) + Send>;
+
+/// One planned interleaving: on the `nth` call of `kind`, take the fake's ordinary answer, then
+/// `act`, then return the answer (or, with `fail`, an error in its place).
+struct Plan {
+    kind: Kind,
+    nth: usize,
+    act: Act,
+    fail: bool,
+}
+
+/// Calls to a fake, counted by kind; a planned call does something after the fake answered it and
+/// before it returns.
+#[derive(Clone)]
+struct AfterAnswer {
+    fake: FakeStation,
+    statuses: Arc<AtomicUsize>,
+    logs: Arc<AtomicUsize>,
+    plan: Arc<std::sync::Mutex<Option<Plan>>>,
+}
+
+impl AfterAnswer {
+    fn new(fake: &FakeStation) -> Self {
+        Self {
+            fake: fake.clone(),
+            statuses: Arc::default(),
+            logs: Arc::default(),
+            plan: Arc::default(),
+        }
+    }
+
+    /// Plans `act` for the `n`-th call of `kind` from now on (counting from 1).
+    fn after(
+        &self,
+        kind: Kind,
+        n: usize,
+        fail: bool,
+        act: impl FnOnce(&FakeStation) + Send + 'static,
+    ) {
+        let made = match kind {
+            Kind::Status => self.statuses.load(Ordering::SeqCst),
+            Kind::Log => self.logs.load(Ordering::SeqCst),
+        };
+        *self.plan.lock().unwrap() = Some(Plan {
+            kind,
+            nth: made + n,
+            act: Box::new(act),
+            fail,
+        });
+    }
+}
+
+impl Transport for AfterAnswer {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let (kind, counter) = match request {
+            Request::Status => (Kind::Status, &self.statuses),
+            Request::Log { .. } => (Kind::Log, &self.logs),
+            _ => return self.fake.call(request).await,
+        };
+        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let plan = {
+            let mut slot = self.plan.lock().unwrap();
+            match slot.as_ref() {
+                Some(p) if p.kind == kind && p.nth == n => slot.take(),
+                _ => None,
+            }
+        };
+        let answer = self.fake.call(request).await;
+        let Some(plan) = plan else {
+            return answer;
+        };
+        assert!(answer.is_ok(), "the fake answered normally first");
+        (plan.act)(&self.fake);
+        if plan.fail {
+            return Err(ApiError::Disconnected {
+                detail: "test".into(),
+            });
+        }
+        answer
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+/// A follower with nothing shown, then a gap: seq 1 is a send still `Sending`, then 257
+/// messages (2..=258), all lost.
+async fn a_gap_with_a_pending_send(fake: &FakeStation, c: &Client<AfterAnswer>) {
+    fake.set_outcome(SendOutcome::Hold);
+    assert_eq!(c.send("bob", "held").await.unwrap().seq, 1);
+    receive_n(fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+}
+
+/// Delivers seq 1 (rev 1) and overflows the subscription again: a second gap.
+fn deliver_and_overflow(fake: &FakeStation) {
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    receive_n(fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+}
+
+#[tokio::test]
+async fn a_stop_as_the_final_check_answers_ends_the_follower() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    // The instance check, then the page, then the final check: it answers, and the station stops
+    // before the answer is returned. The page must not be published.
+    a.after(Kind::Status, 2, false, FakeStation::stop);
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_stop_as_the_final_check_fails_ends_the_follower_without_the_error() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    // The end, ready when the call fails, wins over the error.
+    a.after(Kind::Status, 2, true, FakeStation::stop);
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_gap_as_the_final_check_answers_starts_the_reread_again() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    // The page holds seq 1 at rev 0; as the final check answers, seq 1 is delivered (rev 1) and a
+    // second gap hides its event.
+    let statuses = a.statuses.load(Ordering::SeqCst);
+    a.after(Kind::Status, 2, false, deliver_and_overflow);
+    let first = within(f.next()).await.unwrap().unwrap();
+    assert_eq!(first, LogUpdate::Added(fake.messages()[0].clone()));
+    assert_eq!((first.message().seq, first.message().rev), (1, 1));
+    // The re-read started again: two more checks.
+    assert_eq!(a.statuses.load(Ordering::SeqCst), statuses + 4);
+    assert_eq!(
+        ready(&mut f),
+        added(2..=1 + 2 * (SUBSCRIPTION_CAPACITY as u64 + 1))
+    );
+}
+
+#[tokio::test]
+async fn a_stop_as_a_page_answers_ends_the_follower() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    a.after(Kind::Log, 1, false, FakeStation::stop);
+    // The end wins at once, before the stopped station's final check could fail.
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_gap_as_a_page_answers_starts_the_reread_again() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    let statuses = a.statuses.load(Ordering::SeqCst);
+    a.after(Kind::Log, 1, false, deliver_and_overflow);
+    let first = within(f.next()).await.unwrap().unwrap();
+    assert_eq!((first.message().seq, first.message().rev), (1, 1));
+    // The stale page was dropped at once: one check before it, then the restarted re-read's two.
+    assert_eq!(a.statuses.load(Ordering::SeqCst), statuses + 3);
+    assert_eq!(
+        ready(&mut f),
+        added(2..=1 + 2 * (SUBSCRIPTION_CAPACITY as u64 + 1))
+    );
+}

@@ -236,15 +236,21 @@ impl<T: Transport> LogFollower<'_, T> {
     ///   dropped and the re-read starts again, which covers them.
     /// - Peer and status events, and messages out of scope, are skipped, and the call goes on.
     ///
-    /// Nothing the re-read read and nothing held back is yielded before its last check has passed.
-    /// Then it yields, oldest first, every recovered message that is new or changed, and after
-    /// them the held-back messages in arrival order, again only those new or changed. A `Resync`
-    /// or an end that is ready when the last call completes still wins, since the subscription is
-    /// polled first. If either check finds another instance of the station (rule 1), the follower
-    /// ends and applies nothing. An error of a re-read's call is returned once; the re-read keeps
-    /// what it has read and held back, and the next call races the subscription again and goes on
-    /// with the re-read. Updates queued before a gap was noticed are older than it, and are
-    /// yielded before the re-read goes on.
+    /// When a call completes, the subscription is read once more in the same poll, before the
+    /// call's answer or error is used: an end or a gap that is ready at that moment wins, also when
+    /// the call's own completion made it ready (the station stopped, or overflowed the
+    /// subscription, just before it answered). The answer or error is then dropped: an end returns
+    /// `Ok(None)` and a gap starts the re-read again, never the error. Messages ready at that
+    /// moment are held back as above.
+    ///
+    /// Nothing the re-read read and nothing held back is yielded before its last check has passed
+    /// and the subscription had no end and no gap ready when that check completed. Then it yields,
+    /// oldest first, every recovered message that is new or changed, and after them the held-back
+    /// messages in arrival order, again only those new or changed. If either check finds another
+    /// instance of the station (rule 1), the follower ends and applies nothing. An error of a
+    /// re-read's call is returned once; the re-read keeps what it has read and held back, and the
+    /// next call races the subscription again and goes on with the re-read. Updates queued before
+    /// a gap was noticed are older than it, and are yielded before the re-read goes on.
     ///
     /// Cancel-safe: updates not yet yielded stay queued in the follower, a message taken from the
     /// subscription is held back or queued in the same poll, and a re-read keeps the pages it has
@@ -401,7 +407,7 @@ impl Scope<'_> {
 
 /// How a call of a re-read that raced the subscription ended.
 enum Raced<O> {
-    /// The call completed first.
+    /// The call completed, and the subscription had no end and no gap ready.
     Done(O),
     /// The subscription ended.
     Ended,
@@ -415,11 +421,33 @@ enum Won<O> {
     Call(O),
 }
 
+/// Why a race stops before the call's output is used.
+enum Stop {
+    Ended,
+    Gap,
+}
+
+impl<O> From<Stop> for Raced<O> {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Ended => Self::Ended,
+            Stop::Gap => Self::Gap,
+        }
+    }
+}
+
 /// Runs `call` while reading `events`, polling the subscription first every time. Live messages
 /// in `scope` are pushed to `held` in the poll that takes them, and the one `call` goes on. Returns
-/// when the call completes, the subscription ends, a `Resync` arrives, or a message arrives while
-/// `held` is full. Cancel-safe: a dropped race has taken from the subscription only what is in
-/// `held`.
+/// when the subscription ends, a `Resync` arrives, or a message arrives while `held` is full; or
+/// else when the call completes.
+///
+/// When the call completes, its output (an answer or an error) is kept, the completed call is not
+/// polled again, and in the same poll the race takes everything the subscription has ready at that
+/// moment, the same way: an end or a gap found there wins and the output is dropped, also when the
+/// call's own completion made it ready. Only when the subscription has nothing more ready does the
+/// race return [`Raced::Done`].
+///
+/// Cancel-safe: a dropped race has taken from the subscription only what is in `held`.
 async fn race<F: Future>(
     events: &mut Subscription,
     held: &mut VecDeque<Message>,
@@ -427,7 +455,7 @@ async fn race<F: Future>(
     call: F,
 ) -> Raced<F::Output> {
     let mut call = pin!(call);
-    loop {
+    let output = loop {
         let won = {
             // Kept across polls until it resolves, so its wake-up is never lost; dropped only when
             // it or the call is ready, or when the race is dropped (it is cancel-safe).
@@ -441,20 +469,48 @@ async fn race<F: Future>(
             .await
         };
         match won {
-            Won::Call(output) => return Raced::Done(output),
-            Won::Event(None) => return Raced::Ended,
-            Won::Event(Some(Event::Resync)) => return Raced::Gap,
-            Won::Event(Some(Event::Message { message })) => {
-                if scope.contains(&message) {
-                    if held.len() >= FOLLOW_MEMORY {
-                        return Raced::Gap;
-                    }
-                    held.push_back(message);
+            Won::Call(output) => break output,
+            Won::Event(event) => {
+                if let Err(stop) = take(event, held, scope) {
+                    return stop.into();
                 }
             }
-            Won::Event(Some(
-                Event::Peer { .. } | Event::PeerRemoved { .. } | Event::Status { .. },
-            )) => {}
         }
+    };
+    // The call completed in this poll, and its last poll may have made an end or a gap ready
+    // (the station stopped or overflowed the subscription before it answered). Take what is ready
+    // now, still in this poll; the completed call is never polled again.
+    loop {
+        let ready = {
+            let mut event = pin!(events.next());
+            poll_fn(|cx| Poll::Ready(event.as_mut().poll(cx))).await
+        };
+        match ready {
+            Poll::Pending => return Raced::Done(output),
+            Poll::Ready(event) => {
+                if let Err(stop) = take(event, held, scope) {
+                    return stop.into();
+                }
+            }
+        }
+    }
+}
+
+/// Takes one event of the subscription during a race: an end or a `Resync` stops the race, a
+/// message in `scope` is held back (a gap if `held` is full), and anything else is skipped.
+fn take(event: Option<Event>, held: &mut VecDeque<Message>, scope: Scope<'_>) -> Result<(), Stop> {
+    match event {
+        None => Err(Stop::Ended),
+        Some(Event::Resync) => Err(Stop::Gap),
+        Some(Event::Message { message }) => {
+            if scope.contains(&message) {
+                if held.len() >= FOLLOW_MEMORY {
+                    return Err(Stop::Gap);
+                }
+                held.push_back(message);
+            }
+            Ok(())
+        }
+        Some(Event::Peer { .. } | Event::PeerRemoved { .. } | Event::Status { .. }) => Ok(()),
     }
 }

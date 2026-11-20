@@ -29,20 +29,22 @@
 //! # A client that goes away
 //!
 //! After the `Open` frame the client sends nothing more. From then on the server watches the read
-//! half: the end of the client's stream, a read error or a stray byte all mean that the client has
-//! left, also while the station is still working on the call or on opening the subscription. The
-//! server then drops the pending `call` or `subscribe` future of the [`Transport`], closes the
-//! connection and frees its slot. It puts no deadline on the station: a client that stays waits as
-//! long as the station takes.
+//! half at every await until the connection ends: while the station works on the call or on
+//! opening the subscription, while the reply (also `Reply::Subscribed`) is written, while an open
+//! subscription waits for its next event, and while an event is written. The end of the client's
+//! stream, a read error or a stray byte all mean that the client has left. The server then drops
+//! what it was waiting for (the pending `call` or `subscribe` future of the [`Transport`], or a
+//! frame written halfway), closes the connection and frees its slot. This adds no deadline: a
+//! client that stays waits as long as the station takes, and a subscriber that keeps its stream
+//! open but does not read stalls only its own write and gets `Resync`.
 //!
 //! Dropping the future means only that the server stops waiting for the answer. Whether the request
 //! was carried out is the transport's business: a station finishes a change it has already
 //! accepted, whether or not anyone still waits for its answer. The client never saw an answer and
 //! must treat the call as one that may have been carried out (rule 12 in [`chief::api`]). A
-//! subscription that was being opened
-//! leaves no registration behind: its [`Subscription`] is dropped with the future, or, if the
-//! station had already registered it, when writing `Reply::Subscribed` fails or as soon as the
-//! forwarding of its events sees the client gone.
+//! subscription that was being opened leaves no registration behind: its [`Subscription`] is
+//! dropped with the future, or, if the station had already registered it, together with the
+//! connection.
 //!
 //! A client must therefore keep its write half open until it has read its answer (on a
 //! subscription, as long as it wants events). One that shuts its write half down after `Open` is
@@ -71,7 +73,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::unix::{ReadHalf, WriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -556,12 +559,13 @@ async fn run<T: Transport>(
 /// failure ends this connection only. Every frame of a call, in either direction, must pass within
 /// the frame timeout; the events of a subscription have no deadline.
 ///
-/// While the station works on the call or on opening the subscription, the client may leave
-/// ("A client that goes away" in the module docs): [`until_gone`] then drops the pending future,
-/// and this returns, which closes the connection and frees its slot. There is no deadline on the
-/// station itself. The window after `subscribe` returned is covered as well: if the client left,
-/// writing `Reply::Subscribed` fails or [`forward`] sees it at once, and the subscription is
-/// dropped either way. Before `Open` the frame timeout and the end of the stream bound every read
+/// After `Open` every await goes through [`until_gone`] (or, in [`forward`], an equivalent
+/// `select!`): the station's `call` or `subscribe`, the write of the reply or of
+/// `Reply::Subscribed`, and then every event. If the client leaves ("A client that goes away" in
+/// the module docs), what was pending is dropped and this returns, which closes the connection,
+/// drops a subscription that was already registered, and frees the slot. There is no deadline on
+/// the station itself. Before `Open` the read half is not watched (a client may send `Open` before
+/// it has read the hello reply); there the frame timeout and the end of the stream bound every read
 /// and write.
 async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
     match stream.peer_cred() {
@@ -587,62 +591,64 @@ async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
     }
     let open: Result<Open, FrameError> =
         read_frame(&mut stream, LOCAL_FRAME_MAX, Some(timeout)).await;
-    match open {
+    // From here on the client sends nothing, and every await also watches the read half.
+    let (mut reader, mut writer) = stream.split();
+    let reply = match open {
         Ok(Open::Call { request }) => {
-            let Some(answer) = until_gone(&mut stream, shared.transport.call(request)).await else {
-                return;
-            };
-            let reply = match answer {
-                Ok(response) => Reply::Ok { response },
-                Err(error) => Reply::Err { error },
-            };
-            let _ = write_reply(&mut stream, &reply, timeout).await;
+            match until_gone(&mut reader, shared.transport.call(request)).await {
+                None => return,
+                Some(Ok(response)) => Reply::Ok { response },
+                Some(Err(error)) => Reply::Err { error },
+            }
         }
-        Ok(Open::Subscribe) => match until_gone(&mut stream, shared.transport.subscribe()).await {
-            None => {}
+        Ok(Open::Subscribe) => match until_gone(&mut reader, shared.transport.subscribe()).await {
+            None => return,
             Some(Ok(events)) => {
-                if write_reply(&mut stream, &Reply::Subscribed, timeout)
-                    .await
-                    .is_ok()
-                {
-                    forward(stream, events).await;
+                let subscribed = write_reply(&mut writer, &Reply::Subscribed, timeout);
+                if let Some(Ok(())) = until_gone(&mut reader, subscribed).await {
+                    forward(&mut reader, &mut writer, events).await;
                 }
+                return;
             }
-            Some(Err(error)) => {
-                let _ = write_reply(&mut stream, &Reply::Err { error }, timeout).await;
-            }
+            Some(Err(error)) => Reply::Err { error },
         },
-        Err(FrameError::Json(e)) => {
-            let error = ApiError::BadRequest {
+        Err(FrameError::Json(e)) => Reply::Err {
+            error: ApiError::BadRequest {
                 detail: json_error_detail(&e),
-            };
-            let _ = write_reply(&mut stream, &Reply::Err { error }, timeout).await;
-        }
-        Err(_) => {}
-    }
+            },
+        },
+        Err(_) => return,
+    };
+    let _ = until_gone(&mut reader, write_reply(&mut writer, &reply, timeout)).await;
 }
 
-/// Runs `work` (the station's `call` or `subscribe`) until it finishes or the client leaves, and
-/// gives `None` if the client left; `work` is then dropped unfinished.
+/// Runs `work` until it finishes or the client leaves, and gives `None` if the client left; `work`
+/// is then dropped unfinished. `work` is anything the server awaits after `Open`: the station's
+/// `call` or `subscribe`, the write of a reply, or the write of an event.
 ///
-/// The client sends nothing after `Open`, so the read half is watched as [`forward`] watches it:
-/// the end of the stream, a read error and a stray byte (a protocol violation) all mean that the
-/// client is gone. A client that shut down only its write half counts as gone too. If both happen
-/// at once, the answer wins, so a call the station has answered is still written. `read` into a
-/// buffer is cancel-safe, and no frame is ever read here.
-async fn until_gone<F: Future>(stream: &mut UnixStream, work: F) -> Option<F::Output> {
+/// The client sends nothing after `Open`, so its read half is only watched: the end of the stream,
+/// a read error and a stray byte (a protocol violation) all mean that the client is gone. A client
+/// that shut down only its write half counts as gone too. If both are ready at once, `work` wins,
+/// so an answer the station has given, or a write that can finish at once, is not thrown away.
+/// `read` into a buffer is cancel-safe, and no frame is ever read here. A write dropped halfway
+/// leaves a broken frame behind, which does not matter: the caller then drops the connection.
+async fn until_gone<R, F>(reader: &mut R, work: F) -> Option<F::Output>
+where
+    R: AsyncRead + Unpin,
+    F: Future,
+{
     let mut probe = [0u8; 1];
     tokio::select! {
         biased;
         output = work => Some(output),
-        _ = stream.read(&mut probe) => None,
+        _ = reader.read(&mut probe) => None,
     }
 }
 
 /// Writes `value` as one frame within `timeout`. After a timeout the stream is unusable; the caller
 /// closes it.
-async fn write_within<V: serde::Serialize>(
-    stream: &mut UnixStream,
+async fn write_within<W: AsyncWrite + Unpin, V: serde::Serialize>(
+    stream: &mut W,
     value: &V,
     timeout: Duration,
 ) -> Result<(), FrameError> {
@@ -654,8 +660,8 @@ async fn write_within<V: serde::Serialize>(
 /// Writes `reply` within `timeout`. A reply too large for a frame (a response the station should
 /// never make) becomes [`ApiError::Internal`], so the client learns why instead of seeing the
 /// connection close.
-async fn write_reply(
-    stream: &mut UnixStream,
+async fn write_reply<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     reply: &Reply,
     timeout: Duration,
 ) -> Result<(), FrameError> {
@@ -672,12 +678,19 @@ async fn write_reply(
 
 /// Sends every event of `events` as a frame until the subscription ends or the client goes away.
 ///
-/// The client sends nothing after `Open::Subscribe`, so the read half is only watched for the end
-/// of the stream (or an error, or a stray byte, which is a protocol violation): all three close
-/// the connection. `Subscription::next` and `read` into a buffer are both cancel-safe, so they can
-/// share a `select!` that is re-created on every turn; no frame is ever read here.
-async fn forward(mut stream: UnixStream, mut events: Subscription) {
-    let (mut reader, mut writer) = stream.split();
+/// The client sends nothing after `Open::Subscribe`, so its read half is only watched, for the end
+/// of the stream, a read error or a stray byte (a protocol violation): each of them means that the
+/// client is gone and ends the connection. The read half is watched at both awaits: while waiting
+/// for the next event, and while an event frame is being written, so that a subscriber that stopped
+/// reading and then shut down its write half (or closed, or sent a byte) is noticed although the
+/// write is stuck on a full socket buffer. The frame written halfway then does not matter: the
+/// connection is dropped with it.
+///
+/// No deadline applies: a subscriber that keeps its stream open and does not read stalls only this
+/// write, and gets `Resync` once its queue overflowed. `Subscription::next` and `read` into a
+/// buffer are both cancel-safe, so they share a `select!` that is re-created on every turn; it is
+/// not biased, so a stream of events cannot keep the read half from being looked at.
+async fn forward(reader: &mut ReadHalf<'_>, writer: &mut WriteHalf<'_>, mut events: Subscription) {
     let mut probe = [0u8; 1];
     loop {
         let event = tokio::select! {
@@ -685,10 +698,8 @@ async fn forward(mut stream: UnixStream, mut events: Subscription) {
             _ = reader.read(&mut probe) => return,
         };
         let Some(event) = event else { return };
-        if write_frame(&mut writer, &event, LOCAL_FRAME_MAX)
-            .await
-            .is_err()
-        {
+        let written = until_gone(reader, write_frame(writer, &event, LOCAL_FRAME_MAX)).await;
+        if !matches!(written, Some(Ok(()))) {
             return;
         }
     }
