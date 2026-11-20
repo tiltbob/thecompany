@@ -150,6 +150,9 @@ The owner has authorised merging without them, on these terms:
 - A sub-agent gets a written brief: the issue, the files it owns, the hard rules that apply and the
   commands that must pass. The top-level agent reads the result before it is pushed and stays
   responsible for it.
+- Fit the reasoning effort to the task, on both levels: low for mechanical work and housekeeping,
+  medium for routine implementation and tests, high for tricky logic, security-sensitive code and
+  reviews. Do not default to the maximum.
 
 ### Keeping going
 
