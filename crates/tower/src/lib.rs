@@ -185,7 +185,10 @@ impl fmt::Debug for Listed {
 }
 
 /// An error starting or stopping a tower.
+///
+/// The enum is `#[non_exhaustive]`: later versions add variants.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TowerError {
     /// A dev tower's bind address is not a loopback address.
     #[error("the dev tower requires a loopback bind address, got {0}")]
@@ -202,6 +205,7 @@ pub enum TowerError {
     /// contain the tower's host name. It carries no content of the file and no upstream error,
     /// and the variant has no source.
     #[error("cannot use the tower's certificate file: {problem}")]
+    #[non_exhaustive]
     CertificateFile {
         /// What is wrong with the file.
         problem: TlsFileProblem,
@@ -214,6 +218,7 @@ pub enum TowerError {
     /// contain the tower's host name. It carries no byte of the key and no upstream error, and
     /// the variant has no source.
     #[error("cannot use the tower's private key file: {problem}")]
+    #[non_exhaustive]
     KeyFile {
         /// What is wrong with the file.
         problem: TlsFileProblem,
@@ -252,6 +257,13 @@ pub enum TowerError {
     #[error("the tower's client burst must be at least one byte")]
     InvalidClientBurst,
     /// The relay server failed to start, for example because an address is in use.
+    ///
+    /// The message passes on iroh-relay's text, which can name the socket address it could not
+    /// bind; for a tower reached by an IP literal that can be the tower's own address. It never
+    /// names the host name. When this error comes back because a port was taken, a listener the
+    /// relay had already bound can stay bound until the runtime runs again: a caller that
+    /// retries at once on the same ports can see "address in use". `Tower::spawn` yields once
+    /// before returning the error, which is usually enough; there is no stronger promise.
     #[error("failed to start the tower: {0}")]
     Start(#[source] Box<dyn Error + Send + Sync>),
     /// The relay server started without the listener the tower needs.
@@ -354,7 +366,13 @@ impl Tower {
     ///
     /// Fails before binding anything if a dev tower's bind address is not loopback, an allowlist
     /// entry is not a valid endpoint id, the rate or burst is out of range, or a TLS tower's host
-    /// name, certificate file or key file is unusable.
+    /// name, reload interval, certificate file or key file is unusable. The files are read on
+    /// tokio's blocking pool; a regular file on a mount that stops answering blocks that read,
+    /// and then this call does not return.
+    ///
+    /// If iroh-relay fails to bind a port (it is taken, for example), a listener it had already
+    /// bound is released only when the runtime next runs its aborted tasks. This call yields once
+    /// before returning that error, as a best effort; see [`TowerError::Start`].
     pub async fn spawn(config: TowerConfig) -> Result<Self, TowerError> {
         if config.tls.is_none() && !config.bind.ip().is_loopback() {
             return Err(TowerError::NonLoopbackBind(config.bind));
@@ -364,7 +382,7 @@ impl Tower {
         let tls = match &config.tls {
             Some(tls) => {
                 tls::tower_url(&tls.hostname, tls.https_bind.port())?;
-                Some((tls, tls::cert_config(tls)?))
+                Some((tls, tls::cert_config(tls).await?))
             }
             None => None,
         };
@@ -387,9 +405,14 @@ impl Tower {
         }
         server_config.relay = Some(relay);
 
-        let server = Server::spawn(server_config)
-            .await
-            .map_err(|error| TowerError::Start(Box::new(error)))?;
+        let server = match Server::spawn(server_config).await {
+            Ok(server) => server,
+            Err(error) => {
+                // Lets the runtime run the aborted tasks that still hold a listener.
+                tokio::task::yield_now().await;
+                return Err(TowerError::Start(Box::new(error)));
+            }
+        };
         let http_addr = server.http_addr().ok_or(TowerError::MissingHttpAddress)?;
         let url = match &config.tls {
             Some(tls) => {
@@ -475,7 +498,9 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::timeout;
 
-    use super::{MIN_CLIENT_RATE, TlsTower, Tower, TowerConfig, TowerError, TowerStats};
+    use super::{
+        MAX_RELOAD_INTERVAL, MIN_CLIENT_RATE, TlsTower, Tower, TowerConfig, TowerError, TowerStats,
+    };
 
     fn loopback() -> TowerConfig {
         TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into())
@@ -564,7 +589,8 @@ mod tests {
                 let tls = TlsTower::new("127.0.0.1", &cert, &key)
                     .https_bind(loopback)
                     .qad_bind(Some(loopback))
-                    .reload_interval(Duration::from_millis(20));
+                    // Long enough that only the abort can end the task within the bound.
+                    .reload_interval(MAX_RELOAD_INTERVAL);
                 let tower = Tower::spawn(TowerConfig::tls(tls).bind(loopback))
                     .await
                     .unwrap();
