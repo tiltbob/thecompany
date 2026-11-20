@@ -100,6 +100,17 @@ async fn a_tower_change_pushes_the_whole_status() {
     assert_eq!(queued(&mut events), vec![Event::Status { status }]);
 }
 
+#[tokio::test]
+async fn standby_passes_through_the_fake() {
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_tower_state(TowerState::Standby);
+    let status = c.status().await.unwrap();
+    assert_eq!(status.towers[0].state, TowerState::Standby);
+    assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+}
+
 // Peer book (rule 10).
 
 #[tokio::test]

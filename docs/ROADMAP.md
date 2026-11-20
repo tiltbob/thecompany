@@ -256,15 +256,14 @@ chief may take a candidate into the set with an explicit command, `chief tower a
 any tower URL the chief types; that is the chief's own act, so hard rule 8 is not touched. A station
 whose towers are all gone therefore recovers through SRV or through the chief, not through a peer.
 
-**What the station shows.** `home_relay_status()` lists the home tower only, so the API tells an
-observed state apart from a tower that is configured but not observed. The home tower is
-connected, failing or `Denied { reason }`. Every other tower of the set is not observed (working
-name `Standby`), never failing; an empty home status, such as after a TLS failure with a
-certificate the station does not trust, is not observed either. Each tower carries its source
-(`configured`, `remembered`, `srv`, `peer`); `Status` carries the bootstrap domain, and the API
-carries the candidates with the peer's name. `chief status` prints all of it, with control
-characters in peer and tower text replaced with spaces, and whether each peer is relayed or direct,
-as in M1.
+**What the station shows.** `home_relay_status()` lists the home tower only, so the API distinguishes
+an observed state from an unobserved tower in the station's set. The home tower can be connected,
+failing or `Denied { reason }`. Unobserved towers are shown as `Standby`, including when the home
+status is empty, such as after a TLS failure with a certificate the station does not trust. Each
+tower carries its source (`configured`, `remembered`, `srv`, `peer`). `Status` carries the bootstrap
+domain, and the API carries the candidates with the peer's name. `chief status` prints all of it,
+with control characters in peer and tower text replaced with spaces, and whether each peer is
+relayed or direct, as in M1.
 
 **CLI surface**
 

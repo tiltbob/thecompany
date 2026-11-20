@@ -320,6 +320,15 @@ fn fail_reasons() -> [FailReason; 3] {
     ]
 }
 
+fn tower_sources() -> [TowerSource; 4] {
+    [
+        TowerSource::Configured,
+        TowerSource::Remembered,
+        TowerSource::Srv,
+        TowerSource::Peer,
+    ]
+}
+
 // Exhaustive matches: a new variant does not compile until it is numbered here, and the coverage
 // tests then fail until the samples above hold a value of it.
 
@@ -429,6 +438,16 @@ fn fail_reason_variant(value: &FailReason) -> usize {
     }
 }
 
+const TOWER_SOURCE_VARIANTS: usize = 4;
+fn tower_source_variant(value: &TowerSource) -> usize {
+    match value {
+        TowerSource::Configured => 0,
+        TowerSource::Remembered => 1,
+        TowerSource::Srv => 2,
+        TowerSource::Peer => 3,
+    }
+}
+
 // Helpers.
 
 /// Serializes `value`, reads it back, checks it is equal, and returns the JSON text.
@@ -479,6 +498,11 @@ fn every_state_value_round_trips() {
     round_trip_all(&links(), link_variant, LINK_VARIANTS);
     round_trip_all(&directions(), direction_variant, DIRECTION_VARIANTS);
     round_trip_all(&fail_reasons(), fail_reason_variant, FAIL_REASON_VARIANTS);
+    round_trip_all(
+        &tower_sources(),
+        tower_source_variant,
+        TOWER_SOURCE_VARIANTS,
+    );
 }
 
 #[test]
@@ -555,12 +579,16 @@ fn label_enums_are_bare_strings() {
         texts,
         [r#""no_answer""#, r#""refused""#, r#""peer_removed""#]
     );
-    assert_golden(&[
-        (TowerSource::Configured, r#""configured""#),
-        (TowerSource::Remembered, r#""remembered""#),
-        (TowerSource::Srv, r#""srv""#),
-        (TowerSource::Peer, r#""peer""#),
-    ]);
+    let texts: Vec<String> = tower_sources().iter().map(round_trip).collect();
+    assert_eq!(
+        texts,
+        [
+            r#""configured""#,
+            r#""remembered""#,
+            r#""srv""#,
+            r#""peer""#
+        ]
+    );
 }
 
 #[test]

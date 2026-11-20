@@ -321,17 +321,17 @@ pub struct Status {
     /// Opaque, and new on every start of the station; compare for equality only (rule 1). A
     /// transport that reports an instance id when it connects reports this same value.
     pub instance_id: String,
-    /// Every configured tower, in configuration order.
+    /// Every tower in the station's set, in the set's order.
     pub towers: Vec<TowerStatus>,
     /// The DNS domain supplied for SRV bootstrap, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_domain: Option<String>,
 }
 
-/// One configured tower and what the station knows about it.
+/// One tower in the station's set and what the station knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TowerStatus {
-    /// The tower's URL as configured.
+    /// The tower's URL in the station's set.
     pub url: String,
     /// The station's observation of this tower, or [`TowerState::Standby`] when unknown.
     pub state: TowerState,
@@ -350,7 +350,7 @@ pub enum TowerSource {
     Remembered,
     /// From a DNS SRV lookup.
     Srv,
-    /// From another station's advertised tower set.
+    /// From another station's advertised tower set, adopted at the chief's explicit request.
     Peer,
 }
 
@@ -374,7 +374,7 @@ pub enum TowerState {
         /// Why, as display text (rule 9).
         reason: String,
     },
-    /// The configured tower's connection state is unknown. This can happen for a tower other
+    /// The tower's connection state is unknown. This can happen for a tower other
     /// than the home tower or when no home tower state is available.
     Standby,
 }
