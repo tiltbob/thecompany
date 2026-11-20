@@ -2053,9 +2053,12 @@ version = "0.0.0"
 dependencies = [
  "iroh",
  "iroh-relay",
+ "n0-dns-resolver",
  "n0-future",
+ "numbers",
  "numbers-base",
  "numbers-tower",
+ "simple-dns",
  "thiserror 2.0.21",
  "tokio",
  "url",

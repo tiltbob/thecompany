@@ -2,12 +2,19 @@
 //!
 //! Node identity, tower lookup, and authenticated endpoints. The library takes iroh
 //! without default features, as described in `docs/ARCHITECTURE.md`.
+//!
+//! - [`bootstrap`]: finding a domain's towers through DNS SRV.
+//! - `testing` (cargo feature `test-support`): `FakeDns`, a DNS server on 127.0.0.1 for tests.
 
+pub mod bootstrap;
 pub mod endpoint;
 pub mod gate;
 pub mod identity;
+#[cfg(feature = "test-support")]
+pub mod testing;
 pub mod towers;
 
+pub use bootstrap::{DnsLocator, LocateError, Locator};
 pub use endpoint::{
     Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
 };

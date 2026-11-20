@@ -214,12 +214,14 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 12. **The phone (M14).** Whether it embeds a station (planned) or remote-controls the chief's workstation
     station; and push — only the app's publisher can send it, so either each team signs its own app
     or the project runs a push gateway.
-13. **Bootstrap record (M2).** Planned: SRV with one target per tower, as first specified. A multi-A
-    record on one name does not work with more than one tower: iroh tells towers apart by URL and
-    towers do not forward to each other, so two stations that land on different addresses of the
-    same name cannot reach each other; and every tower would need a certificate for the shared name.
-    If SRV proves awkward (an extra resolver dependency, phones), a TXT record listing tower URLs
-    keeps one name per tower and uses the resolver iroh already has.
+13. **Bootstrap record (M2).** Decided by both agents (#38): SRV with one target per tower, as
+    first specified, looked up behind the `Locator` trait of `numbers::bootstrap`, so that another
+    record type stays one more implementation. A multi-A record on one name does not work with more
+    than one tower: iroh tells towers apart by URL and towers do not forward to each other, so two
+    stations that land on different addresses of the same name cannot reach each other; and every
+    tower would need a certificate for the shared name. The resolver is in the build already,
+    through iroh. If SRV proves awkward on phones, a TXT record listing tower URLs keeps one name
+    per tower.
 14. **Handlers (M15).** What a handler is: how a chief asks for a safehouse, whether a handler may
     enroll one under a chief-signed, expiring grant or every admission needs the chief (and the HSM);
     nspawn or QEMU; one safehouse per chief or per job; what the handler host itself must never
