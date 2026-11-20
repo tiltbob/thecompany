@@ -463,7 +463,11 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   endpoint id). `iroh::RelayConfig` (client) is a different type from
   `iroh_relay::server::RelayConfig`. In TLS mode the server also binds a plain-HTTP listener on
   `RelayConfig::http_bind_addr` that cannot be turned off and answers only `/generate_204`; ACME is
-  tls-alpn-01 on the HTTPS port only and needs `cache_path` (source reading); QAD needs TLS;
+  tls-alpn-01 on the HTTPS port only and needs `cache_path` (source reading); building
+  `AcmeConfig::letsencrypt(..)` and `CertConfig::LetsEncrypt` touches neither the network nor the
+  cache, and the ACME client starts inside `Server::spawn`, writing its account key and the
+  certificate with its key into the cache directory with default file permissions (source
+  reading, tokio-rustls-acme 0.10); QAD needs TLS;
   `Server::spawn` cannot add HTTP routes. The allowlist (`AccessControl`, `Access::Deny { reason }`)
   gates `/relay` only: a denied endpoint still used QAD and the `/ping` probe. Removing an id from
   the list does not disconnect it; `relay_service().clients().disconnect(id, None)` does (21–22 ms).
