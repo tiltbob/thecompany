@@ -1154,6 +1154,45 @@ async fn tower_text_is_normalised_in_status_and_its_event() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn large_tower_display_text_fits_status_reply_and_event_frames() {
+    use chief::socket::wire::Reply;
+    use numbers_base::{LOCAL_FRAME_MAX, encode_frame};
+
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    // Each byte in the near-limit input needs two bytes after JSON escaping.
+    let pair = "\"\\";
+    let input = pair.repeat(LOCAL_FRAME_MAX / pair.len() - 1);
+    let prefix = pair.repeat(TOWER_TEXT_MAX_BYTES / pair.len());
+    for state in [
+        TowerState::Failing {
+            error: input.clone(),
+        },
+        TowerState::Denied { reason: input },
+    ] {
+        fake.set_tower_state(state);
+        let status = c.status().await.unwrap();
+        let display = match &status.towers[0].state {
+            TowerState::Failing { error } | TowerState::Denied { reason: error } => error,
+            _ => panic!("expected a tower error or denial"),
+        };
+        assert!(display == &prefix, "expected the bounded, unchanged prefix");
+        let emitted = queued(&mut events);
+        assert!(
+            matches!(emitted.as_slice(), [Event::Status { status: event_status }] if event_status == &status),
+            "expected one event with the same bounded status"
+        );
+        let reply = Reply::Ok {
+            response: Response::Status { status },
+        };
+        assert!(encode_frame(&reply, LOCAL_FRAME_MAX).is_ok());
+        assert!(encode_frame(&emitted[0], LOCAL_FRAME_MAX).is_ok());
+    }
+}
+
 /// Line breaks and reordering that are not control characters, and a C1 control character.
 const WIDER: &str = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{061C}f\u{200E}g\u{9B}h\u{200B}";
 /// `WIDER` as rule 9 leaves it: each replaced by one space; U+200B stays.
