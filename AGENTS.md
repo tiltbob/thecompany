@@ -5,8 +5,10 @@ file through `CLAUDE.md`.
 
 ## What this is
 
-**theCompany** is a p2p network, called `numbers`, for one person, the chief, working with coding
-agents: chat, sockets, files, locks and a persistence layer.
+**theCompany** coordinates coding agents that run on different machines, for one person, the
+chief. Its p2p network is called `numbers`: chat, sockets, files, locks and a persistence layer.
+One instance of the company is one network, and every node on it can reach every other one;
+towers do the routing, forwarding and replication that takes.
 
 | Name | What it is |
 |---|---|

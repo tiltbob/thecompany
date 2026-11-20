@@ -5,9 +5,25 @@ and the open decisions are in [ROADMAP.md](ROADMAP.md).
 
 ## Context
 
+**The goal is to coordinate agents on disparate nodes.** One person, the chief, has coding
+agents running on machines in different places and on different networks, and they have to work
+together: talk to each other and to the chief, share files and repos, take turns on shared
+resources. Everything else here serves that.
+
 **theCompany** is the project; **`numbers`**
-is its p2p network, giving one person and their coding agents **chat, sockets, files, locks** and a
-**persistence layer** for working with coding agents.
+is its p2p network, giving the chief and their agents **chat, sockets, files, locks** and a
+**persistence layer**.
+
+Two rules follow from the goal, both set by the owner:
+
+- **One instance of the company is one network.** One chief, one roster, one set of towers. There
+  is no second network inside an instance and no bridge to another instance.
+- **Every node on the network is accessible to every other.** Any station or safehouse can open a
+  link to any other station or safehouse, wherever each is and whichever tower each uses. Making
+  that true is the towers' job: they **route** (know which tower a node is on), **forward**
+  (carry traffic to it) and **replicate** (hold the roster and airspace everywhere). A node needs
+  to reach one tower and nothing else. Reachable does not mean permitted: what a node may do on
+  another is still decided by the gate, default deny.
 
 The cast:
 
@@ -17,8 +33,8 @@ The cast:
 | **station** | One of the chief's nodes, one per device: a laptop, a desktop, a phone. A daemon; the `chief` CLI, the Linux GUI and the iOS app are frontends to a station. |
 | **safehouse** | A node that runs agents in arbitrary harnesses (Claude Code and Codex first). At first the chief sets one up by hand. |
 | **handler** | Later: the node that sets safehouses up, creating each in an isolated environment (an nspawn container, maybe a full QEMU VM). To be fleshed out. |
-| **tower** | An untrusted node: relays traffic, lets nodes find each other, and is the final store for encrypted blocks. Towers are linked: they forward traffic to each other and replicate what they keep, so members on different towers work together. A DNS SRV record leads a newcomer to its first tower. Never a member. |
-| **agent** | A harness process on a safehouse. Agents run nowhere else. |
+| **tower** | An untrusted node: relays traffic, lets nodes find each other, and is the final store for encrypted blocks. Towers are linked and are what makes every node reachable from every other: they route and forward traffic between each other and replicate what they keep. A DNS SRV record leads a newcomer to its first tower. Never a member. |
+| **agent** | A harness process on a safehouse. Agents run nowhere else. Coordinating agents on different safehouses is what the network is for. |
 | **airspace** | The persistence layer: text objects, git repos, occasional multi-gigabyte media. Every node takes part. |
 
 Decided: **Rust**; **iroh** as transport (1.0 since June 2026, now 1.5.0: stable API and wire
@@ -193,9 +209,14 @@ again. So a station watches its home tower (below).
   candidate addresses and make it send a few UDP probes. It cannot read, alter or impersonate member
   traffic or stored data, and can never become a member. DNSSEC or pinning would protect availability
   and metadata only.
-- **Towers are linked.** Required by the owner; planned for M3 and M4, not built in M2. Members
-  that use different towers must be able to work together, so the towers of a network forward to
-  each other and replicate what they keep. How it is built is **decision 20**.
+- **Towers are linked, and reachability is their job.** Required by the owner; planned for M3
+  and M4, not built in M2. Every node must be accessible to every other, whichever towers they
+  use, so the towers of a network route and forward between each other and replicate what they
+  keep. How it is built is **decision 20**.
+  - *Routing.* The towers together know, for every connected node id, which tower holds its
+    connection, and keep that current as nodes come, go and move. A node asks nothing and is
+    told nothing about where a peer is: it hands traffic for a node id to its own tower. A node
+    that no tower holds is reported as unreachable at once, not by a timeout.
   - *Links.* Every tower in the roster's signed tower set keeps an authenticated link to every
     other one, from its own endpoint and node key (below). The set is small, so this is a full
     mesh. A tower links only to towers the roster names, never to one a peer or another tower
@@ -209,7 +230,7 @@ again. So a station watches its home tower (below).
   - *Replication.* Everything a tower keeps reaches every other tower: the roster (M3), then
     blocks, names, leases and quota counts (M4). A member talks to one tower; "stored on two
     towers" is reached by the towers among themselves.
-  - *For a node* this means one reachable tower is enough. Two members need no tower in common,
+  - *For a node* this means one reachable tower is enough. Two nodes need no tower in common,
     a member behind a network that reaches only one tower is not cut off, and a node never has
     to connect to a tower because a peer named it (hard rule 8, #73). A direct path is still
     taken whenever one exists.
@@ -249,9 +270,9 @@ this protocol:
 | station → safehouse | everything the chief may do there: terminals, sessions, files, secrets for a start; configuration only as admin-signed statements |
 | station → station | chat, roster sync, airspace blocks and names |
 | safehouse → station | chat, roster sync, airspace blocks and names, answers on streams the station opened, file offers into quarantine |
-| safehouse → safehouse | airspace blocks and names; anything else only under an admin-signed grant naming both |
+| safehouse → safehouse | airspace blocks and names, and what agents coordinate with through the MCP bridge: chat, locks, file transfers between workspaces of the same project; anything else only under an admin-signed grant naming both |
 | member → tower | relay; on the tower's own endpoint: roster feed, block storage, leases |
-| tower → tower | pulls blocks it should hold from towers in the signed set |
+| tower → tower | with towers in the signed set only: routing (which node ids each holds), forwarding relayed traffic, replication of the roster, blocks, names and leases |
 
 `numbers/join/0` (M3) is the only surface open to non-members: pairing-ticket redemption and bounded delivery
 of roster proofs. Control messages are length-prefixed JSON frames (size-capped, read deadlines,
@@ -462,7 +483,8 @@ structurally:
   environment variable, is what separates one project's secrets and files from another project's
   agents, and all of them from the safehouse's key (**decision 3**).
 - Agents never hold node keys or airspace keys. They reach chat, files, locks and airspace only through
-  an MCP bridge the safehouse injects per session, attributed as (safehouse, session, project) and
+  an MCP bridge the safehouse injects per session — on the same safehouse or, through the link
+  between safehouses, on another — attributed as (safehouse, session, project) and
   granted no more than the session's project has. What an agent sends is the safehouse's
   assertion and peer input to a station (hard rule 8), never the chief's word.
 - **A station and a safehouse on one machine** is never suggested and always warned against, but not
