@@ -2,11 +2,14 @@
 
 > These snippets were read from the published sources of **iroh 1.5.0**, **iroh-relay 1.5.0** and
 > **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked by a second reviewer.
-> The code fences of sections 2 to 10 compile as written against iroh 1.5.0 and iroh-relay 1.5.0:
-> a generator copies them byte for byte into a lab crate built with `--features verbatim`. The
-> measured numbers come from that lab's loopback tests (127.0.0.1, also inside a network namespace
-> with only loopback), which exercise equivalent code, not these exact fences. Section 1's feature
-> claims and section 11 are still source reading only. The summary is the appendix of
+> The code fences of sections 2 to 10 compile against iroh 1.5.0 and iroh-relay 1.5.0: a generator
+> copies every line of them into a lab crate that builds with `--features verbatim`. It changes
+> nothing but indentation: it moves `use` lines to module level and wraps the rest in functions and
+> scaffolding that supply what a fence leaves out (free variables, our own types, and in section 7
+> the imports). The measured numbers come from that lab's loopback tests (127.0.0.1, also inside a
+> network namespace with only loopback), which exercise equivalent code, not these exact fences.
+> Section 1's feature claims and section 11 are still source reading only. The summary is the
+> appendix of
 > [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
 
 ## 1. Cargo dependencies and features
