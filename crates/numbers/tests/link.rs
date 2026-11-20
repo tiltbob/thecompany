@@ -1252,13 +1252,21 @@ async fn chat_retry_waits_for_a_later_replacement_close() {
             while_sending(send.as_mut(), sleep(Duration::from_millis(300))).await;
             first.close(409u32.into(), b"");
 
-            let (reply, second) = tokio::join!(send, async {
-                let (second, mut hello) = accept_hello(&peer).await;
-                hello.reply(RAW_GENERATION, [2; 16]).await;
-                hello.confirm([2; 16]).await;
-                reply_to_chat(&second, &chat).await;
-                second
-            });
+            // The close must end the sender's close wait. Without this bound, a wait that
+            // ignored the close would still retry when its 2 s budget runs out.
+            let (reply, second) = checked(
+                timeout(Duration::from_secs(1), async {
+                    tokio::join!(send, async {
+                        let (second, mut hello) = accept_hello(&peer).await;
+                        hello.reply(RAW_GENERATION, [2; 16]).await;
+                        hello.confirm([2; 16]).await;
+                        reply_to_chat(&second, &chat).await;
+                        second
+                    })
+                })
+                .await,
+                "the retry did not follow the replacement close",
+            );
             assert_eq!(reply, Ok(ChatReply::Ack));
             assert!(second.close_reason().is_none());
             checked(
