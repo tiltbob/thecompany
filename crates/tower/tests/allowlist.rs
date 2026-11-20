@@ -277,10 +277,13 @@ async fn a_low_rate_slows_a_relayed_transfer_and_is_counted() {
         let elapsed = started.elapsed();
 
         assert_eq!(received, SIZE);
-        // The tower reads the sender's upload through a token bucket that starts with one burst
-        // (a tenth of the rate) and refills at the rate, so the payload alone takes this long.
-        let floor =
-            Duration::from_secs_f64((SIZE as f64 - f64::from(RATE) / 10.0) / f64::from(RATE));
+        // The tower reads the sender's upload through a token bucket that refills at the rate. It
+        // takes each read whole and makes the client wait for that read's debt before the next
+        // one, so the last read is never waited for, and the exact time depends on how the bytes
+        // fall into reads. At the rate the payload takes six seconds; a quarter of that holds
+        // however the reads fall, and is far above an unlimited transfer (about a tenth of a
+        // second on loopback).
+        let floor = Duration::from_secs_f64(SIZE as f64 / f64::from(RATE) / 4.0);
         assert!(elapsed >= floor, "{elapsed:?} < {floor:?}");
         assert!(tower.stats().rate_limited >= 1, "{:?}", tower.stats());
         // Slowed down, not dropped: both stay connected to the tower.

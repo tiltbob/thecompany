@@ -61,10 +61,13 @@ pub struct TowerConfig {
     /// The tower reads more slowly from a client that sends faster; it does not drop or
     /// disconnect it. [`Tower::spawn`] refuses a value below [`MIN_CLIENT_RATE`].
     pub client_rate: u32,
-    /// The most a client may send at once before the rate applies, in bytes.
+    /// The size of each client's token bucket, in bytes: what a client that has been quiet may
+    /// send before the rate applies.
     ///
-    /// `None` uses iroh-relay's default, a tenth of [`Self::client_rate`]. [`Tower::spawn`]
-    /// refuses zero.
+    /// It is a budget, not a cap on one read. The tower takes each read whole, whatever its size,
+    /// and then makes the client wait before the next read until the bucket has refilled at
+    /// [`Self::client_rate`]. `None` uses iroh-relay's default, a tenth of [`Self::client_rate`].
+    /// [`Tower::spawn`] refuses zero.
     pub client_burst: Option<u32>,
 }
 
@@ -108,7 +111,7 @@ impl TowerConfig {
         self
     }
 
-    /// Sets the most a client may send at once before the rate applies, in bytes.
+    /// Sets the size of each client's token bucket, in bytes; see [`Self::client_burst`].
     pub fn client_burst(mut self, bytes: u32) -> Self {
         self.client_burst = Some(bytes);
         self
