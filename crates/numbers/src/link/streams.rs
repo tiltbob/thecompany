@@ -15,8 +15,8 @@ use crate::{CLOSE_NOT_ALLOWED, Protocol};
 
 use super::{CLOSE_LINK, IncomingChat, Peer, SendError, Shared, lock};
 
-pub(super) fn close_code(connection: &Connection) -> Option<u32> {
-    match connection.close_reason()? {
+pub(super) fn close_code(reason: &ConnectionError) -> Option<u32> {
+    match reason {
         ConnectionError::ApplicationClosed(close) => {
             u32::try_from(close.error_code.into_inner()).ok()
         }
@@ -92,15 +92,10 @@ fn hello_read_failure(error: FrameError) -> SendError {
     }
 }
 
-pub(super) async fn send_chat(
-    connection: &Connection,
+pub(super) async fn write_chat_request(
+    mut send: SendStream,
     message: &ChatMessage,
-    budget: Duration,
-) -> Result<ChatReply, SendError> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|_| SendError::Disconnected)?;
+) -> Result<(), SendError> {
     write_frame(&mut send, &StreamHeader::chat(), WIRE_FRAME_MAX)
         .await
         .map_err(write_failure)?;
@@ -109,7 +104,14 @@ pub(super) async fn send_chat(
         .map_err(write_failure)?;
     // The peer can stop reading after the message. Read the reply even if that races FIN.
     let _ = send.finish();
-    read_frame(&mut recv, WIRE_FRAME_MAX, Some(budget))
+    Ok(())
+}
+
+pub(super) async fn read_chat_reply(
+    recv: &mut RecvStream,
+    budget: Duration,
+) -> Result<ChatReply, SendError> {
+    read_frame(recv, WIRE_FRAME_MAX, Some(budget))
         .await
         .map_err(read_failure)
 }

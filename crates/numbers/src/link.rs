@@ -4,10 +4,12 @@ mod streams;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, Side};
+use iroh::endpoint::{Connection, ConnectionError, Side};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -18,7 +20,9 @@ use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
 use crate::proto::{CHAT_PROTOCOL, Hello};
 use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
 
-use self::streams::{close_code, exchange_hello, receive_chat, send_chat};
+use self::streams::{
+    close_code, exchange_hello, read_chat_reply, receive_chat, write_chat_request,
+};
 
 /// The ALPN of the numbers link.
 pub const LINK_ALPN: &[u8] = b"numbers/0";
@@ -34,7 +38,7 @@ const MAILBOX_CAPACITY: usize = 32;
 pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
     pub connect_timeout: Duration,
-    /// Budget for one send, including any dial and retry.
+    /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
 }
 
@@ -93,8 +97,8 @@ pub enum SendError {
     /// The outgoing message failed validation.
     #[error("invalid chat message")]
     InvalidMessage(NackReason),
-    /// The dial, hello, or full send timed out.
-    #[error("chat deadline expired")]
+    /// A deadline expired or a retry could not confirm the result of an earlier attempt.
+    #[error("no definitive chat reply")]
     Timeout,
     /// Authorization was refused.
     #[error("the station is not authorized for chat")]
@@ -225,37 +229,64 @@ impl LinkHandle {
         message: &ChatMessage,
     ) -> Result<ChatReply, SendError> {
         let start = Instant::now();
-        let connection = self.connection(peer).await?;
-        let remaining = self
-            .shared
-            .config
-            .send_deadline
-            .saturating_sub(start.elapsed());
-        let progress = self.shared.config.connect_timeout.min(remaining / 2);
-        let mut result = timeout(progress, send_chat(&connection, message, progress))
-            .await
-            .unwrap_or(Err(SendError::Timeout));
-        // A stalled or interrupted stream may already have delivered the message. Retry
-        // the same ID once, within the original deadline, to keep receipt de-duplication intact.
-        if result == Err(SendError::Timeout) {
+        let mut first_attempt = true;
+        let mut stale_retry_available = true;
+        let mut replacement_retry_available = true;
+        loop {
+            let lease = self.connection(peer).await?;
+            let connection = &lease.transport;
+            let result = send_chat(
+                peer,
+                connection,
+                message,
+                self.shared.config,
+                start,
+                first_attempt && lease.admitted_at < start,
+            )
+            .await;
+            let error = match result {
+                // The earlier attempt may still be committed after the retry was refused.
+                Ok(ChatReply::Nack(NackReason::Unavailable)) if !first_attempt => {
+                    return Err(SendError::Timeout);
+                }
+                Ok(reply) => return Ok(reply),
+                Err(error) => error,
+            };
             let state = peer.state();
-            if state.is_current(&connection) {
-                connection.close(CLOSE_LINK.into(), b"");
+            if state.revoked {
+                return Err(SendError::Closed);
             }
+            if error != SendError::Disconnected {
+                return Err(error);
+            }
+            let reason = connection.close_reason();
+            let code = reason.as_ref().and_then(close_code);
+            if code == Some(CLOSE_NOT_ALLOWED) {
+                return Err(SendError::NotAllowed);
+            }
+            // LocallyClosed omits the wire code. Admission records its decision on the
+            // exact connection under the peer lock so unrelated redials are not mistaken for it.
+            let replaced = code == Some(CLOSE_REPLACED)
+                || (matches!(reason, Some(ConnectionError::LocallyClosed))
+                    && lease.replaced_locally.load(Ordering::Relaxed));
+            // Retrying the same message preserves receipt de-duplication. A redial can
+            // lose a crossed-dial election, so allow one observed replacement separately.
+            let retry_available = if replaced {
+                &mut replacement_retry_available
+            } else if reason.is_some() {
+                &mut stale_retry_available
+            } else {
+                return Err(error);
+            };
+            if !*retry_available {
+                return Err(error);
+            }
+            *retry_available = false;
+            first_attempt = false;
         }
-        if result == Err(SendError::Timeout)
-            || (result == Err(SendError::Disconnected) && connection.close_reason().is_some())
-        {
-            let winner = self.connection(peer).await?;
-            result = send_chat(&winner, message, self.shared.config.send_deadline).await;
-        }
-        if result.is_err() && peer.state().revoked {
-            return Err(SendError::Closed);
-        }
-        result
     }
 
-    async fn connection(&self, peer: &Arc<Peer>) -> Result<Connection, SendError> {
+    async fn connection(&self, peer: &Arc<Peer>) -> Result<Arc<EstablishedConnection>, SendError> {
         // Subscribe before inspecting state. A later update stays visible across the await.
         let mut changes = peer.changed.subscribe();
         let mut attempt: Option<Arc<Dial>> = None;
@@ -270,7 +301,7 @@ impl LinkHandle {
                     return Err(SendError::NotAllowed);
                 }
                 if let Some(active) = state.active.as_ref().filter(|active| active.is_open()) {
-                    return Ok(active.connection.clone());
+                    return Ok(Arc::clone(&active.connection));
                 }
                 if let Some(pending) = &state.dial {
                     attempt = Some(Arc::clone(pending));
@@ -433,26 +464,37 @@ impl Shared {
             return dial_failure(connection, SendError::Disconnected);
         }
         let same_generation = state.remote_generation == Some(remote_generation);
-        // The peer answered a fresh challenge after this snapshot. If another generation
-        // was admitted in the meantime, this handshake no longer proves a newer peer.
+        // The snapshot predates the fresh challenge. Reject this competing handshake if
+        // another generation was admitted in the meantime.
         if !same_generation && state.remote_generation != observed_generation {
             connection.close(CLOSE_REPLACED.into(), b"");
             return DialResult::Replaced;
         }
         if let Some(active) = state.active.as_ref().filter(|active| active.is_open()) {
-            let existing = initiator(self.local_id, peer.id, active.connection.side());
+            let existing = initiator(self.local_id, peer.id, active.connection.transport.side());
             let candidate = initiator(self.local_id, peer.id, connection.side());
             if same_generation && existing < candidate {
                 connection.close(CLOSE_REPLACED.into(), b"");
                 return DialResult::Replaced;
             }
-            active.connection.close(CLOSE_REPLACED.into(), b"");
+            active
+                .connection
+                .replaced_locally
+                .store(true, Ordering::Relaxed);
+            active
+                .connection
+                .transport
+                .close(CLOSE_REPLACED.into(), b"");
         }
         let old_path = state.path();
         state.remote_generation = Some(remote_generation);
         let path = selected_path(connection);
         state.active = Some(Active {
-            connection: connection.clone(),
+            connection: Arc::new(EstablishedConnection {
+                transport: connection.clone(),
+                admitted_at: Instant::now(),
+                replaced_locally: AtomicBool::new(false),
+            }),
             path,
         });
         publish_path(&self.paths, peer.id, old_path, path);
@@ -490,7 +532,7 @@ impl Peer {
             connection.close(CLOSE_LINK.into(), b"");
         }
         if let Some(active) = state.active.take() {
-            active.connection.close(CLOSE_LINK.into(), b"");
+            active.connection.transport.close(CLOSE_LINK.into(), b"");
             publish_path(paths, self.id, active.path, LinkPath::Down);
         }
         self.changed.send_replace(());
@@ -545,18 +587,64 @@ impl PeerState {
 }
 
 struct Active {
-    connection: Connection,
+    connection: Arc<EstablishedConnection>,
     path: LinkPath,
 }
 
 impl Active {
     fn matches(&self, connection: &Connection) -> bool {
-        self.connection.stable_id() == connection.stable_id()
+        self.connection.transport.stable_id() == connection.stable_id()
     }
 
     fn is_open(&self) -> bool {
-        self.connection.close_reason().is_none()
+        self.connection.transport.close_reason().is_none()
     }
+}
+
+struct EstablishedConnection {
+    transport: Connection,
+    admitted_at: Instant,
+    // Read and written under the peer lock, including after removal from the active slot.
+    replaced_locally: AtomicBool,
+}
+
+async fn send_chat(
+    peer: &Peer,
+    connection: &Connection,
+    message: &ChatMessage,
+    config: LinkConfig,
+    start: Instant,
+    check_progress: bool,
+) -> Result<ChatReply, SendError> {
+    let (send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|_| SendError::Disconnected)?;
+    // In noq, frame_rx counts decoded frames after packet authentication, including QUIC
+    // ACKs and PINGs. Application handling can lag while the connection keeps making progress.
+    let received = check_progress.then(|| connection.stats().frame_rx);
+    write_chat_request(send, message).await?;
+    let remaining = config.send_deadline.saturating_sub(start.elapsed());
+    let reply = read_chat_reply(&mut recv, remaining);
+    // Only start a checkpoint after queuing the request. Waiting for stream credit
+    // or the ability to write doesn't give the peer a request to acknowledge.
+    let Some(received) = received
+        .filter(|_| !config.connect_timeout.is_zero() && config.connect_timeout < remaining)
+    else {
+        return reply.await;
+    };
+    let mut reply = pin!(reply);
+    if let Ok(result) = timeout(config.connect_timeout, reply.as_mut()).await {
+        return result;
+    }
+    {
+        let state = peer.state();
+        if state.is_current(connection) && connection.stats().frame_rx == received {
+            connection.close(CLOSE_LINK.into(), b"");
+            return Err(SendError::Disconnected);
+        }
+    }
+    reply.await
 }
 
 #[derive(Default)]
@@ -692,9 +780,13 @@ fn classify_close(code: u64) -> DialResult {
 }
 
 fn dial_failure(connection: &Connection, fallback: SendError) -> DialResult {
-    close_code(connection).map_or(DialResult::Failed(fallback), |code| {
-        classify_close(u64::from(code))
-    })
+    connection
+        .close_reason()
+        .as_ref()
+        .and_then(close_code)
+        .map_or(DialResult::Failed(fallback), |code| {
+            classify_close(u64::from(code))
+        })
 }
 
 struct IncomingLinks(Arc<Shared>);

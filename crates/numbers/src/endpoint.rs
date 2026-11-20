@@ -1,7 +1,7 @@
 //! Endpoint binding and bare-id lookup via configured towers.
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
@@ -24,6 +24,55 @@ pub struct EndpointConfig {
     pub towers: TowerSet,
     /// How to bind IP sockets.
     pub ip_transport: IpTransport,
+    /// Which certificate roots to trust for TLS connections to towers.
+    pub tls_roots: TlsRoots,
+    /// Which DNS resolver to use for tower hosts.
+    pub dns: DnsConfig,
+}
+
+/// Certificate roots for TLS connections to towers.
+///
+/// [Endpoint::bind] currently supports only [Self::WebPki].
+#[derive(Clone, Default)]
+pub enum TlsRoots {
+    /// Trust the bundled WebPKI roots.
+    #[default]
+    WebPki,
+    /// Trust the bundled WebPKI roots and the supplied DER-encoded certificates.
+    WebPkiPlus(Vec<Vec<u8>>),
+    /// Trust only the supplied DER-encoded certificates.
+    CustomOnly(Vec<Vec<u8>>),
+}
+
+impl fmt::Debug for TlsRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WebPki => f.write_str("WebPki"),
+            Self::WebPkiPlus(_) => f.debug_tuple("WebPkiPlus").finish_non_exhaustive(),
+            Self::CustomOnly(_) => f.debug_tuple("CustomOnly").finish_non_exhaustive(),
+        }
+    }
+}
+
+/// DNS resolver settings for tower hosts.
+///
+/// [Endpoint::bind] currently supports only [Self::System].
+#[derive(Clone, Copy, Default)]
+pub enum DnsConfig {
+    /// Use system DNS with public fallback resolvers disabled.
+    #[default]
+    System,
+    /// Use the specified nameserver.
+    Nameserver(SocketAddr),
+}
+
+impl fmt::Debug for DnsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System => f.write_str("System"),
+            Self::Nameserver(_) => f.debug_tuple("Nameserver").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Which IP sockets an endpoint opens.
@@ -41,6 +90,10 @@ pub enum IpTransport {
 /// An error opening the endpoint.
 #[derive(thiserror::Error)]
 pub enum EndpointBindError {
+    #[error("custom TLS roots are not supported by the numbers endpoint yet")]
+    UnsupportedTlsRoots,
+    #[error("an explicit DNS nameserver is not supported by the numbers endpoint yet")]
+    UnsupportedDns,
     #[error("could not configure the loopback socket for the numbers endpoint")]
     Loopback(#[source] InvalidSocketAddr),
     #[error("could not bind the numbers endpoint")]
@@ -66,6 +119,12 @@ impl Endpoint {
         config: EndpointConfig,
         authorizer: Arc<Authorizer>,
     ) -> Result<Self, EndpointBindError> {
+        if !matches!(config.tls_roots, TlsRoots::WebPki) {
+            return Err(EndpointBindError::UnsupportedTlsRoots);
+        }
+        if !matches!(config.dns, DnsConfig::System) {
+            return Err(EndpointBindError::UnsupportedDns);
+        }
         let relays = config.towers.relay_map();
         let gate = Gate { authorizer };
         let mut net_report = NetReportConfig::default();

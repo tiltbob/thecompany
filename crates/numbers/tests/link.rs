@@ -1,7 +1,9 @@
 #![cfg(test)]
 
+use std::future::Future;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::sync::mpsc::{Receiver, error::TryRecvError};
 use tokio::sync::{broadcast, oneshot};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(45);
 // A loaded test runner can miss the first net report that selects the home relay.
@@ -73,8 +75,8 @@ async fn bind_direct_with_key(key: &[u8; 32]) -> (Endpoint, Arc<Authorizer>) {
     bind_with_key(
         key,
         EndpointConfig {
-            towers: TowerSet::default(),
             ip_transport: IpTransport::LoopbackOnly,
+            ..EndpointConfig::default()
         },
     )
     .await
@@ -599,6 +601,7 @@ async fn simultaneous_sends_finish_in_both_directions_over_the_relay() {
             let relay_config = EndpointConfig {
                 towers: checked(TowerSet::from_url(tower.url()), "parse tower URL"),
                 ip_transport: IpTransport::RelayOnly,
+                ..EndpointConfig::default()
             };
             let (first, first_auth) = bind(relay_config.clone()).await;
             let (second, second_auth) = bind(relay_config).await;
@@ -904,7 +907,7 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
 }
 
 #[tokio::test]
-async fn chat_committed_before_a_stalled_ack_is_delivered_once_after_retry() {
+async fn slow_application_ack_keeps_new_and_established_links_usable() {
     checked(
         timeout(CASE_TIMEOUT, async {
             let (endpoint, auth) = bind_direct().await;
@@ -912,53 +915,336 @@ async fn chat_committed_before_a_stalled_ack_is_delivered_once_after_retry() {
             let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
             add_address(&endpoint, loopback_address(&peer));
             peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
-            let (link, _inbox) = Link::start(endpoint, config());
+            let (link, mut inbox) = Link::start(endpoint, config());
             let handle = link.handle();
-            let chat = message("slow-ack", "commit before acknowledging");
-
-            let (reply, retry) = checked(
-                timeout(SEND_DEADLINE, async {
-                    tokio::join!(handle.send(peer_id, chat.clone()), async {
-                        let (initial, mut hello) = accept_hello(&peer).await;
-                        hello.reply(RAW_GENERATION, [1; 16]).await;
-                        hello.confirm([1; 16]).await;
-                        let (held_ack, received) = accept_chat(&initial, &chat).await;
-                        let initial_id = received["id"].as_str().expect("initial chat ID");
-                        let mut receipts = ReceiptWindow::new(3);
-                        let mut deliveries = usize::from(receipts.record("first", initial_id));
-
-                        // Keep the reply stream open until the sender closes the stalled link.
-                        assert!(matches!(
-                            initial.closed().await,
-                            ConnectionError::ApplicationClosed(_)
-                        ));
-                        drop(held_ack);
-
-                        let (retry, mut hello) = accept_hello(&peer).await;
-                        assert!(retry.stable_id() != initial.stable_id());
-                        hello.reply(RAW_GENERATION, [2; 16]).await;
-                        hello.confirm([2; 16]).await;
-                        let (mut send, received) = accept_chat(&retry, &chat).await;
-                        let retry_id = received["id"].as_str().expect("retried chat ID");
-                        assert!(retry_id == initial_id);
-                        deliveries += usize::from(receipts.record("first", retry_id));
-                        assert_eq!(deliveries, 1);
-                        write(&mut send, &ChatReply::Ack).await;
-                        checked(send.finish(), "finish ACK on retried chat");
-                        retry
-                    })
-                })
-                .await,
-                "acknowledge the retry within the original send deadline",
-            );
+            let fresh = message("fresh", "slow ACK on a fresh link");
+            let (reply, conn) = tokio::join!(handle.send(peer_id, fresh.clone()), async {
+                let (conn, mut hello) = accept_hello(&peer).await;
+                hello.reply(RAW_GENERATION, [1; 16]).await;
+                hello.confirm([1; 16]).await;
+                let (mut held_ack, _) = accept_chat(&conn, &fresh).await;
+                sleep(CONNECT_TIMEOUT + Duration::from_millis(100)).await;
+                assert!(conn.close_reason().is_none());
+                write(&mut held_ack, &ChatReply::Ack).await;
+                checked(held_ack.finish(), "finish a delayed ACK on the new link");
+                conn
+            });
             assert_eq!(reply, Ok(ChatReply::Ack));
-            assert!(retry.close_reason().is_none());
 
-            checked(link.shutdown().await, "stop link after retry");
+            let established = message("established", "slow ACK on an established link");
+            let reverse = message("reverse", "other chat streams still make progress");
+            let header = StreamHeader::chat();
+            let (reply, ()) = tokio::join!(handle.send(peer_id, established.clone()), async {
+                let (mut held_ack, _) = accept_chat(&conn, &established).await;
+                // Only transport traffic has returned while the progress checkpoint passes.
+                sleep(CONNECT_TIMEOUT + Duration::from_millis(100)).await;
+                assert!(conn.close_reason().is_none());
+                let (other_reply, ()) = tokio::join!(
+                    request(&conn, &header, &reverse),
+                    acknowledge(&mut inbox, peer_id, "second", &reverse),
+                );
+                assert_eq!(
+                    checked(other_reply, "receive ACK on the other stream"),
+                    ChatReply::Ack
+                );
+                write(&mut held_ack, &ChatReply::Ack).await;
+                checked(
+                    held_ack.finish(),
+                    "finish a delayed ACK on the established link",
+                );
+            });
+            assert_eq!(reply, Ok(ChatReply::Ack));
+
+            checked(
+                link.shutdown().await,
+                "stop link after delayed acknowledgments",
+            );
             peer.iroh().close().await;
         })
         .await,
-        "stalled ACK retry test timed out",
+        "slow application ACK test timed out",
+    );
+}
+
+#[tokio::test]
+async fn waiting_for_stream_credit_keeps_a_healthy_link_usable() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let handle = link.handle();
+            // The raw peer initiates the hello and warmup so the station starts
+            // with its full allowance of 16 locally initiated streams.
+            let conn = dial(&peer, &address).await;
+            let (mut hello, remote) =
+                begin_hello(&conn, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            finish_hello(&mut hello, &remote).await;
+            let warmup = message("warmup", "establish the link");
+            let header = StreamHeader::chat();
+            let (reply, ()) = tokio::join!(
+                request(&conn, &header, &warmup),
+                acknowledge(&mut inbox, peer_id, "second", &warmup),
+            );
+            assert_eq!(checked(reply, "establish the link with a chat"), ChatReply::Ack);
+
+            let mut outstanding = Vec::new();
+            for index in 0..16 {
+                let chat = message(&format!("hold-{index}"), "hold one stream credit");
+                let task_handle = handle.clone();
+                let sent = chat.clone();
+                let task = tokio::spawn(async move { task_handle.send(peer_id, sent).await });
+                let (held_ack, _) = checked(
+                    timeout(PROBE_TIMEOUT, accept_chat(&conn, &chat)).await,
+                    "occupy a stream credit",
+                );
+                outstanding.push((task, held_ack));
+            }
+
+            let next = message("credit", "wait for one of the older streams to finish");
+            let mut send = pin!(handle.send(peer_id, next.clone()));
+            tokio::select! {
+                reply = send.as_mut() => panic!("send ended while stream credit was held: {reply:?}"),
+                _ = conn.accept_bi() => panic!("a new stream arrived while all credits were held"),
+                () = sleep(CONNECT_TIMEOUT + Duration::from_millis(100)) => {}
+            }
+            assert!(conn.close_reason().is_none());
+            // noq advertises new stream credits in batches when the window is full.
+            for _ in 0..3 {
+                let (task, mut ack) = outstanding.pop().expect("one held stream");
+                write(&mut ack, &ChatReply::Ack).await;
+                checked(ack.finish(), "release a stream credit");
+                assert_eq!(checked(task.await, "join a released send"), Ok(ChatReply::Ack));
+            }
+            let (reply, ()) = checked(
+                timeout(PROBE_TIMEOUT, async { tokio::join!(send, reply_to_chat(&conn, &next)) })
+                    .await,
+                "send after the peer advertises more credits",
+            );
+            assert_eq!(reply, Ok(ChatReply::Ack));
+            for (task, mut ack) in outstanding {
+                write(&mut ack, &ChatReply::Ack).await;
+                checked(ack.finish(), "release another stream credit");
+                assert_eq!(checked(task.await, "join an outstanding send"), Ok(ChatReply::Ack));
+            }
+
+            checked(link.shutdown().await, "stop link after a full stream window");
+            peer.iroh().close().await;
+        })
+        .await,
+        "stream credit test timed out",
+    );
+}
+
+enum WinnerAction {
+    Acknowledge,
+    Replace,
+    Stall,
+    Unavailable,
+}
+
+struct CrossedRedial {
+    temporary: Connection,
+    winner: Connection,
+    winner_hello: SendStream,
+    remote: Hello,
+}
+
+async fn stage_crossed_redial(peer: &Endpoint, address: &EndpointAddr) -> CrossedRedial {
+    let (temporary, mut hello) = accept_hello(peer).await;
+    let winner = dial(peer, address).await;
+    let (winner_hello, remote) = begin_hello(&winner, &Hello::local(RAW_GENERATION, [2; 16])).await;
+    hello.reply(RAW_GENERATION, [3; 16]).await;
+    hello.confirm([3; 16]).await;
+    CrossedRedial {
+        temporary,
+        winner,
+        winner_hello,
+        remote,
+    }
+}
+
+async fn while_sending<T>(
+    send: Pin<&mut impl Future<Output = Result<ChatReply, SendError>>>,
+    step: impl Future<Output = T>,
+) -> T {
+    tokio::select! {
+        reply = send => panic!("send ended before the next test step: {reply:?}"),
+        output = step => output,
+    }
+}
+
+async fn expect_close(conn: &Connection, code: u64) {
+    assert!(
+        matches!(conn.closed().await, ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == code)
+    );
+}
+
+async fn crossed_redial(install_before_polling: bool, action: WinnerAction) {
+    let (lower, higher) = ordered_keys();
+    let (endpoint, auth) = bind_direct_with_key(&higher).await;
+    let (peer, peer_auth) = bind_direct_with_key(&lower).await;
+    let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+    let address = loopback_address(&endpoint);
+    add_address(&endpoint, loopback_address(&peer));
+    peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+    let budget = LinkConfig {
+        connect_timeout: CONNECT_TIMEOUT,
+        send_deadline: CONNECT_TIMEOUT * 3,
+    };
+    let (link, _inbox) = Link::start(endpoint, budget);
+    let handle = link.handle();
+    let chat = message("crossed-redial", "send while both peers reconnect");
+    let started = Instant::now();
+    let mut send = pin!(handle.send(peer_id, chat.clone()));
+    let (initial, initial_ack) = while_sending(send.as_mut(), async {
+        let (initial, mut hello) = accept_hello(&peer).await;
+        hello.reply(RAW_GENERATION, [1; 16]).await;
+        hello.confirm([1; 16]).await;
+        let (initial_ack, _) = accept_chat(&initial, &chat).await;
+        (initial, initial_ack)
+    })
+    .await;
+
+    if matches!(action, WinnerAction::Stall) {
+        // Spend enough of the budget on the first attempt to detect a reset on retry.
+        sleep(CONNECT_TIMEOUT / 2).await;
+    }
+    initial.close(0u32.into(), b"");
+    wait_for_path(&handle, peer_id, LinkPath::Down).await;
+    let CrossedRedial {
+        temporary,
+        winner,
+        mut winner_hello,
+        remote,
+    } = if install_before_polling {
+        // Leave the send parked while another send installs a new connection. The
+        // earlier closure is ordinary even though another connection is already open.
+        let probe = message(
+            "reconnect",
+            "install a link before the original send resumes",
+        );
+        let (ack, crossed) = tokio::join!(handle.send(peer_id, probe.clone()), async {
+            let crossed = stage_crossed_redial(&peer, &address).await;
+            reply_to_chat(&crossed.temporary, &probe).await;
+            crossed
+        });
+        assert_eq!(ack, Ok(ChatReply::Ack));
+        crossed
+    } else {
+        while_sending(send.as_mut(), stage_crossed_redial(&peer, &address)).await
+    };
+    drop(initial_ack);
+
+    // Admit the higher-ID dial first. The retry must reach it before the lower-ID
+    // dial finishes its hello and supersedes it.
+    let (retry_ack, _) = while_sending(send.as_mut(), accept_chat(&temporary, &chat)).await;
+    finish_hello(&mut winner_hello, &remote).await;
+    expect_close(&temporary, 409).await;
+    drop(retry_ack);
+
+    // accept_chat checks the whole message, including the original ID, on each attempt.
+    let (mut winner_ack, _) = while_sending(send.as_mut(), accept_chat(&winner, &chat)).await;
+    match action {
+        WinnerAction::Acknowledge => {
+            write(&mut winner_ack, &ChatReply::Ack).await;
+            checked(winner_ack.finish(), "finish ACK on the winning connection");
+            assert_eq!(send.await, Ok(ChatReply::Ack));
+        }
+        WinnerAction::Replace => {
+            // A fresh connection from the same initiator can replace the winner again.
+            let replacement = dial(&peer, &address).await;
+            let (mut hello, remote) =
+                begin_hello(&replacement, &Hello::local(RAW_GENERATION, [4; 16])).await;
+            finish_hello(&mut hello, &remote).await;
+            expect_close(&winner, 409).await;
+            assert!(replacement.close_reason().is_none());
+            assert_eq!(send.await, Err(SendError::Disconnected));
+        }
+        WinnerAction::Stall => {
+            // The send must still expire at one deadline after its first poll.
+            let latest = started + budget.send_deadline + Duration::from_millis(500);
+            let result = checked(timeout_at(latest, send).await, "original send deadline");
+            assert_eq!(result, Err(SendError::Timeout));
+            assert!(winner.close_reason().is_none());
+        }
+        WinnerAction::Unavailable => {
+            let unavailable = ChatReply::Nack(NackReason::Unavailable);
+            write(&mut winner_ack, &unavailable).await;
+            checked(
+                winner_ack.finish(),
+                "finish unavailable reply on the winning connection",
+            );
+            assert_eq!(send.await, Err(SendError::Timeout));
+
+            let first_try = message("unavailable-first", "try the link with a different message");
+            let (result, ()) = tokio::join!(handle.send(peer_id, first_try.clone()), async {
+                let (mut ack, _) = accept_chat(&winner, &first_try).await;
+                write(&mut ack, &unavailable).await;
+                checked(
+                    ack.finish(),
+                    "finish unavailable reply to the first attempt",
+                );
+            });
+            assert_eq!(result, Ok(unavailable));
+        }
+    }
+
+    checked(link.shutdown().await, "stop link after crossed redial");
+    peer.iroh().close().await;
+}
+
+#[tokio::test]
+async fn crossed_redial_retries_after_closure_and_replacement_with_the_same_message() {
+    checked(
+        timeout(
+            CASE_TIMEOUT,
+            crossed_redial(false, WinnerAction::Acknowledge),
+        )
+        .await,
+        "crossed redial send timed out",
+    );
+}
+
+#[tokio::test]
+async fn crossed_redial_does_not_retry_a_second_replacement() {
+    checked(
+        timeout(CASE_TIMEOUT, crossed_redial(false, WinnerAction::Replace)).await,
+        "repeated replacement test timed out",
+    );
+}
+
+#[tokio::test]
+async fn crossed_redial_keeps_the_original_deadline() {
+    checked(
+        timeout(CASE_TIMEOUT, crossed_redial(false, WinnerAction::Stall)).await,
+        "replacement send deadline test timed out",
+    );
+}
+
+#[tokio::test]
+async fn late_observation_of_an_ordinary_close_preserves_the_replacement_retry() {
+    checked(
+        timeout(
+            CASE_TIMEOUT,
+            crossed_redial(true, WinnerAction::Acknowledge),
+        )
+        .await,
+        "late ordinary close test timed out",
+    );
+}
+
+#[tokio::test]
+async fn unavailable_after_retry_reports_uncertain_delivery() {
+    checked(
+        timeout(
+            CASE_TIMEOUT,
+            crossed_redial(false, WinnerAction::Unavailable),
+        )
+        .await,
+        "unavailable after retry test timed out",
     );
 }
 

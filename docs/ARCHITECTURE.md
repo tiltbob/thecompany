@@ -179,6 +179,8 @@ again. So a station watches its home tower (below).
   Towers do not forward to each other, so a dialer reaches a peer only through a tower both of them
   can reach; all nodes therefore use the same small set (two or three). SRV priority and weight are
   ignored.
+  `TowerSet` caps the set at eight unique canonical URLs. Each `TowerEntry` carries its own QAD
+  setting and defaults to UDP 7842 for HTTPS or QAD off for plain HTTP.
 - **Not an open relay.** A production tower relays only for listed node ids and rate-limits each
   client: a static list in M2, fed from the roster in M3 (verifiable against the genesis hash, no
   secret). The list covers relaying only: an unlisted node can still use the tower's address
@@ -223,11 +225,12 @@ the echo before admitting its connection.
 
 A new authenticated generation can replace a connection left open by a crash. A hello for a
 different generation is admitted only if the remembered generation has stayed the same since
-before the fresh challenge. This prevents a delayed handshake from replacing a newer generation.
-For the same generation, the lower node ID's dial wins crossed dials and a fresh connection
-replaces one from the same initiator. Either end can then open a bidirectional chat stream with
-the header `{"proto":"chat","v":1}`, followed by one message. Each JSON frame has a four-byte
-big-endian length and a payload limit of 64 KiB.
+before the fresh challenge. When concurrent hellos present different generations, the first
+admission that changes the remembered generation takes precedence. A later handshake can start
+from the updated value. For the same generation, the lower node ID's dial wins crossed dials and
+a fresh connection replaces one from the same initiator. Either end can then open a bidirectional
+chat stream with the header `{"proto":"chat","v":1}`, followed by one message. Each JSON frame
+has a four-byte big-endian length and a payload limit of 64 KiB.
 
 A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
 letters, digits, underscores or hyphens and reports its own time in Unix milliseconds. The
@@ -237,11 +240,14 @@ to at most 16 KiB of UTF-8. The receiver replies with `{"type":"ack"}` or a
 the message after deciding whether it is a new message or a retry.
 
 `connect_timeout` bounds each dial and hello together. `send_deadline` bounds the send, including
-any shared dial, retry and wait for a reply. The first stream attempt gets the smaller of
-`connect_timeout` and half the remaining send budget. If it stalls, the sender closes that
-connection if it is still current. A stalled or disconnected stream on a closed connection can
-be retried once with the same message ID, by reusing a replacement connection or dialing again.
-The receiver also applies a deadline to each incoming chat stream.
+any shared dials, retries and waits for a reply. On the first attempt over an already established
+connection, the sender checks for transport progress a full `connect_timeout` after queuing the
+request, if the send budget allows. If the connection is still current and has received no
+authenticated QUIC frames since before the request was written, the sender closes it. The sender
+can retry once after an ordinary connection closure and once after observing a replacement. Each
+retry uses the same message ID and the original deadline. An `unavailable` reply to a retry leaves
+delivery uncertain because an earlier attempt can still be accepted. The receiver also applies a
+deadline to each incoming chat stream.
 
 ### Stations and the chief's frontends
 
@@ -465,6 +471,8 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
+  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
+  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
@@ -564,6 +572,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. An endpoint
   bound with the URLs from the SRV answer came online through a TLS tower named by the record in
   227–284 ms (bind to online; the lookup was done before the timed part).
+  Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
+  DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
+  requires a literal loopback address.
 - **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
   `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
