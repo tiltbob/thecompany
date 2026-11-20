@@ -519,6 +519,43 @@ fn numbers_keep_their_full_range() {
     round_trip(&error);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_full_tower_status_fits_local_socket_frames() {
+    use chief::socket::wire::Reply;
+    use numbers_base::{LOCAL_FRAME_MAX, encode_frame};
+
+    // Quotes and backslashes each double in JSON after cleaning.
+    let worst = "\"\\".repeat(TOWER_TEXT_MAX_BYTES);
+    let reason = clean_tower_display(&worst);
+    assert_eq!(reason.len(), TOWER_TEXT_MAX_BYTES);
+    // Eight is the tower set limit (numbers::MAX_TOWERS), with no frontend dependency on numbers.
+    let towers = (0..8)
+        .map(|offset| {
+            tower(
+                3340 + offset,
+                TowerState::Denied {
+                    reason: reason.clone(),
+                },
+            )
+        })
+        .collect();
+    let status = status(towers);
+    let reply = Reply::Ok {
+        response: Response::Status {
+            status: status.clone(),
+        },
+    };
+    let event = Event::Status { status };
+    assert!(
+        matches!(encode_frame(&reply, LOCAL_FRAME_MAX), Ok(frame) if frame.len() < LOCAL_FRAME_MAX)
+    );
+    assert!(
+        matches!(encode_frame(&event, LOCAL_FRAME_MAX), Ok(frame) if frame.len() < LOCAL_FRAME_MAX)
+    );
+    assert_eq!(TOWER_TEXT_MAX_BYTES, 1024);
+}
+
 // 2. Golden JSON.
 
 fn assert_golden<T: Serialize + DeserializeOwned + PartialEq + Debug>(pairs: &[(T, &str)]) {
