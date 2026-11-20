@@ -59,17 +59,20 @@ impl Actor {
     pub(super) fn new(
         storage: Storage,
         own_id: NodeId,
-        book: PeerBook,
+        book: Option<PeerBook>,
         authorizer: Arc<Authorizer>,
         status: Status,
         send_deadline: Duration,
         links: LinkHandle,
     ) -> Self {
+        // A prior writeback failure may already have been reported to the previous
+        // process. An existing record needs a fresh checked write to confirm it.
+        let book_uncertain = book.is_some();
         Self {
             storage,
             own_id,
-            book,
-            book_uncertain: false,
+            book: book.unwrap_or_default(),
+            book_uncertain,
             authorizer,
             status,
             send_deadline,

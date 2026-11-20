@@ -156,7 +156,9 @@ impl Station {
         let own_id = node_id(&key);
         let book = storage.load_peers(own_id)?;
         let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
-        actor::authorize_book(&authorizer, &book);
+        if let Some(book) = &book {
+            actor::authorize_book(&authorizer, book);
+        }
         let endpoint_config = EndpointConfig {
             towers,
             ip_transport: config.ip_transport,

@@ -160,13 +160,16 @@ The private data directory must be on a local filesystem so the station can rely
 lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the
 node key relative to the checked directory handle used for the lock. The peer book is a version-1
 object with a list of peer records, each containing a name and ordered canonical station IDs. It
-is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
-rename and directory sync. If the rename succeeds but directory sync fails, the station applies
-the visible book and reports that the change may not survive a crash. While that running station
-has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
-and syncs the directory before giving its usual answer. These retries emit no additional events.
-On startup, the station requires a directory sync under its lock before it can read the book or
-accept commands.
+is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic rename and
+directory sync. Each staging attempt uses a fresh random name and leaves existing staging files
+untouched. If the rename succeeds but directory sync fails, the station applies the visible book
+and reports that the change may not survive a crash. The station syncs the directory under its
+lock before reading the book or accepting commands on startup. This flushes pending metadata, but
+an earlier writeback failure may already have been reported to the previous process. A loaded
+book, even an empty one, starts uncertain until a successful checked rewrite. While the book is
+uncertain, a duplicate peer add or a remove of an absent peer rewrites the current book and syncs
+the directory before giving its usual answer. These retries emit no additional events. With no
+book file, an absent remove does not create one.
 The saved file contains no network path state or message history. While the actor writes and syncs
 the peer book, command replies and event processing can pause. An incoming chat can receive
 `Unavailable` if its bounded mailbox fills during that time.

@@ -32,6 +32,12 @@ const OPEN_PRIVATE: OFlags = OFlags::NOFOLLOW
     .union(OFlags::NOCTTY)
     .union(OFlags::CLOEXEC);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_STARTUP_SYNC: Cell<bool> = const { Cell::new(false) };
+    static STARTUP_SYNCS: Cell<u32> = const { Cell::new(0) };
+}
+
 /// Names are sorted for snapshots. Each peer's stations stay in insertion order.
 pub(crate) type PeerBook = BTreeMap<String, Vec<NodeId>>;
 
@@ -117,7 +123,7 @@ pub(crate) struct Storage {
 impl Storage {
     /// Acquires the lock and syncs the checked directory before loading station records.
     pub(crate) fn lock(data_dir: &Path) -> Result<Self, StorageError> {
-        Self::lock_with_sync(data_dir, File::sync_all)
+        Self::lock_with_sync(data_dir, startup_sync)
     }
 
     fn lock_with_sync(
@@ -147,7 +153,8 @@ impl Storage {
         let lock = open_lock(&dir)?;
         match lock.try_lock() {
             Ok(()) => {
-                // A previous process may have renamed a record without syncing the directory.
+                // Flush pending metadata from a previous process. This cannot recover an old
+                // writeback error that has already been reported.
                 sync_dir(&dir).map_err(|_| StorageError::SyncDataDir)?;
                 Ok(Self {
                     dir,
@@ -167,13 +174,13 @@ impl Storage {
             .map_err(|_| StorageError::NodeKey)
     }
 
-    pub(crate) fn load_peers(&self, own_id: NodeId) -> Result<PeerBook, StorageError> {
+    pub(crate) fn load_peers(&self, own_id: NodeId) -> Result<Option<PeerBook>, StorageError> {
         let Some(bytes) = self.read_record(RecordFile::Peers)? else {
-            return Ok(PeerBook::new());
+            return Ok(None);
         };
         let disk: DiskBook = serde_json::from_slice(&bytes)
             .map_err(|_| StorageError::InvalidPeers("expected a versioned peer book"))?;
-        disk.into_book(own_id)
+        disk.into_book(own_id).map(Some)
     }
 
     /// Any error means the rename did not happen. Both successful outcomes commit the new book.
@@ -233,10 +240,20 @@ impl Storage {
         bytes: &[u8],
         sync_dir: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<SaveOutcome, StorageError> {
+        self.replace_record_with_suffixes(record, bytes, random_staging_suffix, sync_dir)
+    }
+
+    fn replace_record_with_suffixes(
+        &self,
+        record: RecordFile,
+        bytes: &[u8],
+        draw_suffix: impl FnMut() -> Result<u128, getrandom::Error>,
+        sync_dir: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
         if bytes.len() > record.max_bytes() {
             return Err(StorageError::RecordTooLarge(record));
         }
-        let mut stage = StagedRecord::create(&self.dir, record)?;
+        let mut stage = StagedRecord::create(&self.dir, record, draw_suffix)?;
         stage
             .file
             .write_all(bytes)
@@ -250,6 +267,17 @@ impl Storage {
             Err(_) => SaveOutcome::DurabilityUncertain,
         })
     }
+}
+
+fn startup_sync(dir: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_STARTUP_SYNC.replace(false) {
+        return Err(io::ErrorKind::Other.into());
+    }
+    dir.sync_all()?;
+    #[cfg(test)]
+    STARTUP_SYNCS.set(STARTUP_SYNCS.get() + 1);
+    Ok(())
 }
 
 fn open_lock(dir: &File) -> Result<File, StorageError> {
@@ -320,9 +348,14 @@ struct StagedRecord<'a> {
 }
 
 impl<'a> StagedRecord<'a> {
-    fn create(dir: &'a File, record: RecordFile) -> Result<Self, StorageError> {
-        for index in 0..STAGING_ATTEMPTS {
-            let name = staging_name(record, index);
+    fn create(
+        dir: &'a File,
+        record: RecordFile,
+        mut draw_suffix: impl FnMut() -> Result<u128, getrandom::Error>,
+    ) -> Result<Self, StorageError> {
+        for _ in 0..STAGING_ATTEMPTS {
+            let suffix = draw_suffix().map_err(|_| StorageError::StageRecord(record))?;
+            let name = staging_name(record, suffix);
             match rustix::fs::openat(
                 dir,
                 name.as_str(),
@@ -363,8 +396,14 @@ impl Drop for StagedRecord<'_> {
     }
 }
 
-fn staging_name(record: RecordFile, index: u8) -> String {
-    format!(".{}.{}.{index}.tmp", record.name(), std::process::id())
+fn random_staging_suffix() -> Result<u128, getrandom::Error> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn staging_name(record: RecordFile, suffix: u128) -> String {
+    format!(".{}.{suffix:032x}.tmp", record.name())
 }
 
 #[derive(Serialize, Deserialize)]
