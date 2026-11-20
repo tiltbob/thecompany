@@ -8,7 +8,7 @@
 
 use chief::api::*;
 use chief::client::{BindInstance, Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
-use chief::fake::{FAKE_TOWER_URL, FakeStation, SendOutcome};
+use chief::fake::{FAKE_LOG_CAPACITY, FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
     AFTER_HELP, Cli, Command, Exit, PeerCommand, format_change, format_message, format_time, run,
@@ -513,6 +513,196 @@ async fn send_waits_for_a_slow_outcome() {
     .await;
 }
 
+// send: what happened at which step (findings A of the second review of #51).
+
+/// The second line of `send` when its `Send` call ended without an answer.
+const MAY_HAVE_BEEN_SENT: &str =
+    "the message may still have been sent; check `chief log bob` before sending it again\n";
+/// The last line of `send` when the station accepted the message and its outcome is unknown.
+const ACCEPTED_OUTCOME_UNKNOWN: &str = "the station accepted the message, but its outcome is \
+     unknown; check `chief log bob` before sending it again\n";
+
+/// A fake whose `Send` reaches the station, but whose answer is lost: the call ends with `error`.
+#[derive(Clone)]
+struct LostAnswer {
+    fake: FakeStation,
+    error: ApiError,
+}
+
+impl Transport for LostAnswer {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let send = matches!(request, Request::Send { .. });
+        let answer = self.fake.call(request).await;
+        if send {
+            Err(self.error.clone())
+        } else {
+            answer
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+impl BindInstance for LostAnswer {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            fake: self.fake.bound_to(instance_id),
+            error: self.error.clone(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_send_without_an_answer_says_the_message_may_have_been_sent() {
+    bounded(async {
+        for (error, first) in [
+            (
+                ApiError::Timeout { after_ms: 10_000 },
+                "the station did not answer within 10000 ms\n",
+            ),
+            (
+                ApiError::Disconnected {
+                    detail: "the station closed the connection".to_owned(),
+                },
+                "lost the connection to the station: the station closed the connection\n",
+            ),
+        ] {
+            let fake = fake_with_peers().await;
+            let c = Client::new(LostAnswer {
+                fake: fake.clone(),
+                error: error.clone(),
+            });
+            let (exit, out, err) = exec(&c, &["send", "bob", "hello"]).await;
+            assert_eq!(exit, Exit::NoStation, "{error:?}");
+            assert_eq!(out, "", "{error:?}");
+            assert_eq!(err, format!("{first}{MAY_HAVE_BEEN_SENT}"), "{error:?}");
+            // And it was: the station logged and delivered it.
+            assert_eq!(sends(&fake), ["hello"]);
+            let logged = fake.messages();
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0].status, MessageStatus::Delivered);
+        }
+    })
+    .await;
+}
+
+/// Waits until the station holds an outgoing message that is still `Sending`.
+async fn wait_for_sending(events: &mut Subscription) {
+    loop {
+        if let Some(Event::Message { message }) = events.next().await
+            && message.status == MessageStatus::Sending
+        {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_whose_message_left_the_log_before_its_outcome_exits_3_not_1() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.set_outcome(SendOutcome::Hold);
+        let c = Client::new(fake.clone());
+        let mut events = c.subscribe().await.unwrap();
+        let (result, ()) = tokio::join!(exec(&c, &["send", "bob", "evicted"]), async {
+            wait_for_sending(&mut events).await;
+            // Without a pause: more than the CLI's subscription holds, and more than the log
+            // keeps, so its re-read after the `Resync` finds the message gone.
+            for i in 0..=FAKE_LOG_CAPACITY {
+                fake.receive("alice", &format!("flood {i}")).unwrap();
+            }
+        });
+        let (exit, out, err) = result;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        assert_eq!(
+            err,
+            format!("message 1 is not in the station's log\n{ACCEPTED_OUTCOME_UNKNOWN}")
+        );
+        assert!(fake.messages().iter().all(|m| m.body != "evicted"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn send_whose_station_stops_while_it_waits_exits_3() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.set_outcome(SendOutcome::Hold);
+        let c = Client::new(fake.clone());
+        let mut events = c.subscribe().await.unwrap();
+        let (result, ()) = tokio::join!(exec(&c, &["send", "bob", "hello"]), async {
+            wait_for_sending(&mut events).await;
+            fake.stop();
+        });
+        let (exit, out, err) = result;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        assert_eq!(
+            err,
+            format!(
+                "lost the connection to the station: the subscription ended before the outcome \
+                 of the send\n{ACCEPTED_OUTCOME_UNKNOWN}"
+            )
+        );
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_waits_at_most_120_s_for_the_outcome() {
+    // Virtual time: the bound of the test is far above the bound of `send`.
+    let test = async {
+        let fake = fake_with_peers().await;
+        fake.set_outcome(SendOutcome::Hold);
+        let c = Client::new(fake.clone());
+        let start = tokio::time::Instant::now();
+        let (exit, out, err) = exec(&c, &["send", "bob", "held"]).await;
+        let waited = start.elapsed();
+        assert!(
+            (Duration::from_secs(120)..Duration::from_secs(121)).contains(&waited),
+            "{waited:?}"
+        );
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        assert_eq!(
+            err,
+            format!(
+                "the station did not report the outcome within 120 s\n{ACCEPTED_OUTCOME_UNKNOWN}"
+            )
+        );
+        assert_eq!(sends(&fake), ["held"]);
+    };
+    tokio::time::timeout(Duration::from_secs(600), test)
+        .await
+        .expect("send did not give up within 600 s of virtual time");
+}
+
+/// A writer that fails every write, like a closed stdout.
+struct Closed;
+
+impl Write for Closed {
+    fn write(&mut self, _data: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[tokio::test]
+async fn a_delivered_send_exits_0_even_when_stdout_is_gone() {
+    bounded(async {
+        let c = Client::new(fake_with_peers().await);
+        let command = parse(&["send", "bob", "hello"]);
+        let mut err = Vec::new();
+        let exit = run(&command, &c, tokio::io::empty(), &mut Closed, &mut err).await;
+        assert_eq!(exit, Exit::Done);
+        assert_eq!(String::from_utf8(err).unwrap(), "");
+    })
+    .await;
+}
+
 // log.
 
 #[tokio::test]
@@ -957,7 +1147,15 @@ async fn send_with_a_restart_before_its_send_never_sends() {
         restart_on(&fake, 1, |r| matches!(r, Request::Send { .. }));
         let (exit, out, err) = exec(&c, &["send", "bob", "hello"]).await;
         assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
-        assert_eq!(err.lines().count(), 1, "{err}");
+        // The bound transport refuses with `Disconnected`, which the CLI cannot tell from a lost
+        // answer: it says the message may have been sent, though it was not.
+        assert_eq!(
+            err,
+            format!(
+                "lost the connection to the station: the station restarted: another instance \
+                 runs now\n{MAY_HAVE_BEEN_SENT}"
+            )
+        );
         assert!(sends(&fake).is_empty());
     })
     .await;

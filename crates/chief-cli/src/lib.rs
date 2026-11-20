@@ -15,7 +15,7 @@
 //!   peer add <name> <station-id>   adds a station to a peer; prints the peer as stored
 //!   peer ls                        one line per peer station
 //!   peer rm <name>                 removes a peer
-//!   send <peer> <text>             sends a message and waits for the outcome
+//!   send <peer> <text>             sends a message and waits for the outcome, at most 120 s
 //!   log [peer]                     the whole message log, oldest first
 //!   chat <peer>                    the last 50 messages of all peers, then live; each line read
 //!                                  from stdin is sent to <peer>; end of input ends the chat
@@ -28,9 +28,31 @@
 //! ([`chief::client::BindInstance`]): `status` reads the peers, `log` every page, `send` its
 //! subscription and its send, and `chat` its follower and every send through the bound client. If
 //! the station restarts in between, the next call fails before it reaches the new instance, and
-//! the command ends with exit 3 and one line, as for a lost connection: it never mixes the answers
-//! of two instances, and never sends a typed line to a station other than the one whose messages
-//! it shows. `id`, `peer ls`, `peer add` and `peer rm` make one call each and need no binding.
+//! the command ends with exit 3 and one line, as for a lost connection (`send` and `chat` add the
+//! lines below): it never mixes the answers of two instances, and never sends a typed line to a
+//! station other than the one whose messages it shows. `id`, `peer ls`, `peer add` and `peer rm`
+//! make one call each and need no binding.
+//!
+//! # send
+//!
+//! `send` reads the status, subscribes, sends the message and waits for its outcome, at most
+//! [`SEND_OUTCOME_WAIT`] (120 s). It tells three cases apart:
+//!
+//! - Delivered: `delivered to <peer>` on stdout, exit 0, also when stdout no longer takes the
+//!   line.
+//! - Not delivered, exit 1: the station refused the message (an unknown peer, an invalid body), so
+//!   nothing was sent; or the station reported that it failed (`<peer> appears offline, or has
+//!   not added you`, `<peer> refused the message`, `<peer> was removed before the message was
+//!   delivered`). When no station can be talked to before the send, the exit is 3 with one line,
+//!   and nothing was sent either.
+//! - Unknown, exit 3, with two lines on stderr. The send got no answer it could read (it timed
+//!   out, the connection broke, or the answer was nonsense): its error, then ``the message may
+//!   still have been sent; check `chief log <peer>` before sending it again``. Or the station
+//!   accepted the message and the wait then failed (the station stopped or restarted, the message
+//!   left the log before its outcome was seen, or 120 s passed): the error, or `the station did
+//!   not report the outcome within 120 s`, then ``the station accepted the message, but its
+//!   outcome is unknown; check `chief log <peer>` before sending it again``. Once the station
+//!   has accepted the message, `send` never exits 1 unless the station reported it failed.
 //!
 //! # chat
 //!
@@ -79,8 +101,9 @@
 //! # Exit codes
 //!
 //! See [`Exit`]: 0 done (for `send`: delivered); 1 the station refused or the operation failed
-//! (for `send`: not delivered); 2 usage error; 3 cannot talk to a station, or the station
-//! restarted during the command (`log`, `status`, `send`), or stopped during a `chat`.
+//! (for `send`: refused, so not sent, or failed, so not delivered); 2 usage error; 3 cannot talk
+//! to a station, or the station restarted during the command (`log`, `status`, `send`), or
+//! stopped during a `chat`; for `send` also an unknown outcome (see "send" above).
 //!
 //! # Process-global state
 //!
@@ -100,6 +123,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// How many messages `chat` shows before it goes live.
@@ -109,14 +133,20 @@ pub const CHAT_TAIL: u32 = 50;
 /// the input until there is room.
 const CHAT_QUEUE_MAX: usize = 64;
 
+/// How long `send` waits for the outcome of a message the station accepted, before it gives up
+/// with exit 3: a bound of its own, whatever the station's send deadline is.
+pub const SEND_OUTCOME_WAIT: Duration = Duration::from_secs(120);
+
 /// The text after the options in `--help`: the exit codes and where the socket is.
 pub const AFTER_HELP: &str = "\
 Exit status:
   0  done; for send: the message was delivered
-  1  the station refused or the operation failed; for send: the message was not delivered
+  1  the station refused or the operation failed; for send: the station refused the message
+     (it was not sent) or reported that it failed (it was not delivered)
   2  usage error
   3  cannot talk to a station: none is running, it speaks another API version, it stopped
-     answering, or it restarted during the command; for chat: the station stopped or restarted
+     answering, or it restarted during the command; for send: also when the outcome is unknown
+     (see chief send --help); for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
 set, otherwise station.sock in the station's data dir, $XDG_DATA_HOME/thecompany/station (or
@@ -153,6 +183,13 @@ pub enum Command {
         command: PeerCommand,
     },
     /// Send a message and wait for the outcome
+    ///
+    /// Waits at most 120 s for the outcome. Exit 0: delivered. Exit 1: the station refused the
+    /// message, so it was not sent, or reported that it failed. Exit 3 with one line: no station
+    /// could be talked to, and nothing was sent. Exit 3 with a second line: the outcome is
+    /// unknown, because the send got no answer, or because the station accepted the message and
+    /// then stopped, restarted, lost it from its log, or did not report the outcome within 120 s;
+    /// check `chief log <peer>` before sending it again.
     Send {
         /// The peer's name
         peer: String,
@@ -201,15 +238,16 @@ pub enum Exit {
     /// 0: done. For `send`: the message was delivered.
     Done,
     /// 1: the station refused or the operation failed: an unknown peer, an invalid name or body,
-    /// any error the station itself answers with. For `send`: the message was not delivered.
+    /// any error the station itself answers with. For `send`: the station refused the message (it
+    /// was not sent) or reported that it failed (it was not delivered).
     Failed,
     /// 2: a usage error, reported by clap.
     Usage,
     /// 3: cannot talk to a station: none is running, it speaks another API version, the
     /// connection broke, it did not answer in time or answered nonsense. Also when the station
     /// restarted during a command of several calls (the next call is refused before it reaches
-    /// the new instance), when a `chat` ends because the station stopped, and when no socket path
-    /// can be worked out.
+    /// the new instance), when a `chat` ends because the station stopped, when no socket path
+    /// can be worked out, and when the outcome of a `send` is unknown (see the crate docs).
     NoStation,
 }
 
@@ -297,8 +335,9 @@ pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, Str
 ///
 /// Exit codes ([`Exit`]): 0 done; 1 the station refused; 3 cannot talk to the station, which
 /// includes the bound instance being gone (the station restarted mid-command), a log cursor that
-/// does not move back ([`ApiError::BadReply`]), and a `chat` that ends because the station
-/// stopped. `chat` returns 0 at the end of `input`, after the lines read so far have been sent.
+/// does not move back ([`ApiError::BadReply`]), a `send` whose outcome is unknown (it got no
+/// answer, or the station accepted it and the wait for the outcome failed or passed
+/// [`SEND_OUTCOME_WAIT`]), and a `chat` that ends because the station stopped. `chat` returns 0 at the end of `input`, after the lines read so far have been sent.
 pub async fn run<T, I>(
     command: &Command,
     client: &Client<T>,
@@ -566,21 +605,86 @@ async fn send<T: BindInstance>(
     // Bound, so that a restart between the subscription and the send cannot send the message to
     // an instance whose outcome this command never sees.
     let instance = client.status().await?.instance_id;
-    let message = client.bound_to(&instance).send_and_wait(peer, text).await?;
-    match message.status {
-        MessageStatus::Delivered => {
-            say(out, &format!("delivered to {}", message.peer))?;
-            Ok(Exit::Done)
+    let client = client.bound_to(&instance);
+    // Subscribed before the send, so that the outcome cannot slip past (`Client::send_and_wait`
+    // in three steps, so that an error says which step it ended).
+    let mut events = client.subscribe().await?;
+    let sent = match client.send(peer, text).await {
+        Ok(sent) => sent,
+        // The call ended without an answer it could read: the station may have taken the message
+        // (rule 12 in chief::api).
+        Err(error) if unanswered(&error) => {
+            let exit = report(err, &error);
+            let _ = say(
+                err,
+                &format!(
+                    "the message may still have been sent; check `chief log {peer}` before \
+                     sending it again"
+                ),
+            );
+            return Ok(exit);
         }
-        MessageStatus::Failed { reason } => {
-            // FailReason's Display follows the peer's name: "bob appears offline, ...".
-            let _ = say(err, &format!("{} {reason}", message.peer));
-            Ok(Exit::Failed)
+        // A refusal: nothing was sent.
+        Err(error) => return Err(Stop::Api(error)),
+    };
+    // From here on the station holds the message: no error means "not delivered".
+    let waited = tokio::time::timeout(
+        SEND_OUTCOME_WAIT,
+        client.wait_for_outcome(&mut events, sent),
+    )
+    .await;
+    match waited {
+        Ok(Ok(message)) => match message.status {
+            MessageStatus::Delivered => {
+                // Delivered whether or not stdout still takes the line.
+                let _ = say(out, &format!("delivered to {}", message.peer));
+                return Ok(Exit::Done);
+            }
+            MessageStatus::Failed { reason } => {
+                // FailReason's Display follows the peer's name: "bob appears offline, ...".
+                let _ = say(err, &format!("{} {reason}", message.peer));
+                return Ok(Exit::Failed);
+            }
+            MessageStatus::Sending | MessageStatus::Received => {
+                let error = ApiError::BadReply {
+                    detail: "the send ended without an outcome".to_owned(),
+                };
+                report(err, &error);
+            }
+        },
+        // The exit is 3 whatever the error: a `MessageNotFound` here is not a refusal.
+        Ok(Err(error)) => {
+            report(err, &error);
         }
-        MessageStatus::Sending | MessageStatus::Received => Err(Stop::Api(ApiError::BadReply {
-            detail: "the send ended without an outcome".to_owned(),
-        })),
+        Err(_) => {
+            let _ = say(
+                err,
+                &format!(
+                    "the station did not report the outcome within {} s",
+                    SEND_OUTCOME_WAIT.as_secs()
+                ),
+            );
+        }
     }
+    let _ = say(
+        err,
+        &format!(
+            "the station accepted the message, but its outcome is unknown; check `chief log \
+             {peer}` before sending it again"
+        ),
+    );
+    Ok(Exit::NoStation)
+}
+
+/// Whether `error` ended a call without an answer that could be read, so that the station may
+/// have carried the call out (rule 12 in `chief::api`): [`ApiError::Timeout`],
+/// [`ApiError::Disconnected`], and [`ApiError::BadReply`], an answer that came but could not be
+/// read.
+fn unanswered(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Timeout { .. } | ApiError::Disconnected { .. } | ApiError::BadReply { .. }
+    )
 }
 
 async fn log<T: BindInstance>(
