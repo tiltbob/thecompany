@@ -257,6 +257,11 @@ impl Actor {
             return Err(no_peer(name));
         };
         let saved = self.change_book(book)?;
+        // A job that already returned was not overtaken by the removal: keep its result. Take
+        // them before closing the links, so that no result caused by the closing is kept.
+        while let Some(result) = self.jobs.try_join_next() {
+            self.completed(result);
+        }
         for id in removed {
             self.links.close_peer(id);
             self.paths.remove(&id);
