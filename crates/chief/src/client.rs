@@ -4,6 +4,13 @@
 //! local socket. [`Client`] gives any transport typed methods. A subscription is a pair made by
 //! [`subscription`]: the transport keeps the [`EventSink`] and pushes events into it; the frontend
 //! pulls them from the [`Subscription`]. The rules both sides keep are in [`crate::api`].
+//!
+//! [`SocketTransport`] (Unix) is the transport over the station's local socket; it lives in
+//! `crate::socket` with the socket's envelope. The attach order for a live view of the log is
+//! [`Client::follow_log`] in [`crate::follow`].
+
+#[cfg(unix)]
+pub use crate::socket::{DEFAULT_CALL_TIMEOUT, SocketTransport};
 
 use crate::api::{
     ApiError, Event, LogPage, Message, MessageStatus, Peer, Request, Response, Status,

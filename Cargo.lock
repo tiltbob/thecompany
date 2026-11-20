@@ -329,7 +329,9 @@ dependencies = [
 name = "chief"
 version = "0.0.0"
 dependencies = [
+ "chief",
  "numbers-base",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",
@@ -2073,6 +2075,10 @@ dependencies = [
  "chief",
  "numbers",
  "numbers-base",
+ "rustix",
+ "serde",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
