@@ -556,3 +556,51 @@ async fn a_removal_refused_before_rename_leaves_finished_jobs_to_the_next_turn()
         "refused removal timed out",
     );
 }
+
+#[tokio::test]
+async fn removal_completes_a_failed_worker_of_another_peer_that_is_not_yet_joined() {
+    checked(
+        timeout(CASE_BUDGET, async {
+            let dir = checked(tempfile::tempdir(), "create removal test directory");
+            let mut station = station(&dir.path().join("station")).await;
+            let alice = station.peer("alice").await;
+            let bob = station.peer("bob").await;
+            let bob_open = station.send("bob");
+            let bob_unanswered = station.accept(&bob, bob_open).await;
+
+            // Aborting through the handle stands in for a worker that panicked: it ends with a
+            // JoinError while its send is still pending, and nothing has joined it yet.
+            station
+                .actor
+                .pending
+                .get(&bob_open)
+                .expect("bob's send is pending")
+                .worker
+                .abort();
+            station.finished(bob_open).await;
+            station.watch();
+
+            assert!(matches!(
+                station.actor.remove_peer("alice"),
+                Ok(Response::Done)
+            ));
+
+            let no_answer = MessageStatus::Failed {
+                reason: FailReason::NoAnswer,
+            };
+            assert_eq!(station.message_event().await, (bob_open, no_answer.clone()));
+            station.peer_removed_event("alice").await;
+            station.no_event().await;
+            assert_eq!(station.status_of(bob_open), no_answer);
+            assert!(station.actor.pending.is_empty());
+            assert!(
+                station.actor.jobs.is_empty(),
+                "the failed worker was joined"
+            );
+            drop(bob_unanswered);
+            station.shut_down(vec![alice, bob]).await;
+        })
+        .await,
+        "failed worker of another peer at removal timed out",
+    );
+}
