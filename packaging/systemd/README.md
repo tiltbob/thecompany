@@ -22,10 +22,15 @@ before the first start anyway, and the tower takes the config path from `ExecSta
 The service runs as a user that systemd allocates when it starts (`DynamicUser=yes`). It sees
 the file system read-only, except its state directory and a private `/tmp`, and no home
 directories. `StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
-`/var/lib/private/numbers-tower`; systemd gives that directory to the service's user and sets
-its mode to 0700 at every start (`StateDirectoryMode=0700`). `/var/lib/private` is accessible to root only. The ACME cache
-holds the tower's TLS key and its ACME account key: the tower creates it with mode 0700 and
-refuses to start with a cache that the group or others can access.
+`/var/lib/private/numbers-tower`, which only root can reach from outside the service. At every
+start systemd makes that directory and everything in it the service user's own, and sets the
+directory's mode to 0700 (`StateDirectoryMode=0700`).
+
+The ACME cache holds the tower's TLS key and its ACME account key. The tower creates it with
+mode 0700, and refuses to start with a cache that the group or others can access, that another
+user owns, or that it cannot write. Under this unit, with `cache_dir` in the state directory,
+systemd's ownership and mode keep those checks passing; they matter if `cache_dir` points
+elsewhere.
 
 ## Install
 
@@ -95,11 +100,11 @@ journalctl -u numbers-tower -o cat -f
 
 `-o cat` shows the tower's own lines only: journald's usual prefix holds this machine's host
 name. The tower's log lines start with its own timestamp (UTC), left out below; its `tower: …`
-error lines have none. The start line gives the bound addresses, the number of listed ids and
-where the certificate comes from:
+error lines have none. The start line gives the ports of the listeners (`off` for one that is
+off), the number of listed ids (or `open`) and where the certificate comes from:
 
 ```text
-INFO numbers_tower::cli: tower listening https=0.0.0.0:443 http=0.0.0.0:80 qad=0.0.0.0:7842 access=3 ids listed certificate="acme staging"
+INFO numbers_tower::cli: tower listening https=443 http=80 qad=7842 access=3 ids listed certificate="acme staging"
 ```
 
 With staging it is followed by:
@@ -108,22 +113,69 @@ With staging it is followed by:
 WARN numbers_tower::cli: the certificate comes from Let's Encrypt's staging directory, which stations do not trust; set `production = true` in `[acme]` for a real one
 ```
 
-The ACME client reports two things, without detail:
+The ACME client's progress comes as four fixed lines, without detail:
 
 ```text
 INFO numbers_tower::cli: ACME: a certificate is in use
-WARN numbers_tower::cli: ACME: a certificate step failed; the tower retries with a growing delay
 ```
 
-If the relay stops by itself, the tower logs `tower: the tower's relay stopped by itself` and
-exits with a failure; `Restart=on-failure` starts it again after 5 seconds. `systemctl stop`
-ends it with success, and it stays stopped. A config error also ends the tower with one
-`tower: …` line. It quotes nothing from the files: a syntax error, an unknown key or a value
-of the wrong form gives the line number in the config file, and a missing key names the key.
-systemd then tries again every 5 seconds until the config is fixed.
+The tower serves a certificate; nothing to do.
 
-The tower logs no host name, endpoint id or path, on purpose: logs get copied into issues and
-chats. To see which host or file a problem is about, look at the config.
+```text
+WARN numbers_tower::cli: ACME: a certificate order failed; the tower retries with a growing delay
+```
+
+Let's Encrypt did not issue the certificate. Check that the host name resolves to this host
+and that port 443 is reachable from the internet; the tower keeps trying.
+
+```text
+WARN numbers_tower::cli: ACME: the cache directory could not be read or written; certificates are not kept across restarts
+```
+
+The state directory is not usable. With this unit and the config above that should not
+happen: check whether the unit or `cache_dir` was changed. Until it is fixed, every restart
+orders a new certificate, and Let's Encrypt's rate limits soon stop that.
+
+```text
+WARN numbers_tower::cli: ACME: a certificate step failed
+```
+
+Another step failed. If it repeats and no certificate comes into use, check the host name, the
+contact address and port 443.
+
+## When the tower stops
+
+`systemctl stop` ends the tower with success, and it stays stopped. An error ends it with a line
+that starts with `tower: `, and with an exit status that decides what systemd does next.
+
+Errors that can pass exit with status 1, and `Restart=on-failure` starts the tower again after 5
+seconds: a port that is taken or not allowed (`tower: cannot bind the HTTPS listener (…)`), the
+relay stopping by itself (`tower: the tower's relay stopped by itself`), and certificate files
+that cannot be read, which can be a renewal in progress.
+
+A configuration error exits with status 78: the config file or the allow file, a value in them
+that the tower refuses, or an ACME cache directory that it refuses. A wrong command line exits
+with status 2.
+`RestartPreventExitStatus=2 78` keeps systemd from restarting it: the service ends as failed.
+`systemctl enable --now` has already returned by then, so check:
+
+```bash
+systemctl status numbers-tower
+```
+
+It shows `Active: failed (Result: exit-code)` and `(code=exited, status=78)`; the journal has
+the `tower: …` line. A config error quotes nothing from the files: a syntax error, an unknown
+key or a value of the wrong form gives the line number in the config file, a missing key
+names the key, and a file that cannot be read says which file and why. A command-line error is
+one fixed line and a pointer to `tower --help`, and never shows what was typed. Fix the config
+or the unit, then:
+
+```bash
+sudo systemctl restart numbers-tower
+```
+
+The tower logs no host name, address, endpoint id or path, on purpose: logs get copied into
+issues and chats. To see which host or file a problem is about, look at the config.
 
 ## Ports
 
