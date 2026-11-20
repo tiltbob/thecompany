@@ -42,5 +42,16 @@ ProtectSystem=strict
 ProtectHome=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
+# Kernel variables in /proc/sys, /sys and a few other /proc files are read-only for the
+# service; reading them still works.
+ProtectKernelTunables=yes
+# No loading or unloading of kernel modules, and /usr/lib/modules is inaccessible.
+ProtectKernelModules=yes
+# No reading of or writing to the kernel log buffer (syslog(2), /dev/kmsg, /proc/kmsg). The
+# tower logs to stderr, which this does not touch.
+ProtectKernelLogs=yes
+# The control group tree under /sys/fs/cgroup is read-only for the service.
+ProtectControlGroups=yes
+
 [Install]
 WantedBy=multi-user.target
