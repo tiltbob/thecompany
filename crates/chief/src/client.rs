@@ -368,9 +368,10 @@ impl<T: Transport> Client<T> {
     /// a subscription that ends first. Other errors of the calls are passed through.
     ///
     /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
-    /// [`crate::api`]). In the one remaining corner, a [`Event::Resync`] that hides that event for a
-    /// message that has left the log, the re-read gives [`ApiError::MessageNotFound`], which is
-    /// returned.
+    /// [`crate::api`]), and an outcome that arrives as an event is returned. But every
+    /// [`Event::Resync`] makes it re-read the message, and once the message has left the log that
+    /// re-read gives [`ApiError::MessageNotFound`], which is returned: whether or not the gap hid
+    /// the outcome's event, and also when the outcome has not happened yet.
     ///
     /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
     /// call in a timeout.
