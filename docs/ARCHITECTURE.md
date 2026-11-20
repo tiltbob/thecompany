@@ -144,18 +144,31 @@ A tower embeds an `iroh-relay` server. Every node keeps a connection to one towe
 by id through the towers, and iroh moves the connection to a direct path when it can. When that
 tower dies, iroh moves the node to another tower only after about two net reports (41–49 s), and a
 connection relayed through the dead tower does not move: it ends at the idle timeout and is dialed
-again. So a station watches its home tower and, when it has none or the tower is not connected,
-removes and re-inserts the tower, which makes iroh probe at once (decided in #74, built in #78).
+again. So a station watches its home tower (below).
 
 - **SRV only bootstraps.** A newcomer resolves `_numbers._tcp.<domain>` (SRV) to
   `https://target:port` to reach its first tower; `--tower <url>` does the same by hand for
   development and tests. A node that is already on the network finds towers and other nodes through
-  the network first, in this order: paths and addresses it already holds; what the network tells it —
-  the tower set (remembered across restarts, passed on by peers, and from M3 a signed roster
-  statement carried in invites) and other nodes' signed address records, which any connected node
-  can pass on; then every tower in the known set; and only then the SRV record again. A changed SRV
-  record therefore matters to newcomers and to a node that has lost every tower, not to a running
-  network.
+  the network first, in this order: paths and addresses it already holds; what the network tells it,
+  which is other nodes' signed address records, passed on by any connected node, and from M3 a
+  signed roster statement carried in invites; then every tower in its own set, which is the towers
+  it was configured with and the ones it remembered across restarts; and only then the SRV record
+  again. A changed SRV record therefore matters to newcomers and to a node that has lost every
+  tower, not to a running network.
+- **Towers named by a peer are candidates, not part of the set.** Stations exchange their working
+  tower sets over an established link. What a peer sends is checked, kept as candidates with the
+  peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
+  and never passes one on; a chief may take one into the set with an explicit command (decided in
+  #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
+- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
+  tower that is not connected, for some seconds, and never while the home tower is connected. Then
+  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
+  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+  is taken out of the relay map only if another tower of the set is not marked denied; if it is
+  the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
+  does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
+  only when the set changes or at a long interval. The station limits its own attempts; it does not
+  control iroh's own retries (decided in #74, built in #78).
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
@@ -478,14 +491,15 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   second tower down as well, 18–24 s waiting and 0.4–0.8 s with the remove and insert. Under heavy
   load an endpoint occasionally missed its first report and came online only after 21–24 s.
   `home_relay_status()` lists the home tower only. After the home tower stopped, an endpoint moved
-  to the second tower after 41–49 s, because the report after a successful one probes nothing
+  to the second tower after 41–49 s, because the report after a successful one plans no HTTPS probe
   (`ProbePlan::with_last_report`); `network_change()` did not help, QAD (TLS towers) made it
   22–28 s, and removing and re-inserting the dead tower made it 0.2–0.4 s (observed, not
   documented). Home moves back to a recovered tower only if it is clearly faster (hysteresis; 6 of
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  changed nothing. A tower that denies an endpoint can still become its home when another tower is
+  took it out of the map but left the home connection and the status as they were. A tower that
+  denies an endpoint can still become its home when another tower is
   in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
@@ -516,8 +530,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   name and its records at debug level. A fresh `n0_dns_resolver` builder has no public
   fallback; `iroh::dns::DnsResolver::with_nameserver` keeps one, so iroh's resolver for the tower
   host names is built with `.disable_fallback()`. `https://host.:port/` works but is a different
-  `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. From SRV to an
-  endpoint online through a TLS tower named by the record took 227–284 ms.
+  `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. An endpoint
+  bound with the URLs from the SRV answer came online through a TLS tower named by the record in
+  227–284 ms (bind to online; the lookup was done before the timed part).
 - **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
   `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed

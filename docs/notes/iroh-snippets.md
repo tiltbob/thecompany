@@ -491,8 +491,11 @@ impl AccessControl for Members {
   other in 215–301 ms; `insert_relay` of the admitting tower while homed on the denying one did not
   help (2 of 15 online in about 220 ms, 4 after 46–50 s, 9 not within 60 s) (observed, not
   documented). What a station does on `auth_denied_reason()` is decided in #74: it marks the
-  tower as denied and shows the reason, takes it out of the relay map when another tower of the
-  set is left, and otherwise changes nothing and does not nudge.
+  tower as denied and shows the reason. It takes the tower out of the relay map only if another
+  tower of the set is not marked denied. If it is the only tower, or every tower denies, the
+  station changes nothing in the map, does not nudge and does not ask DNS because of the denial.
+  Putting a denied tower back and asking DNS again happen only when the set changes or at a long
+  interval: the station limits its own attempts, not iroh's own retries, which go on.
 - **Changing the list.** Removing an id does not end its open relay connection. The service handle
   does:
   ```rust
@@ -590,15 +593,16 @@ pub async fn lookup(
   it). The resolver logs each name and its records with `debug!`, so a binary that lets debug
   through for `n0_dns_resolver` writes the domain and the tower names to its log.
 - Measured, the whole chain (SRV, tower URLs, an endpoint with `iroh_resolver` on the same server,
-  TLS towers whose certificates name the targets): online in 227–284 ms; the endpoint sent only
-  A and AAAA queries for the targets.
+  TLS towers whose certificates name the targets): bind to online in 227–284 ms, with the SRV
+  lookup done before the timed part; the endpoint sent only A and AAAA queries for the targets.
 - **Trailing dot.** `https://a.example.test.:<port>/` also works (TLS verified against a
   certificate for `a.example.test`, online 225–270 ms), but it is a different `RelayUrl` from the
   form without the dot: two keys for one tower. Canonical form: no trailing dot, for SRV, `--tower`
   and tower sets alike; with the default `ndots = 1` a name with dots is tried as absolute first
   (source reading; system configuration not tested).
 - Priority and weight are ignored. SRV carries no QAD port, so SRV-located towers get QAD on UDP
-  7842; a tower that does not serve it costs every station 3 s at each first report (above).
+  7842; a tower that does not serve it costs every endpoint that runs QAD 3 s at each first report
+  (above). Relay-only endpoints and hosts with only loopback run no QAD and pay nothing.
 - SRV only bootstraps. Tower sets passed on by peers are exchanged and shown, never used
   automatically (#73). Recovering a lost tower is the station watchdog of #74.
 
@@ -616,16 +620,20 @@ let removed = ep.remove_relay(&tower_url).await;
 - Measured: with two towers up, bind → online median 264–423 ms; with one up and one down at start,
   420–495 ms. With both down and one up 3 s later, online 17.9–23.5 s after it was up; with
   `remove_relay` + `insert_relay` of it, 415–818 ms (observed, not documented).
-- **Failover is slow.** After a successful report the next one probes nothing:
+- **Failover is slow.** After a successful report the next one plans no HTTPS probe:
   `ProbePlan::with_last_report` returns an empty plan when the last report had latencies, and an
   empty report keeps the old home (`handle_net_report_report`). Only the second report after the
-  failure probes again. Measured after the home tower stopped: connected to the other tower after
+  failure probes over HTTPS again. QAD probes have a plan of their own and run in every report,
+  which is why towers with QAD moved sooner. Measured after the home tower stopped: connected to
+  the other tower after
   41.0–48.7 s; with `network_change()` 1 s after the stop 41.9–49.1 s (no help); with
   `remove_relay` + `insert_relay` of the dead tower 1 s after the stop 1.22–1.44 s; with TLS towers
   and QAD (QAD probes run in every report) 22.0–27.5 s, and 44.9–46.5 s in a namespace where QAD
   does not run. Meanwhile the status shows the dead tower, not connected, `last_error` "Failed to
-  connect to relay server". A station watches for this and nudges (decided in #74, built in
-  #78).
+  connect to relay server". A station watches for this (decided in #74, built in #78): only after
+  it has seen no home tower, or a home tower that is not connected, for some seconds, it removes
+  and re-inserts the tower, at a growing, capped interval, and never while the home tower is
+  connected.
 - **Hysteresis.** A new home must measure under 2/3 of the old one's latency. After the stopped
   tower came back, home moved back to it within 50 s in 6 of 25 runs; on loopback this is noise.
 - **An open relayed connection does not move.** When the tower carrying its selected path stopped,
@@ -639,7 +647,9 @@ let removed = ep.remove_relay(&tower_url).await;
 - **Runtime changes** (observed, not documented). `insert_relay` returned in 0–4 ms and moved the
   home to the new tower when it measured faster (about half the runs); open connections were not
   disturbed. `remove_relay` of the home tower with another in the map: on the other in 220–244 ms.
-  `remove_relay` of the **only** tower does nothing: still connected, `online()` still resolves.
-  Inserting a URL that is already there returns `Some(previous)` and changes nothing. A connection
+  `remove_relay` of the **only** tower takes it out of the shared map, but the home connection
+  and the status did not change: still connected, `online()` still resolves. `insert_relay` of a
+  URL that is already there replaces its configuration and returns `Some(previous)`; the home
+  connection and the status did not change either. A connection
   whose path runs through a removed tower kept working, and a new dial to a peer reachable only
   through that tower still connected (2–10 ms).
