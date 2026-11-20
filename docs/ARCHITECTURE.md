@@ -179,6 +179,8 @@ again. So a station watches its home tower (below).
   Towers do not forward to each other, so a dialer reaches a peer only through a tower both of them
   can reach; all nodes therefore use the same small set (two or three). SRV priority and weight are
   ignored.
+  `TowerSet` caps the set at eight unique canonical URLs. Each `TowerEntry` carries its own QAD
+  setting and defaults to UDP 7842 for HTTPS or QAD off for plain HTTP.
 - **Not an open relay.** A production tower relays only for listed node ids and rate-limits each
   client: a static list in M2, fed from the roster in M3 (verifiable against the genesis hash, no
   secret). The list covers relaying only: an unlisted node can still use the tower's address
@@ -435,6 +437,8 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
+  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
+  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
@@ -516,8 +520,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `is_relay()`, `is_ip()`, `is_selected()`. On one host a connection starts on the relay and selects
   the direct path 33–47 ms after `connect()` starts.
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
-  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket path is limited to
-  108 bytes on Linux, 104 on Apple. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
+  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket address holds
+  108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107
+  or 103 bytes. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
   stream type and does not propagate cancellation, hence the pull-style `Subscription::next()`.
 - **Bootstrap (M2).** The record is SRV (decision 13, settled in #38); it was measured against a
   DNS server on 127.0.0.1. `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
@@ -533,6 +538,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. An endpoint
   bound with the URLs from the SRV answer came online through a TLS tower named by the record in
   227–284 ms (bind to online; the lookup was done before the timed part).
+  Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
+  DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
+  requires a literal loopback address.
 - **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
   `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed

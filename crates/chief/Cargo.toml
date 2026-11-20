@@ -5,12 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# `chief::fake`: an in-memory station for tests of transports, the socket server and frontends.
+# Off by default; nothing that ships enables it.
+fake = []
+
 [dependencies]
 numbers-base.workspace = true
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["sync"] }
+serde_json.workspace = true
+# `net`, `io-util`, `time` and `rt` for the socket transport (`chief::socket`); never `process`.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+# The crate itself with the fake station, for its integration tests.
+chief = { workspace = true, features = ["fake"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 

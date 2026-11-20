@@ -16,8 +16,9 @@ pub mod towers;
 
 pub use bootstrap::{DnsLocator, LocateError, LocateFuture, Locator};
 pub use endpoint::{
-    Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+    DnsConfig, Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+    TlsRoots,
 };
 pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
 pub use identity::{NodeId, generate_node_key, node_id};
-pub use towers::{TowerSet, TowerSetError};
+pub use towers::{MAX_TOWERS, Qad, TowerEntry, TowerSet, TowerSetError, canonical_tower_url};

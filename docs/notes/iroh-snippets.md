@@ -600,6 +600,8 @@ pub async fn lookup(
   form without the dot: two keys for one tower. Canonical form: no trailing dot, for SRV, `--tower`
   and tower sets alike; with the default `ndots = 1` a name with dots is tried as absolute first
   (source reading; system configuration not tested).
+- Use `numbers::canonical_tower_url` and `TowerEntry::from_url` in production to apply the same
+  validation to explicit, SRV, remembered and peer-supplied URLs.
 - Priority and weight are ignored. SRV carries no QAD port, so SRV-located towers get QAD on UDP
   7842; a tower that does not serve it costs every endpoint that runs QAD 3 s at each first report
   (above). Relay-only endpoints and hosts with only loopback run no QAD and pay nothing.
