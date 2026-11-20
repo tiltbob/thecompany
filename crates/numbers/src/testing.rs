@@ -51,7 +51,8 @@ struct State {
 ///
 /// It binds UDP on a free port and serves until it is dropped. A name it does not know gets
 /// NXDOMAIN. Names are compared in lower case and without a trailing dot. Every record it returns
-/// has a TTL of 300 seconds. It needs a tokio runtime with IO enabled.
+/// has a TTL of 300 seconds. It serves UDP only: the TCP query a resolver adds after 900 ms of UDP
+/// silence finds nothing listening and is refused. It needs a tokio runtime with IO enabled.
 pub struct FakeDns {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -226,5 +227,5 @@ fn handle(bytes: &[u8], state: &mut State) -> Option<Vec<u8>> {
             }
         }
     }
-    reply.build_bytes_vec().ok()
+    reply.build_bytes_vec_compressed().ok()
 }

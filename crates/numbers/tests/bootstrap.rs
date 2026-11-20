@@ -7,7 +7,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use numbers::bootstrap::{DEFAULT_LOCATE_TIMEOUT, SRV_SERVICE, srv_name, towers_from_srv};
+use numbers::bootstrap::{
+    DEFAULT_LOCATE_TIMEOUT, MAX_LOCATED_TOWERS, SRV_SERVICE, srv_name, towers_from_srv,
+};
 use numbers::testing::FakeDns;
 use numbers::{DnsLocator, LocateError, LocateFuture, Locator, TowerSet};
 use tokio::time::timeout;
@@ -96,6 +98,117 @@ fn srv_name_refuses_what_is_not_a_domain() {
             "accepted {bad:?}"
         );
     }
+}
+
+/// A domain of exactly `len` characters under `example.test`, in labels of at most 63.
+fn domain_of_len(len: usize) -> String {
+    let suffix = ".example.test";
+    let mut rest = len - suffix.len();
+    let mut labels = Vec::new();
+    while rest > 0 {
+        // A label of n characters and its dot take n + 1; the last one has no dot.
+        let take = rest.min(63);
+        let take = if rest - take == 1 { take - 1 } else { take };
+        labels.push("a".repeat(take));
+        rest -= take;
+        rest = rest.saturating_sub(1); // the dot before the next label
+    }
+    let domain = format!("{}{suffix}", labels.join("."));
+    assert_eq!(domain.len(), len);
+    domain
+}
+
+#[test]
+fn srv_name_length_boundary() {
+    // 253 characters without the final dot, less the 14 of `_numbers._tcp.`, leaves 239.
+    assert_eq!(SRV_SERVICE.len() + 1, 14);
+    let longest = domain_of_len(239);
+    let name = srv_name(&longest).unwrap();
+    assert_eq!(name.len(), 254); // 253 and the final dot
+    assert_eq!(srv_name(&format!("{longest}.")).unwrap(), name);
+    let too_long = domain_of_len(240);
+    assert!(matches!(
+        srv_name(&too_long),
+        Err(LocateError::InvalidDomain)
+    ));
+    assert!(matches!(
+        srv_name(&format!("{too_long}.")),
+        Err(LocateError::InvalidDomain)
+    ));
+    // The 63-character label rule still holds inside a short name.
+    assert!(srv_name(&format!("{}.test", "a".repeat(63))).is_ok());
+    assert!(srv_name(&format!("{}.test", "a".repeat(64))).is_err());
+}
+
+#[tokio::test]
+async fn locate_longest_domain_through_the_resolver() {
+    bounded(TEST_TIMEOUT, async {
+        let (dns, locator) = server().await;
+        let longest = domain_of_len(239);
+        let srv = format!("_numbers._tcp.{longest}");
+        dns.set_srv(&srv, &[("a.example.test", 443)]);
+        assert_eq!(
+            locator.locate(&longest).await.unwrap(),
+            ["https://a.example.test/"]
+        );
+        assert_eq!(dns.query_count_for(&srv, "SRV"), 1);
+        assert_eq!(dns.query_count(), 1);
+    })
+    .await;
+}
+
+/// `n` distinct targets `t0.example.test` and on, all on port 443.
+fn targets(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("t{i}.example.test")).collect()
+}
+
+#[tokio::test]
+async fn locate_accepts_eight_towers() {
+    bounded(TEST_TIMEOUT, async {
+        assert_eq!(MAX_LOCATED_TOWERS, 8);
+        let (dns, locator) = server().await;
+        let names = targets(8);
+        let records: Vec<(&str, u16)> = names.iter().map(|t| (t.as_str(), 443)).collect();
+        dns.set_srv(SRV, &records);
+        assert_eq!(locator.locate(DOMAIN).await.unwrap().len(), 8);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn locate_refuses_nine_towers() {
+    bounded(TEST_TIMEOUT, async {
+        let (dns, locator) = server().await;
+        let names = targets(9);
+        let records: Vec<(&str, u16)> = names.iter().map(|t| (t.as_str(), 443)).collect();
+        dns.set_srv(SRV, &records);
+        let err = locator.locate(DOMAIN).await.unwrap_err();
+        assert!(matches!(err, LocateError::TooManyTowers), "{err:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn locate_counts_towers_after_removing_duplicates_and_unusable() {
+    bounded(TEST_TIMEOUT, async {
+        let (dns, locator) = server().await;
+        let names = targets(8);
+        // 13 records: the 8 towers, then a duplicate, two spellings of a duplicate, the root
+        // target and a target that is not a host name. They come down to the 8.
+        let mut records: Vec<(&str, u16)> = names.iter().map(|t| (t.as_str(), 443)).collect();
+        records.extend([
+            ("t0.example.test", 443),
+            ("T1.EXAMPLE.TEST.", 443),
+            ("t2.example.test.", 443),
+            (".", 443),
+            ("-bad.example.test", 443),
+        ]);
+        dns.set_srv(SRV, &records);
+        let towers = locator.locate(DOMAIN).await.unwrap();
+        assert_eq!(towers.len(), 8);
+        assert_eq!(towers[0], "https://t0.example.test/");
+    })
+    .await;
 }
 
 #[test]
@@ -347,6 +460,7 @@ async fn errors_and_debug_do_not_echo_names() {
         );
         errors.push(srv_name(&format!("{MARKER} .test")).unwrap_err());
         // The variants that a fake server cannot easily produce here.
+        errors.push(LocateError::TooManyTowers);
         errors.push(LocateError::Timeout);
         errors.push(LocateError::Resolver);
 
