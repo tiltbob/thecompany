@@ -85,10 +85,12 @@
 //!    [`MessageStatus::Delivered`] (a station of the peer acknowledged it), or
 //!    [`MessageStatus::Failed`] with [`FailReason::NoAnswer`] (no answer before the send
 //!    deadline), [`FailReason::Refused`] (a station of the peer refused it) or
-//!    [`FailReason::PeerRemoved`] (the peer was removed first). If the message has left the log
-//!    before its outcome (rule 1; only when 1,000 newer messages entered the log first), no event
-//!    follows. A final status never changes. A client accepts a final status already in the answer
-//!    to `Send`.
+//!    [`FailReason::PeerRemoved`] (the peer was removed first). The station always pushes that one
+//!    event, with the whole message at rev 1 and its final status, also when the message has left
+//!    the log meanwhile (rule 1; only when 1,000 newer messages entered the log first); the log then
+//!    no longer holds it, and [`Request::Message`] for its `seq` gives
+//!    [`ApiError::MessageNotFound`]. A final status never changes. A client accepts a final status
+//!    already in the answer to `Send`.
 //! 8. **Incoming messages.** The station logs a message from a peer as [`Direction::Incoming`] with
 //!    [`MessageStatus::Received`] and rev 0, with [`Message::at_ms`] set to the time it arrived, and
 //!    pushes its event. The station remembers the newest [`RECEIPT_WINDOW`] accepted messages by
@@ -132,6 +134,10 @@ use std::fmt;
 /// `#[serde(default)]`, so that code which knows it also reads JSON without it. A new variant of
 /// any enum, a renamed, removed or retyped field, and a new required field all change
 /// `API_VERSION`.
+///
+/// Version 1 is not final until the first station that implements it is released with M1. Until
+/// then its rules are being completed, and clarifications of them do not change the number; from
+/// that release on, the rule above applies as written.
 pub const API_VERSION: u32 = 1;
 
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
