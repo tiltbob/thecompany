@@ -84,8 +84,12 @@ async fn chat_from_a_removed_peer_is_refused_and_not_logged() {
     assert_eq!(chat.peer.as_ref(), "peer");
 
     // Change the book as `remove_peer` does, but leave the link open: the queued chat reaches the
-    // actor after the removal, and its reply must still reach the sender to be observed.
-    checked(actor.change_book(PeerBook::new()), "remove the peer");
+    // actor after the removal, and its reply must still reach the sender to be observed. The
+    // station is listed again under another name, so knowing the station is not enough.
+    checked(
+        actor.change_book(PeerBook::from([("renamed".to_owned(), vec![peer_id])])),
+        "remove the peer",
+    );
     actor.incoming_chat(chat);
 
     let reply: ChatReply = read(&mut recv).await;
