@@ -11,6 +11,7 @@ use super::*;
 mod book_rules;
 mod delivery_deadline;
 mod incoming_chat;
+mod send_rules;
 
 async fn queued_event(events: &mut Subscription) -> Option<Event> {
     tokio::select! {
