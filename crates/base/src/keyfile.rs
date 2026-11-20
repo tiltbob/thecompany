@@ -50,8 +50,8 @@ const DIRECTORY_DESCRIPTOR_LABEL: &str = "<directory descriptor>";
 
 /// Why a private directory or a key file was refused or could not be used.
 ///
-/// Errors identify the path involved. For [`load_or_create_key_in`], they identify the filename or
-/// the directory descriptor. No variant holds key bytes.
+/// Errors identify the path involved. For [`load_or_create_key_in`], they identify a bare
+/// filename or the directory descriptor. No variant holds key bytes.
 #[derive(Debug)]
 pub enum PrivatePathError {
     /// The file or directory belongs to another user.
@@ -304,9 +304,13 @@ pub fn load_or_create_key<const N: usize>(
 /// such as locking the station's data directory, is tied to that same directory descriptor.
 ///
 /// `dir` must be a directory owned by the effective user with no group or other permission bits.
-/// Open it for reading so it can be synced after creating a key. `name` must be one bare filename
-/// without separators or NUL bytes. All file operations use `dir`, even if the path used to open it
-/// has since changed. Errors identify only the filename or the directory descriptor.
+/// Open it for reading so it can be synced. If the key is missing, the directory is synced before
+/// calling `generate`, and again after publication so the new entry survives a crash. A later I/O
+/// error can still leave a complete key behind, as in [`create_key_file`].
+///
+/// `name` must be one bare filename without separators or NUL bytes. All file operations use `dir`,
+/// even if the path used to open it has since changed. Errors identify only a bare filename or the
+/// directory descriptor.
 ///
 /// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`].
 pub fn load_or_create_key_in<const N: usize>(
@@ -348,6 +352,11 @@ fn load_or_create_in<const N: usize>(
         Ok(key) => return Ok(loaded(key)),
         Err(PrivatePathError::NotFound { .. }) => {}
         Err(e) => return Err(e),
+    }
+    // A caller-supplied descriptor can allow relative opens yet fail to sync, for example O_PATH.
+    if dir_path.is_none() {
+        dir.sync_all()
+            .map_err(|error| io_error(Path::new(DIRECTORY_DESCRIPTOR_LABEL), error))?;
     }
     let key = generate();
     match create_in(dir, dir_path, path, name, &key, write_all) {
@@ -533,12 +542,11 @@ fn create_in(
     key: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
 ) -> Result<(), PrivatePathError> {
-    // The optional directory path is for diagnostics only. A descriptor-only call identifies
-    // staging failures by the requested filename.
+    // Include the directory path in diagnostics when the caller supplied one.
     let dir_label = dir_path.unwrap_or(Path::new(DIRECTORY_DESCRIPTOR_LABEL));
     let stage_label = |staged: &OsStr| match dir_path {
         Some(dir_path) => dir_path.join(staged),
-        None => path.to_path_buf(),
+        None => PathBuf::from(staged),
     };
     // An entry under a staging name proves nothing about who made it (any file name is a valid key
     // name), so a taken name is skipped, never removed. Only the name this call created is
@@ -1025,6 +1033,17 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("staging"), "{err}");
+
+        let dir = File::open(&base).unwrap();
+        let err = load_or_create_key_in(&dir, OsStr::new("node.key"), || *KEY).unwrap_err();
+        assert!(matches!(
+            &err,
+            PrivatePathError::Io { path, source }
+                if path == Path::new("<directory descriptor>")
+                    && source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!err.to_string().contains(base.to_string_lossy().as_ref()));
+        assert!(!base.join("node.key").exists());
         for t in &taken {
             assert_eq!(fs::read(t).unwrap(), b"taken");
         }
@@ -1475,6 +1494,8 @@ mod tests {
         symlink(&original, &alias).unwrap();
         let dir = File::open(&alias).unwrap();
 
+        // This fixture checks rename and retargeting of the original path. The absence of
+        // descriptor-to-path reconstruction is an implementation property checked in review.
         fs::rename(&original, &moved).unwrap();
         fs::remove_file(&alias).unwrap();
         symlink(&replacement, &alias).unwrap();
@@ -1502,6 +1523,43 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.origin, KeyOrigin::Loaded);
         assert!(loaded.key == created.key);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn unsyncable_directory_handle_refuses_creation_before_generation() {
+        let (_t, base) = tmp();
+        let dir = File::from(
+            rustix::fs::open(
+                &base,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let name = OsStr::new("node.key");
+        let error = load_or_create_key_in::<32>(&dir, name, || {
+            panic!("a descriptor that cannot sync must fail before generation")
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PrivatePathError::Io { path, source }
+                if path == Path::new("<directory descriptor>")
+                    && source.raw_os_error() == Some(Errno::BADF.raw_os_error())
+        ));
+        assert!(
+            entries(&base).is_empty(),
+            "no key or staging file was created"
+        );
+
+        create_key_file(&base.join(name), KEY).unwrap();
+        let existing = load_or_create_key_in::<32>(&dir, name, || {
+            panic!("loading the existing key needs no generator or sync")
+        })
+        .unwrap();
+        assert_eq!(existing.origin, KeyOrigin::Loaded);
+        assert!(existing.key == *KEY);
     }
 
     #[test]

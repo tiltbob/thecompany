@@ -78,11 +78,13 @@ async fn status_has_the_ids_and_one_tower() {
     let status = client(&fake).status().await.unwrap();
     assert_eq!(status.station_id, ME);
     assert_eq!(status.instance_id, "INSTANCE-1");
+    assert_eq!(status.bootstrap_domain, None);
     assert_eq!(
         status.towers,
         vec![TowerStatus {
             url: FAKE_TOWER_URL.into(),
-            state: TowerState::Connecting
+            state: TowerState::Connecting,
+            source: None,
         }]
     );
 }
@@ -95,6 +97,17 @@ async fn a_tower_change_pushes_the_whole_status() {
     fake.set_tower_state(TowerState::Connected);
     let status = c.status().await.unwrap();
     assert_eq!(status.towers[0].state, TowerState::Connected);
+    assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+}
+
+#[tokio::test]
+async fn standby_passes_through_the_fake() {
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_tower_state(TowerState::Standby);
+    let status = c.status().await.unwrap();
+    assert_eq!(status.towers[0].state, TowerState::Standby);
     assert_eq!(queued(&mut events), vec![Event::Status { status }]);
 }
 
