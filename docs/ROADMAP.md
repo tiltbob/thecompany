@@ -276,6 +276,7 @@ tower carries its source (`configured`, `remembered`, `srv`, `peer`). `Status` c
 domain, and the API carries the candidates with the peer's name. `chief status` prints all of it,
 with control characters in peer and tower text replaced with spaces, and whether each peer is
 relayed or direct, as in M1.
+The station caps each cleaned tower error or denial reason at 1,024 UTF-8 bytes before it reports it.
 
 **CLI surface**
 
