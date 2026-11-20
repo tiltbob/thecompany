@@ -3,9 +3,10 @@
 //! that transport, server and frontend tests trust. Nothing sleeps or touches the network.
 
 use chief::api::*;
-use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription};
+use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
 use chief::fake::*;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1619,4 +1620,427 @@ async fn the_largest_incoming_messages_the_fixtures_accept_fit_a_page() {
         }
     }
     assert_eq!(seen, (1..=40).collect::<Vec<_>>());
+}
+
+const CANDIDATE_A: &str = "https://xn--bcher-kva.synthetic.invalid/";
+const CANDIDATE_B: &str = "https://tower-b.synthetic.invalid/";
+const TYPED_CANDIDATE_A: &str = "HTTPS://Bücher.SYNTHETIC.INVALID.:443";
+
+fn domain_backed() -> (FakeStation, Client<FakeStation>) {
+    let fake = FakeStation::new_domain_backed(ME, "INSTANCE-1", "team.synthetic.invalid");
+    let c = client(&fake);
+    (fake, c)
+}
+
+#[tokio::test]
+async fn candidates_replace_the_whole_logical_peer_set_only_on_valid_delivery() {
+    let (fake, c) = with_peers().await;
+    c.peer_add("bob", "STATION-B2").await.unwrap();
+    let before = c.status().await.unwrap();
+    let mut events = c.subscribe().await.unwrap();
+    assert_eq!(
+        c.tower_candidates(None, 1).await.unwrap().next_after_peer,
+        None
+    );
+    assert!(matches!(
+        fake.receive_tower_candidates("unknown", "STATION-B", &[CANDIDATE_A]),
+        Err(ApiError::PeerNotFound { .. })
+    ));
+    assert!(
+        fake.receive_tower_candidates("alice", "STATION-B", &[CANDIDATE_A])
+            .is_err()
+    );
+
+    fake.receive_tower_candidates("bob", "STATION-B", &[CANDIDATE_B, CANDIDATE_A])
+        .unwrap();
+    let page = c.tower_candidates(None, 32).await.unwrap();
+    assert_eq!(
+        page.groups,
+        vec![TowerCandidateGroup {
+            peer: "bob".into(),
+            candidates: vec![
+                TowerCandidate {
+                    url: CANDIDATE_B.into()
+                },
+                TowerCandidate {
+                    url: CANDIDATE_A.into()
+                }
+            ],
+        }]
+    );
+    assert_eq!(page.next_after_peer, None);
+
+    let over_count = [CANDIDATE_B; MAX_TOWERS + 1];
+    for invalid_list in [
+        over_count.as_slice(),
+        &[CANDIDATE_B, CANDIDATE_B],
+        &[CANDIDATE_B, FAKE_TOWER_URL],
+        &[CANDIDATE_B, TYPED_CANDIDATE_A],
+        &[CANDIDATE_B, "https://tower-c.synthetic.invalid/path"],
+    ] {
+        assert!(
+            fake.receive_tower_candidates("bob", "STATION-B2", invalid_list)
+                .is_err()
+        );
+        assert_eq!(c.tower_candidates(None, 32).await.unwrap(), page);
+    }
+
+    fake.receive_tower_candidates("bob", "STATION-B2", &[CANDIDATE_A])
+        .unwrap();
+    assert_eq!(
+        c.tower_candidates(None, 32).await.unwrap().groups[0].candidates,
+        vec![TowerCandidate {
+            url: CANDIDATE_A.into()
+        }]
+    );
+    fake.receive_tower_candidates("bob", "STATION-B", &[])
+        .unwrap();
+    assert!(
+        c.tower_candidates(None, 32)
+            .await
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+    assert_eq!(c.status().await.unwrap(), before);
+    assert!(queued(&mut events).is_empty());
+
+    fake.receive_tower_candidates("bob", "STATION-B2", &[CANDIDATE_A])
+        .unwrap();
+    c.peer_remove("bob").await.unwrap();
+    c.peer_add("bob", "STATION-B2").await.unwrap();
+    assert!(
+        c.tower_candidates(None, 32)
+            .await
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn candidate_pages_filter_first_and_use_live_exclusive_byte_boundaries() {
+    let (fake, c) = domain_backed();
+    c.tower_add(CANDIDATE_A).await.unwrap();
+    fake.set_tower_state(TowerState::Denied {
+        reason: "test refusal".into(),
+    });
+    for (name, id, url) in [
+        ("Zed", "STATION-Z", CANDIDATE_B),
+        ("a", "STATION-A1", CANDIDATE_A),
+        ("b", "STATION-B1", CANDIDATE_B),
+        ("z", "STATION-Z2", CANDIDATE_A),
+    ] {
+        c.peer_add(name, id).await.unwrap();
+        fake.receive_tower_candidates(name, id, &[url]).unwrap();
+    }
+    let mut events = c.subscribe().await.unwrap();
+    let first = c.tower_candidates(None, 1).await.unwrap();
+    assert_eq!(first.groups[0].peer, "Zed");
+    assert_eq!(first.next_after_peer.as_deref(), Some("Zed"));
+    let last = c.tower_candidates(Some("a?"), 2).await.unwrap();
+    assert_eq!(last.groups[0].peer, "b");
+    assert_eq!(last.next_after_peer, None);
+    for (after, expected) in [
+        (None, Some("")),
+        (Some("a?"), Some("a?")),
+        (Some("b"), None),
+    ] {
+        let probe = c.tower_candidates(after, 0).await.unwrap();
+        assert!(probe.groups.is_empty());
+        assert_eq!(probe.next_after_peer.as_deref(), expected);
+    }
+    assert!(queued(&mut events).is_empty());
+
+    c.peer_remove("Zed").await.unwrap();
+    assert_eq!(
+        c.tower_candidates(first.next_after_peer.as_deref(), 1)
+            .await
+            .unwrap(),
+        last
+    );
+    c.peer_remove("b").await.unwrap();
+    let vanished = c
+        .tower_candidates(first.next_after_peer.as_deref(), 1)
+        .await
+        .unwrap();
+    assert!(vanished.groups.is_empty());
+    assert_eq!(vanished.next_after_peer, None);
+}
+
+#[tokio::test]
+async fn candidate_page_caps_count_and_the_cursor_is_instance_local() {
+    let (fake, c) = domain_backed();
+    c.tower_add(CANDIDATE_A).await.unwrap();
+    for index in 0..=TOWER_CANDIDATES_PAGE_MAX_GROUPS {
+        for (prefix, url) in [('a', CANDIDATE_B), ('b', CANDIDATE_A)] {
+            let name = format!("peer-{index:02}{prefix}");
+            let id = format!("STATION-{index:02}{prefix}");
+            c.peer_add(&name, &id).await.unwrap();
+            fake.receive_tower_candidates(&name, &id, &[url]).unwrap();
+        }
+    }
+    let bound = c.bound_to(&c.status().await.unwrap().instance_id);
+    let first = bound.tower_candidates(None, u32::MAX).await.unwrap();
+    assert_eq!(
+        first.groups.len(),
+        TOWER_CANDIDATES_PAGE_MAX_GROUPS as usize
+    );
+    let after = first.next_after_peer.as_deref();
+    assert_eq!(after, Some("peer-31a"));
+    let second = bound.tower_candidates(after, u32::MAX).await.unwrap();
+    assert_eq!(second.groups.len(), 1);
+    assert_eq!(second.groups[0].peer, "peer-32a");
+    assert_eq!(second.next_after_peer, None);
+
+    let before = fake.requests().len();
+    fake.restart("INSTANCE-2");
+    assert!(matches!(
+        bound.tower_candidates(after, 32).await,
+        Err(ApiError::Disconnected { .. })
+    ));
+    assert_eq!(fake.requests().len(), before);
+    assert!(
+        c.tower_candidates(None, 32)
+            .await
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+    let status = c.status().await.unwrap();
+    assert_eq!(
+        status.bootstrap_domain.as_deref(),
+        Some("team.synthetic.invalid")
+    );
+    assert_eq!(status.towers[0].state, TowerState::Standby);
+    assert_eq!(status.towers[0].source, Some(TowerSource::Remembered));
+}
+
+#[tokio::test]
+async fn tower_changes_use_canonical_urls_and_emit_only_for_changes() {
+    let (fake, c) = domain_backed();
+    assert!(c.status().await.unwrap().towers.is_empty());
+    let mut events = c.subscribe().await.unwrap();
+    c.peer_add("bob", "STATION-B").await.unwrap();
+    queued(&mut events);
+    fake.receive_tower_candidates("bob", "STATION-B", &[CANDIDATE_A])
+        .unwrap();
+    assert!(queued(&mut events).is_empty());
+
+    let added = c.tower_add(TYPED_CANDIDATE_A).await.unwrap();
+    assert_eq!(added.outcome, TowerAddOutcome::Added);
+    assert_eq!(added.tower.url, CANDIDATE_A);
+    assert_eq!(added.tower.source, Some(TowerSource::Peer));
+    assert_eq!(added.tower.state, TowerState::Standby);
+    let status = c.status().await.unwrap();
+    assert_eq!(status.towers, vec![added.tower]);
+    assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+    assert!(c.tower_candidates(None, 1).await.unwrap().groups.is_empty());
+
+    let http = c.tower_add("http://127.0.0.1:80").await.unwrap();
+    assert_eq!(http.tower.url, "http://127.0.0.1/");
+    assert_eq!(http.tower.source, Some(TowerSource::Configured));
+    assert_eq!(
+        queued(&mut events),
+        vec![Event::Status {
+            status: c.status().await.unwrap()
+        }]
+    );
+
+    for url in [TYPED_CANDIDATE_A, "http://127.0.0.1"] {
+        let changed = c.tower_remove(url).await.unwrap();
+        assert_eq!(changed.outcome, TowerRemoveOutcome::Removed);
+        assert_eq!(
+            queued(&mut events),
+            vec![Event::Status {
+                status: c.status().await.unwrap()
+            }]
+        );
+        let absent = c.tower_remove(url).await.unwrap();
+        assert_eq!(absent.url, changed.url);
+        assert_eq!(absent.outcome, TowerRemoveOutcome::NotInSet);
+        assert!(queued(&mut events).is_empty());
+    }
+    assert!(c.status().await.unwrap().towers.is_empty());
+    assert_eq!(
+        c.tower_candidates(None, 1).await.unwrap().groups[0].candidates[0].url,
+        CANDIDATE_A
+    );
+}
+
+#[tokio::test]
+async fn presentation_overrides_leave_pin_policy_in_force() {
+    let pinned = station();
+    let c = client(&pinned);
+    pinned.set_bootstrap_domain(Some("team.synthetic.invalid".into()));
+    pinned.set_towers(
+        (0..MAX_TOWERS)
+            .map(|index| {
+                tower(
+                    &format!("https://pin-{index}.synthetic.invalid/"),
+                    TowerState::Standby,
+                    Some(TowerSource::Configured),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(c.tower_add(CANDIDATE_A).await, Err(ApiError::TowersPinned));
+    assert_eq!(
+        c.tower_remove("https://pin-0.synthetic.invalid/").await,
+        Err(ApiError::TowersPinned),
+    );
+
+    let (mutable, c) = domain_backed();
+    mutable.set_bootstrap_domain(None);
+    mutable.set_towers(Vec::new());
+    assert_eq!(
+        c.tower_add(CANDIDATE_A).await.unwrap().outcome,
+        TowerAddOutcome::Added
+    );
+}
+
+#[tokio::test]
+async fn invalid_domain_backed_fixtures_panic_before_changing_towers_or_events() {
+    let (fake, c) = domain_backed();
+    let row = |url: &str| tower(url, TowerState::Standby, Some(TowerSource::Configured));
+    let valid = row(CANDIDATE_A);
+    fake.set_towers(vec![valid.clone()]);
+    let before = fake.status();
+    let mut events = c.subscribe().await.unwrap();
+    for invalid in [
+        vec![
+            valid.clone(),
+            row("https://tower.synthetic.invalid/not-root"),
+        ],
+        vec![valid.clone(), row("https://Tower.synthetic.invalid")],
+        vec![valid.clone(), valid.clone()],
+        (0..=MAX_TOWERS)
+            .map(|index| row(&format!("https://over-{index}.synthetic.invalid/")))
+            .collect(),
+    ] {
+        assert!(catch_unwind(AssertUnwindSafe(|| fake.set_towers(invalid))).is_err());
+        assert_eq!(fake.status(), before);
+        assert!(queued(&mut events).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn duplicate_add_checks_the_installed_set_before_capacity() {
+    let (fake, c) = domain_backed();
+    for index in 0..MAX_TOWERS {
+        c.tower_add(&format!("https://tower-{index}.synthetic.invalid/"))
+            .await
+            .unwrap();
+    }
+    fake.set_tower_state(TowerState::Denied {
+        reason: "test refusal".into(),
+    });
+    let before = c.status().await.unwrap();
+    let mut events = c.subscribe().await.unwrap();
+    assert!(matches!(
+        c.tower_add("https://invalid.synthetic.invalid/?marker").await,
+        Err(ApiError::Invalid { field, .. }) if field == "url"
+    ));
+    let duplicate = c
+        .tower_add("https://TOWER-0.SYNTHETIC.INVALID.:443")
+        .await
+        .unwrap();
+    assert_eq!(duplicate.outcome, TowerAddOutcome::AlreadyInSet);
+    assert_eq!(duplicate.tower, before.towers[0]);
+    assert_eq!(
+        c.tower_add(CANDIDATE_B).await,
+        Err(ApiError::TowerSetFull { max: 8 })
+    );
+    assert_eq!(c.status().await.unwrap(), before);
+    assert!(queued(&mut events).is_empty());
+    c.tower_remove(&before.towers[0].url).await.unwrap();
+    assert_eq!(
+        c.tower_add(CANDIDATE_B).await.unwrap().outcome,
+        TowerAddOutcome::Added
+    );
+}
+
+#[tokio::test]
+async fn validation_precedes_pins_and_pins_precede_no_ops() {
+    let fake = station();
+    let c = client(&fake);
+    let before = c.status().await.unwrap();
+    let mut events = c.subscribe().await.unwrap();
+    let with_query = "https://tower.synthetic.invalid/?marker";
+    let invalid = ApiError::Invalid {
+        field: "url".into(),
+        reason: "a tower URL must have a root path and no credentials, query, or fragment".into(),
+    };
+    assert_eq!(c.tower_add(with_query).await, Err(invalid.clone()));
+    assert_eq!(c.tower_remove(with_query).await, Err(invalid));
+    assert_eq!(
+        c.tower_add(FAKE_TOWER_URL).await,
+        Err(ApiError::TowersPinned)
+    );
+    assert_eq!(
+        c.tower_remove(CANDIDATE_B).await,
+        Err(ApiError::TowersPinned)
+    );
+    assert_eq!(c.status().await.unwrap(), before);
+    assert!(queued(&mut events).is_empty());
+}
+
+#[tokio::test]
+async fn a_hook_can_script_a_visible_tower_change_with_uncertain_durability() {
+    let (fake, c) = domain_backed();
+    let mut events = c.subscribe().await.unwrap();
+    let configured = tower(
+        CANDIDATE_A,
+        TowerState::Standby,
+        Some(TowerSource::Configured),
+    );
+    let uncertain = ApiError::Internal {
+        detail: "the tower set sync failed".into(),
+    };
+
+    for (request, visible, durable_reply) in [
+        (
+            Request::TowerAdd {
+                url: CANDIDATE_A.into(),
+            },
+            vec![configured.clone()],
+            Response::TowerAdd {
+                tower: configured,
+                outcome: TowerAddOutcome::AlreadyInSet,
+            },
+        ),
+        (
+            Request::TowerRemove {
+                url: CANDIDATE_A.into(),
+            },
+            Vec::new(),
+            Response::TowerRemove {
+                url: CANDIDATE_A.into(),
+                outcome: TowerRemoveOutcome::NotInSet,
+            },
+        ),
+    ] {
+        let once = request.clone();
+        let next = visible.clone();
+        let error = uncertain.clone();
+        fake.on_call(move |fake, request| {
+            if request == &once {
+                fake.clear_on_call();
+                fake.set_towers(next.clone());
+                fake.fail_calls(Some(error.clone()));
+            }
+        });
+
+        assert_eq!(fake.call(request.clone()).await, Err(uncertain.clone()));
+        let status = fake.status();
+        assert_eq!(status.towers, visible);
+        assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+
+        assert_eq!(fake.call(request.clone()).await, Err(uncertain.clone()));
+        assert!(queued(&mut events).is_empty());
+
+        fake.fail_calls(None);
+        assert_eq!(fake.call(request).await, Ok(durable_reply));
+        assert!(queued(&mut events).is_empty());
+    }
 }

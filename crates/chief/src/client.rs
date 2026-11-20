@@ -16,6 +16,7 @@ pub use crate::socket::{DEFAULT_CALL_TIMEOUT, SocketTransport};
 
 use crate::api::{
     ApiError, Event, LogPage, Message, MessageStatus, Peer, Request, Response, Status,
+    TowerAddResult, TowerCandidatesPage, TowerRemoveResult,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -291,6 +292,9 @@ fn unexpected(expected: &str, response: &Response) -> ApiError {
     let got = match response {
         Response::Status { .. } => "status",
         Response::Peers { .. } => "peers",
+        Response::TowerCandidates { .. } => "tower_candidates",
+        Response::TowerAdd { .. } => "tower_add",
+        Response::TowerRemove { .. } => "tower_remove",
         Response::Peer { .. } => "peer",
         Response::Message { .. } => "message",
         Response::Log { .. } => "log",
@@ -317,6 +321,48 @@ impl<T: Transport> Client<T> {
         match self.transport.call(Request::Status).await? {
             Response::Status { status } => Ok(status),
             other => Err(unexpected("status", &other)),
+        }
+    }
+
+    /// [`Request::TowerCandidates`]: one live page of peer-supplied tower candidates.
+    ///
+    /// For several pages, read [`Self::status`] and use a client bound to that instance
+    /// ([`Self::bound_to`]).
+    pub async fn tower_candidates(
+        &self,
+        after_peer: Option<&str>,
+        limit: u32,
+    ) -> Result<TowerCandidatesPage, ApiError> {
+        let request = Request::TowerCandidates {
+            after_peer: after_peer.map(str::to_owned),
+            limit,
+        };
+        match self.transport.call(request).await? {
+            Response::TowerCandidates { page } => Ok(page),
+            other => Err(unexpected("tower_candidates", &other)),
+        }
+    }
+
+    /// [`Request::TowerAdd`]: explicitly adds the URL and returns the canonical tower and outcome.
+    pub async fn tower_add(&self, url: &str) -> Result<TowerAddResult, ApiError> {
+        let request = Request::TowerAdd {
+            url: url.to_owned(),
+        };
+        match self.transport.call(request).await? {
+            Response::TowerAdd { tower, outcome } => Ok(TowerAddResult { tower, outcome }),
+            other => Err(unexpected("tower_add", &other)),
+        }
+    }
+
+    /// [`Request::TowerRemove`]: explicitly removes the URL and returns its canonical form and
+    /// the outcome.
+    pub async fn tower_remove(&self, url: &str) -> Result<TowerRemoveResult, ApiError> {
+        let request = Request::TowerRemove {
+            url: url.to_owned(),
+        };
+        match self.transport.call(request).await? {
+            Response::TowerRemove { url, outcome } => Ok(TowerRemoveResult { url, outcome }),
+            other => Err(unexpected("tower_remove", &other)),
         }
     }
 

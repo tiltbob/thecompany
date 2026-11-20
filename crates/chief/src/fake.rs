@@ -2,10 +2,10 @@
 //!
 //! It follows the rules of [`crate::api`] closely enough to test transports, the socket server and
 //! frontends against it: a peer book, a log with `seq` and `rev`, paging, sends whose outcome the
-//! test scripts, incoming messages, subscriptions, stopping and restarting. It has no network,
-//! spawns nothing, and reads the clock only for [`Message::at_ms`], and not even then after
-//! [`FakeStation::set_now_ms`]. It is the reference that frontend tests trust, so its own tests
-//! check it against the rules.
+//! test scripts, incoming messages, tower candidates and changes, subscriptions, stopping and
+//! restarting. It has no network, spawns nothing, and reads the clock only for [`Message::at_ms`]
+//! until [`FakeStation::set_now_ms`] sets the time. Its own tests check it against the rules so
+//! frontend tests can use it as a reference.
 //!
 //! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of a call (for one
 //! call at a time: a call that starts while the hook runs for another is answered without it),
@@ -17,13 +17,21 @@
 //!
 //! What it leaves out: links never change on their own (a test sets them with
 //! [`FakeStation::set_link`]), there is no send deadline (a held send stays `Sending` until
-//! [`FakeStation::resolve`]), and nothing is persisted.
+//! [`FakeStation::resolve`]), and nothing is written to disk. The domain-backed fixture keeps
+//! its installed set across simulated restarts.
+//!
+//! To exercise uncertain durability (API rule 14), have a [`FakeStation::on_call`] hook
+//! apply the visible set once with [`FakeStation::set_towers`] and make the call answer
+//! [`ApiError::Internal`] with [`FakeStation::fail_calls`]. Retries fail until the test clears
+//! that error. The next retry then answers with the regular no-op outcome and pushes no event.
 
 use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
-    LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
-    PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
-    check_peer_name, clean, clean_tower_display,
+    LOG_PAGE_MAX_MESSAGES, Link, LogPage, MAX_TOWERS, MESSAGE_ID_MAX_BYTES, Message, MessageStatus,
+    Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status, TOWER_CANDIDATES_PAGE_MAX_GROUPS,
+    TowerAddOutcome, TowerCandidate, TowerCandidateGroup, TowerCandidatesPage, TowerRemoveOutcome,
+    TowerSource, TowerState, TowerStatus, check_peer_name, check_tower_url, clean,
+    clean_tower_display,
 };
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
@@ -31,6 +39,7 @@ use crate::client::{
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::ops::Bound;
 use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
@@ -110,6 +119,9 @@ struct Inner {
 
 struct State {
     status: Status,
+    towers_pinned: bool,
+    /// Each peer's latest accepted whole announcement, including installed URLs.
+    tower_candidates: BTreeMap<String, Vec<TowerCandidate>>,
     peers: BTreeMap<String, Vec<PeerStation>>,
     log: VecDeque<Message>,
     log_capacity: usize,
@@ -155,7 +167,7 @@ impl fmt::Debug for FakeStation {
 impl FakeStation {
     /// A running station with this station id and instance id, an empty peer book, an empty log of
     /// [`FAKE_LOG_CAPACITY`] messages, [`SendOutcome::Deliver`], and one tower at
-    /// [`FAKE_TOWER_URL`] in [`TowerState::Connecting`].
+    /// [`FAKE_TOWER_URL`] in [`TowerState::Connecting`]. This run uses pins.
     pub fn new(station_id: impl Into<String>, instance_id: impl Into<String>) -> Self {
         let state = State {
             status: Status {
@@ -168,6 +180,8 @@ impl FakeStation {
                 }],
                 bootstrap_domain: None,
             },
+            towers_pinned: true,
+            tower_candidates: BTreeMap::new(),
             peers: BTreeMap::new(),
             log: VecDeque::new(),
             log_capacity: FAKE_LOG_CAPACITY,
@@ -194,6 +208,23 @@ impl FakeStation {
             }),
             bound: None,
         }
+    }
+
+    /// A domain-backed run with an initially empty installed set. Supply a valid bootstrap
+    /// domain. This fixture accepts explicit tower changes and performs no discovery.
+    pub fn new_domain_backed(
+        station_id: impl Into<String>,
+        instance_id: impl Into<String>,
+        bootstrap_domain: impl Into<String>,
+    ) -> Self {
+        let station = Self::new(station_id, instance_id);
+        {
+            let mut state = station.state();
+            state.towers_pinned = false;
+            state.status.bootstrap_domain = Some(bootstrap_domain.into());
+            state.status.towers.clear();
+        }
+        station
     }
 
     /// Keeps only the newest `capacity` messages (at least 1), evicting the oldest.
@@ -234,12 +265,29 @@ impl FakeStation {
     /// with [`clean_tower_display`], as [`FakeStation::set_tower_state`] does. The sources are
     /// stored as given.
     ///
-    /// The bootstrap domain is left as it is. The fake treats the first tower of the list as the
-    /// home tower: a [`FakeStation::restart`] puts it back in [`TowerState::Connecting`] and every
-    /// other tower in [`TowerState::Standby`], and keeps the list itself (its order, urls and
-    /// sources). Keeping them is the fake's choice; what a real station reports after a restart
-    /// is not settled here, and a test that needs something else calls `set_towers` again.
+    /// The bootstrap domain is left as it is. See [`FakeStation::restart`] for how the fixture
+    /// presents the retained entries after restart.
+    ///
+    /// # Panics
+    ///
+    /// The domain-backed fixture requires at most [`MAX_TOWERS`] unique canonical tower URLs.
+    /// Invalid input panics before replacing the set or pushing an event. The pinned fixture
+    /// also accepts arbitrary presentation data for frontend tests.
     pub fn set_towers(&self, towers: Vec<TowerStatus>) {
+        let mut state = self.state();
+        if !state.towers_pinned {
+            assert!(towers.len() <= MAX_TOWERS, "too many tower fixtures");
+            for (index, tower) in towers.iter().enumerate() {
+                assert!(
+                    check_tower_url(&tower.url).is_ok_and(|url| url == tower.url),
+                    "a domain-backed tower fixture needs a canonical URL",
+                );
+                assert!(
+                    !towers[..index].iter().any(|other| other.url == tower.url),
+                    "a domain-backed tower fixture needs distinct URLs",
+                );
+            }
+        }
         let towers = towers
             .into_iter()
             .map(|tower| TowerStatus {
@@ -248,7 +296,6 @@ impl FakeStation {
                 source: tower.source,
             })
             .collect();
-        let mut state = self.state();
         state.status.towers = towers;
         let status = state.status.clone();
         state.emit(&Event::Status { status });
@@ -259,13 +306,66 @@ impl FakeStation {
     /// The domain is the chief's own input to its station, not text from a peer or a tower, so it
     /// is stored as given, without [`crate::api::clean`]; a frontend still cleans what it prints.
     ///
-    /// A [`FakeStation::restart`] keeps it: the fake's choice, as for the list of towers; a test
-    /// that needs something else calls `set_bootstrap_domain` again.
+    /// A [`FakeStation::restart`] keeps it. This changes reported metadata only. The fixture's
+    /// constructor selects whether the run uses pins.
     pub fn set_bootstrap_domain(&self, domain: Option<String>) {
         let mut state = self.state();
         state.status.bootstrap_domain = domain;
         let status = state.status.clone();
         state.emit(&Event::Status { status });
+    }
+
+    /// Delivers a tower announcement from a known station of `peer`. This hook represents a
+    /// delivery after admission and does not depend on the fake's link state. A valid whole set
+    /// replaces the peer's previous announcement even if it came from a different station.
+    /// An empty announcement clears it. An invalid set leaves the previous one intact. Delivery
+    /// pushes no events and changes no installed towers.
+    pub fn receive_tower_candidates(
+        &self,
+        peer: &str,
+        station_id: &str,
+        urls: &[&str],
+    ) -> Result<(), ApiError> {
+        let mut state = self.state();
+        if state.stopped {
+            return Err(ApiError::Stopping);
+        }
+        let stations = state
+            .peers
+            .get(peer)
+            .ok_or_else(|| ApiError::PeerNotFound {
+                name: peer.to_owned(),
+            })?;
+        if !stations
+            .iter()
+            .any(|station| station.station_id == station_id)
+        {
+            return Err(invalid("station_id", "is not a station of this peer"));
+        }
+        if urls.len() > MAX_TOWERS {
+            return Err(invalid("towers", "too many tower URLs"));
+        }
+
+        let mut candidates: Vec<TowerCandidate> = Vec::with_capacity(urls.len());
+        for &url in urls {
+            let canonical = check_tower_url(url)?;
+            if canonical != url || !canonical.starts_with("https://") {
+                return Err(invalid("url", "a candidate must be a canonical HTTPS URL"));
+            }
+            if candidates
+                .iter()
+                .any(|candidate| candidate.url == canonical)
+            {
+                return Err(invalid("url", "the candidate set contains a duplicate URL"));
+            }
+            candidates.push(TowerCandidate { url: canonical });
+        }
+        if candidates.is_empty() {
+            state.tower_candidates.remove(peer);
+        } else {
+            state.tower_candidates.insert(peer.to_owned(), candidates);
+        }
+        Ok(())
     }
 
     /// Sets the link to one of a peer's stations and, if it changed, pushes [`Event::Peer`] (rule
@@ -379,20 +479,15 @@ impl FakeStation {
         self.inner.subscribers_changed.notify_waiters();
     }
 
-    /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
-    /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, the first tower of the list (the fake's home tower) is back in
-    /// [`TowerState::Connecting`] and every other one in [`TowerState::Standby`], as the API
-    /// reports a set whose home tower is not connected yet (no event is pushed: the subscriptions
-    /// have ended), and calls are answered again after a
-    /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
-    /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
-    /// to the new one. The peer book, the send outcome and the other test settings, the hold of
-    /// subscribes included, stay, as a station's peer book survives a restart. So do, by the fake's
-    /// choice, the list of towers ([`FakeStation::set_towers`]: its order, urls and sources) and
-    /// the bootstrap domain ([`FakeStation::set_bootstrap_domain`]); only the towers' states
-    /// change. What a real station reports after a restart is not settled here: a test that
-    /// needs something else sets the towers or the domain again.
+    /// Restarts as a new instance. Subscriptions end, the log and receipt window are emptied,
+    /// candidate announcements are forgotten and all peer links go down. Calls are answered again
+    /// after [`FakeStation::stop`]. A subscribe held by [`FakeStation::hold_subscribes`] wakes up
+    /// with [`ApiError::Stopping`] because it belongs to the old instance. The peer book, the send
+    /// outcome and other test settings stay.
+    ///
+    /// The bootstrap domain and installed URL order stay. By default, the first tower is
+    /// [`TowerState::Connecting`], the others are [`TowerState::Standby`] and their sources stay.
+    /// In the domain-backed fixture, all towers start unobserved and show as remembered.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();
@@ -401,15 +496,20 @@ impl FakeStation {
             state.log.clear();
             state.pending.clear();
             state.receipts.clear();
+            state.tower_candidates.clear();
             state.next_seq = 1;
             state.stopped = false;
             state.generation += 1;
-            for (i, tower) in state.status.towers.iter_mut().enumerate() {
-                tower.state = if i == 0 {
+            let towers_pinned = state.towers_pinned;
+            for (index, tower) in state.status.towers.iter_mut().enumerate() {
+                tower.state = if towers_pinned && index == 0 {
                     TowerState::Connecting
                 } else {
                     TowerState::Standby
                 };
+                if !towers_pinned {
+                    tower.source = Some(TowerSource::Remembered);
+                }
             }
             for stations in state.peers.values_mut() {
                 for station in stations {
@@ -595,6 +695,11 @@ impl FakeStation {
             Request::Status => Ok(Response::Status {
                 status: state.status.clone(),
             }),
+            Request::TowerCandidates { after_peer, limit } => Ok(Response::TowerCandidates {
+                page: state.tower_candidates_page(after_peer.as_deref(), limit),
+            }),
+            Request::TowerAdd { url } => state.tower_add(&url),
+            Request::TowerRemove { url } => state.tower_remove(&url),
             Request::Peers => Ok(Response::Peers {
                 peers: state
                     .peers
@@ -829,6 +934,104 @@ impl State {
         Ok(message)
     }
 
+    fn tower_candidates_page(&self, after_peer: Option<&str>, limit: u32) -> TowerCandidatesPage {
+        let lower_bound = after_peer.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut eligible = self
+            .tower_candidates
+            .range::<str, _>((lower_bound, Bound::Unbounded))
+            .filter_map(|(peer, urls)| {
+                let candidates: Vec<_> = urls
+                    .iter()
+                    .filter(|candidate| self.tower_index(&candidate.url).is_none())
+                    .cloned()
+                    .collect();
+                (!candidates.is_empty()).then(|| TowerCandidateGroup {
+                    peer: peer.clone(),
+                    candidates,
+                })
+            });
+
+        let cap = limit.min(TOWER_CANDIDATES_PAGE_MAX_GROUPS) as usize;
+        let groups: Vec<_> = eligible.by_ref().take(cap).collect();
+        let next_after_peer = eligible.next().map(|_| match groups.last() {
+            Some(group) => group.peer.clone(),
+            None => after_peer.unwrap_or_default().to_owned(),
+        });
+        TowerCandidatesPage {
+            groups,
+            next_after_peer,
+        }
+    }
+
+    fn tower_index(&self, url: &str) -> Option<usize> {
+        self.status.towers.iter().position(|tower| tower.url == url)
+    }
+
+    fn tower_change_url(&self, url: &str) -> Result<String, ApiError> {
+        let url = check_tower_url(url)?;
+        if self.towers_pinned {
+            return Err(ApiError::TowersPinned);
+        }
+        Ok(url)
+    }
+
+    fn tower_add(&mut self, url: &str) -> Result<Response, ApiError> {
+        let url = self.tower_change_url(url)?;
+        if let Some(tower) = self.status.towers.iter().find(|tower| tower.url == url) {
+            return Ok(Response::TowerAdd {
+                tower: tower.clone(),
+                outcome: TowerAddOutcome::AlreadyInSet,
+            });
+        }
+        if self.status.towers.len() >= MAX_TOWERS {
+            return Err(ApiError::TowerSetFull {
+                max: MAX_TOWERS as u32,
+            });
+        }
+
+        let source = if self
+            .tower_candidates
+            .values()
+            .flatten()
+            .any(|candidate| candidate.url == url)
+        {
+            TowerSource::Peer
+        } else {
+            TowerSource::Configured
+        };
+        let tower = TowerStatus {
+            url,
+            state: TowerState::Standby,
+            source: Some(source),
+        };
+        self.status.towers.push(tower.clone());
+        self.emit(&Event::Status {
+            status: self.status.clone(),
+        });
+        Ok(Response::TowerAdd {
+            tower,
+            outcome: TowerAddOutcome::Added,
+        })
+    }
+
+    fn tower_remove(&mut self, url: &str) -> Result<Response, ApiError> {
+        let url = self.tower_change_url(url)?;
+        let Some(index) = self.tower_index(&url) else {
+            return Ok(Response::TowerRemove {
+                url,
+                outcome: TowerRemoveOutcome::NotInSet,
+            });
+        };
+        self.status.towers.remove(index);
+        self.emit(&Event::Status {
+            status: self.status.clone(),
+        });
+        Ok(Response::TowerRemove {
+            url,
+            outcome: TowerRemoveOutcome::Removed,
+        })
+    }
+
     fn peer_add(&mut self, name: String, station_id: String) -> Result<Response, ApiError> {
         check_peer_name(&name)?;
         if station_id.is_empty()
@@ -888,6 +1091,7 @@ impl State {
             )?;
         }
         self.peers.remove(&name);
+        self.tower_candidates.remove(&name);
         self.emit(&Event::PeerRemoved { name });
         Ok(Response::Done)
     }
