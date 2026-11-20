@@ -7,7 +7,7 @@
 mod common;
 
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ use iroh::tls::CaTlsConfig;
 use iroh::{RelayConfig, RelayUrl, SecretKey, Watcher};
 use iroh_relay::RelayQuicConfig;
 use numbers_tower::{
-    MAX_RELOAD_INTERVAL, TlsFileProblem, TlsTower, Tower, TowerConfig, TowerError,
+    Listener, MAX_RELOAD_INTERVAL, TlsFileProblem, TlsTower, Tower, TowerConfig, TowerError,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -573,13 +573,61 @@ async fn an_invalid_host_name_fails_spawn_before_binding() {
     .await;
 }
 
-/// A TLS tower whose HTTPS port is taken fails to start.
+/// A taken port fails spawn with the listener it belongs to and `AddrInUse`, never with the
+/// address or the port in the error.
 #[tokio::test]
-async fn a_taken_https_port_fails_spawn_with_a_start_error() {
+async fn a_taken_port_fails_spawn_naming_its_listener_and_not_its_address() {
     bounded(async {
         let cert = cert();
-        let error = spawn_fails_with_https_taken(tls_tower(&cert.cert, &cert.key)).await;
-        assert!(matches!(error, TowerError::Start(_)), "{error}");
+        let tcp = || TcpListener::bind(loopback()).unwrap();
+        let expect = |error: &TowerError, listener: Listener, port: u16| {
+            let TowerError::Bind {
+                listener: found,
+                kind,
+                ..
+            } = error
+            else {
+                panic!("expected a bind error, got: {error}");
+            };
+            assert_eq!((*found, *kind), (listener, ErrorKind::AddrInUse), "{error}");
+            for text in texts(error) {
+                assert!(!text.contains(&port.to_string()), "{text}");
+                assert!(!text.contains("127.0.0.1"), "{text}");
+            }
+        };
+
+        let taken = tcp();
+        let port = taken.local_addr().unwrap().port();
+        let tls = tls_tower(&cert.cert, &cert.key).https_bind(taken.local_addr().unwrap());
+        let Err(error) = Tower::spawn(config(tls)).await else {
+            panic!("spawn bound a taken HTTPS port");
+        };
+        expect(&error, Listener::Https, port);
+
+        let taken = tcp();
+        let port = taken.local_addr().unwrap().port();
+        let tls = tls_tower(&cert.cert, &cert.key);
+        let Err(error) =
+            Tower::spawn(TowerConfig::tls(tls).bind(taken.local_addr().unwrap())).await
+        else {
+            panic!("spawn bound a taken HTTP port");
+        };
+        expect(&error, Listener::Http, port);
+
+        let taken = UdpSocket::bind(loopback()).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let tls = tls_tower(&cert.cert, &cert.key).qad_bind(Some(taken.local_addr().unwrap()));
+        let Err(error) = Tower::spawn(config(tls)).await else {
+            panic!("spawn bound a taken address discovery port");
+        };
+        expect(&error, Listener::AddressDiscovery, port);
+
+        let taken = tcp();
+        let port = taken.local_addr().unwrap().port();
+        let Err(error) = Tower::spawn(TowerConfig::dev(taken.local_addr().unwrap())).await else {
+            panic!("spawn bound a taken dev tower port");
+        };
+        expect(&error, Listener::Http, port);
     })
     .await;
 }

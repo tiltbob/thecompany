@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,9 +35,11 @@ const fn all_ipv4(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
 }
 
-/// The TLS part of a tower's configuration: its name, its listeners and its certificate files.
+/// The TLS part of a tower's configuration: its name, its listeners and where its certificate
+/// comes from.
 ///
-/// Build it with [`TlsTower::new`] and pass it to [`TowerConfig::tls`](crate::TowerConfig::tls).
+/// Build it with [`TlsTower::new`] (certificate files) or [`TlsTower::acme`] (Let's Encrypt)
+/// and pass it to [`TowerConfig::tls`](crate::TowerConfig::tls).
 /// The struct is `#[non_exhaustive]`; adjust it with the builder-style setters.
 ///
 /// Its `Debug` output never shows the host name, the file paths (which often contain it) or the
@@ -120,25 +122,34 @@ pub enum CertSource {
     /// A certificate from Let's Encrypt, obtained and renewed with the ACME tls-alpn-01
     /// challenge by iroh-relay's ACME client.
     ///
-    /// The certificate is for the tower's host name, which must then be a DNS name, not an IP
-    /// literal. Let's Encrypt validates it on TCP port 443 of that name, so the HTTPS listener
-    /// must be reachable there from the internet. The client contacts Let's Encrypt only once
-    /// the tower runs, never at configuration time.
+    /// The certificate is for the tower's host name, which must then be a DNS name of at least
+    /// two labels, not an IP literal. Let's Encrypt validates it on TCP port 443 of that name,
+    /// so the HTTPS listener must be reachable there from the internet. The client contacts
+    /// Let's Encrypt only once the tower runs, never at configuration time.
     ///
     /// The ACME client creates the account key and the certificate's private key itself and
     /// stores them, with the certificate, in `cache_dir` (files named `cached_account_<hash>`
-    /// and `cached_cert_<hash>`), written with the process's default file permissions. That is
-    /// the tower's own TLS key: the directory must be private to the tower (for example mode
-    /// 0700, owned by the tower's user). Without the cache every restart would order a new
-    /// certificate and soon hit Let's Encrypt's rate limits.
+    /// and `cached_cert_<hash>`), written with the process's default file permissions. Those
+    /// are the tower's own keys (its TLS key and its ACME account key), so the directory must
+    /// be private to the tower's user. On unix, [`Tower::spawn`] makes sure of it just before
+    /// the ACME client starts: a missing directory is created with mode 0700 (and every missing
+    /// directory above it); an existing one that the group or others can access, or a path
+    /// that is not a directory, is refused. A systemd unit that provides the directory with
+    /// `StateDirectory=` therefore needs `StateDirectoryMode=0700`. Without the cache every
+    /// restart would order a new certificate and soon hit Let's Encrypt's rate limits.
+    ///
+    /// [`Tower::spawn`]: crate::Tower::spawn
     #[non_exhaustive]
     Acme {
-        /// The account contact, a `mailto:` address. [`Tower::spawn`] refuses anything else.
+        /// The account contact: `mailto:` followed by one address, for example
+        /// `mailto:ops@example.com`. [`Tower::spawn`] refuses anything else, including an
+        /// upper-case `MAILTO:` (the contact is a URL the operator writes), several addresses,
+        /// white space and a `?` query.
         ///
         /// [`Tower::spawn`]: crate::Tower::spawn
         contact: String,
         /// The directory where the ACME client keeps its account key, the certificate and its
-        /// private key. It is created if it does not exist.
+        /// private key. It must be private to the tower's user; see the variant's docs.
         cache_dir: PathBuf,
         /// `true` for Let's Encrypt's production directory, `false` (the default) for its
         /// staging directory, whose certificates no client trusts.
@@ -385,13 +396,12 @@ pub(crate) async fn cert_config(
             production,
         } => {
             let host = canonical_host(&tls.hostname).ok_or(TowerError::InvalidHostname)?;
-            if ip_literal(&host).is_some() {
+            // Let's Encrypt issues certificates for DNS names under a public suffix only: at
+            // least two labels, and never an IP literal.
+            if ip_literal(&host).is_some() || !host.contains('.') {
                 return Err(TowerError::AcmeNeedsDnsName);
             }
-            if contact
-                .strip_prefix("mailto:")
-                .is_none_or(|address| address.is_empty())
-            {
+            if !is_acme_contact(contact) {
                 return Err(TowerError::InvalidAcmeContact);
             }
             let acme_config = AcmeConfig::letsencrypt(*production)
@@ -409,36 +419,135 @@ pub(crate) async fn cert_config(
     }
 }
 
+/// Whether `contact` is `mailto:` (lower case) followed by one address: no white space, no
+/// comma, no `?`, and exactly one `@` with something on both sides.
+fn is_acme_contact(contact: &str) -> bool {
+    let Some(address) = contact.strip_prefix("mailto:") else {
+        return false;
+    };
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && !address
+            .chars()
+            .any(|c| c.is_whitespace() || c == ',' || c == '?')
+}
+
+/// Makes sure the ACME cache directory exists and is private to the tower's user, before the
+/// ACME client is started (it would create the directory and its key files with the process's
+/// default modes).
+///
+/// On unix: a missing directory is created with mode 0700, and so is every missing directory
+/// above it; an existing one must not be accessible to the group or to others; a path that
+/// exists and is not a directory is refused. Elsewhere a missing directory is created and no
+/// mode is checked. The path is followed if it is a symbolic link.
+pub(crate) fn prepare_acme_cache(dir: &Path) -> Result<(), TowerError> {
+    let unusable = |error: std::io::Error| TowerError::AcmeCacheUnusable(error.kind());
+    match std::fs::metadata(dir) {
+        Ok(metadata) if !metadata.is_dir() => Err(TowerError::AcmeCacheNotADirectory),
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(TowerError::AcmeCacheNotPrivate);
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = metadata;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).map_err(unusable)
+        }
+        Err(error) => Err(unusable(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CertSource, TlsTower, cert_config, tower_url};
     use crate::TowerError;
     use iroh_relay::server::CertConfig;
 
-    /// An ACME source builds iroh-relay's `CertConfig::LetsEncrypt` without touching the cache
-    /// directory (or the network: nothing here can reach it).
+    /// An ACME source builds iroh-relay's `CertConfig::LetsEncrypt` with the right directory, the
+    /// canonical domain, the contact and the cache path, without touching the cache directory
+    /// (or the network: nothing here can reach it). `AcmeConfig` derives `Debug` over all its
+    /// fields, and its directory constants are private, so the test reads the debug text.
     #[tokio::test]
     async fn an_acme_source_becomes_a_lets_encrypt_config_without_side_effects() {
+        const PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
+        const STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("acme-cache");
-        let tls = TlsTower::acme("Tower1.Example.com.", "mailto:ops@example.com", &cache)
-            .production(true);
-        let (cert, reloader) = cert_config(&tls).await.unwrap();
-        assert!(matches!(cert, CertConfig::LetsEncrypt { .. }));
-        assert!(reloader.is_none());
+        for production in [true, false] {
+            let tls = TlsTower::acme("Tower1.Example.com.", "mailto:ops@example.com", &cache)
+                .production(production);
+            let (cert, reloader) = cert_config(&tls).await.unwrap();
+            assert!(reloader.is_none());
+            let CertConfig::LetsEncrypt { acme_config, .. } = cert else {
+                panic!("expected a Let's Encrypt configuration");
+            };
+            let debug = format!("{acme_config:?}");
+            let (expected, other) = if production {
+                (PRODUCTION, STAGING)
+            } else {
+                (STAGING, PRODUCTION)
+            };
+            assert!(
+                debug.contains(expected) && !debug.contains(other),
+                "{debug}"
+            );
+            assert!(debug.contains(r#"["tower1.example.com"]"#), "{debug}");
+            assert!(!debug.contains("Tower1"), "{debug}");
+            assert!(debug.contains(r#"["mailto:ops@example.com"]"#), "{debug}");
+            assert!(
+                debug.contains(&format!("cache_path: Some({:?})", cache)),
+                "{debug}"
+            );
+        }
         assert!(!cache.exists());
     }
 
     #[tokio::test]
     async fn an_acme_source_refuses_an_ip_literal_and_a_contact_without_mailto() {
-        for host in ["127.0.0.1", "::1", "[2001:db8::1]", "::ffff:1.2.3.4"] {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "[2001:db8::1]",
+            "::ffff:1.2.3.4",
+            "localhost",
+            "tower.",
+        ] {
             let tls = TlsTower::acme(host, "mailto:ops@example.com", "/nonexistent");
             assert!(matches!(
                 cert_config(&tls).await,
                 Err(TowerError::AcmeNeedsDnsName)
             ));
         }
-        for contact in ["", "ops@example.com", "mailto:", "https://example.com/"] {
+        for contact in [
+            "",
+            "ops@example.com",
+            "mailto:",
+            "https://example.com/",
+            "MAILTO:ops@example.com",
+            "mailto:ops",
+            "mailto:@example.com",
+            "mailto:ops@",
+            "mailto:ops@@example.com",
+            "mailto:a@b@example.com",
+            "mailto:ops @example.com",
+            "mailto:ops@example.com,dev@example.com",
+            "mailto:ops@example.com?subject=hi",
+            "mailto:ops@example.com\n",
+        ] {
             let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
             let Err(error) = cert_config(&tls).await else {
                 panic!("accepted an ACME contact without mailto");
@@ -675,5 +784,59 @@ mod tests {
             }
             assert!(text.contains("127.0.0.1:44443"), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod acme_cache_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::prepare_acme_cache;
+    use crate::TowerError;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_missing_cache_directory_is_created_private_with_its_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("state/acme");
+        prepare_acme_cache(&cache).unwrap();
+        assert_eq!(mode(&dir.path().join("state")), 0o700);
+        assert_eq!(mode(&cache), 0o700);
+    }
+
+    #[test]
+    fn an_existing_private_cache_directory_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_acme_cache(dir.path()).unwrap();
+        assert_eq!(mode(dir.path()), 0o700);
+    }
+
+    #[test]
+    fn a_cache_directory_others_can_read_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for open in [0o755, 0o750, 0o701] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(open)).unwrap();
+            assert!(matches!(
+                prepare_acme_cache(dir.path()),
+                Err(TowerError::AcmeCacheNotPrivate)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_file_in_place_of_the_cache_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("acme");
+        std::fs::write(&file, "").unwrap();
+        assert!(matches!(
+            prepare_acme_cache(&file),
+            Err(TowerError::AcmeCacheNotADirectory)
+        ));
     }
 }
