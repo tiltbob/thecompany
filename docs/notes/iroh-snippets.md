@@ -412,7 +412,12 @@ let server = Server::spawn(config).await?;
 - **Check the certificate file yourself.** `reloading_resolver` fails at once on a missing,
   unreadable or non-PEM key file ("cert loading: reading key: ..."). A certificate file that holds
   no PEM certificate passes: the PEM reader skips what it does not know, the chain is empty and
-  `Server::spawn` succeeds (found while building the tower, #70; not a lab experiment).
+  `Server::spawn` succeeds (found while building the tower, #70; not a lab experiment). The
+  resolver also never checks that the key belongs to the certificate (source reading:
+  rustls-cert-reloadable-resolver 0.7.1 does not call `CertifiedKey::keys_match`), and its error
+  text comes from the PEM reader, which can quote a line of the file. The tower therefore does not
+  use `reloading_resolver`: it loads and checks the pair itself and passes its own resolver to
+  `with_cert_resolver` (#70). The rest of the snippet is what the tower does.
 - ACME (`CertConfig::LetsEncrypt`) is tls-alpn-01 on the HTTPS port and needs `cache_path`, or
   every restart orders a certificate (source reading, not tested). `Server::spawn` cannot add
   HTTP routes. Build the tower URL from the host name, not the socket address.

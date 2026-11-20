@@ -534,13 +534,18 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `RelayUrl` from `https://host:port/`; the canonical form has no trailing dot. An endpoint
   bound with the URLs from the SRV answer came online through a TLS tower named by the record in
   227–284 ms (bind to online; the lookup was done before the timed part).
-- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
-  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
+- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself and checks the
+  pair before it serves it: the chain holds a certificate, the first one parses, the key file holds
+  exactly one key that ring can use, and the key belongs to the certificate. It hands the pair to
+  rustls through its own certificate resolver, in
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
-  explicitly and no process-wide default was installed or needed. The resolver fails at once on a
-  missing, unreadable or non-PEM key file, but accepts a certificate file that holds no PEM
-  certificate (an empty chain; `Server::spawn` succeeds), so a tower checks that file itself (found
-  while building the tower, #70). A test endpoint trusts the
+  explicitly and no process-wide default was installed or needed. It reads both files again once a
+  day and replaces the pair only when the new one passes the same checks. iroh-relay's own
+  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` is not used: it fails at
+  once on a missing, unreadable or non-PEM key file, but accepts a certificate file that holds no
+  PEM certificate (an empty chain; `Server::spawn` succeeds), never checks that the key belongs to
+  the certificate (source reading), and its errors can quote the file (found while building the
+  tower, #70). A test endpoint trusts the
   certificate with `iroh::tls::CaTlsConfig::custom_roots` (an empty list fails `bind()`) and came
   online in 223–325 ms. An endpoint that does not trust it never chooses a home tower: empty
   status, no error, `online()` pending. QAD ran when the relay map carried the tower's QAD port
