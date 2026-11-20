@@ -1,5 +1,8 @@
 #![cfg(test)]
 
+#[path = "link/shared_dial_retry.rs"]
+mod shared_dial_retry;
+
 use std::future::Future;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -1156,7 +1159,12 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
                 ]),
             );
             peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
-            let (link, _inbox) = Link::start(endpoint, config());
+            let budget = LinkConfig {
+                // The send expires in the middle of its second dial's setup budget.
+                send_deadline: CONNECT_TIMEOUT + CONNECT_TIMEOUT / 2,
+                ..config()
+            };
+            let (link, _inbox) = Link::start(endpoint, budget);
             let handle = link.handle();
 
             let cancel_handle = handle.clone();
@@ -1183,17 +1191,24 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
             assert_eq!(handle.path(peer_id), LinkPath::Down);
 
             let expiring_handle = handle.clone();
+            let deadline = Instant::now() + budget.send_deadline + Duration::from_millis(500);
             let expiring = tokio::spawn(async move {
                 expiring_handle
                     .send(peer_id, message("expires", "peer never replies to hello"))
                     .await
             });
             let (expired, _held_hello) = accept_hello(&peer).await;
-            assert!(matches!(
-                checked(expiring.await, "join timed-out send"),
+            let (retry, _retry_hello) = accept_hello(&peer).await;
+            let result = checked(
+                timeout_at(deadline, expiring).await,
+                "original send deadline",
+            );
+            assert_eq!(
+                checked(result, "join timed-out send"),
                 Err(SendError::Timeout)
-            ));
+            );
             wait_for_close(&expired).await;
+            wait_for_close(&retry).await;
             assert_eq!(handle.path(peer_id), LinkPath::Down);
 
             // A new send must reach the peer instead of reusing the expired attempt.

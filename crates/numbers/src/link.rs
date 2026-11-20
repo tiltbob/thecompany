@@ -46,8 +46,10 @@ pub struct LinkConfig {
     ///
     /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
     /// The progress check after writing a message needs a positive interval shorter
-    /// than the remaining send budget. A wait for stream credit also allows time for
-    /// a transport keepalive, and its progress observation can span several sends.
+    /// than the remaining send budget. The stream-credit progress window is the
+    /// larger of this timeout and 6 seconds. A send that first observes a stall can
+    /// close the link only if its remaining budget exceeds that window. Otherwise
+    /// the observation carries over to a later send on the same connection.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
@@ -244,8 +246,11 @@ impl LinkHandle {
         let mut first_attempt = true;
         let mut stale_retry_available = true;
         let mut replacement_retry_available = true;
+        let mut dial_retry_available = true;
         loop {
-            let lease = self.connection(peer).await?;
+            let lease = self
+                .connection(peer, start, &mut dial_retry_available)
+                .await?;
             let connection = &lease.transport;
             let result = send_chat(
                 peer,
@@ -308,7 +313,12 @@ impl LinkHandle {
         }
     }
 
-    async fn connection(&self, peer: &Arc<Peer>) -> Result<Arc<EstablishedConnection>, SendError> {
+    async fn connection(
+        &self,
+        peer: &Arc<Peer>,
+        start: Instant,
+        dial_retry_available: &mut bool,
+    ) -> Result<Arc<EstablishedConnection>, SendError> {
         // Subscribe before inspecting state. A later update stays visible across the await.
         let mut changes = peer.changed.subscribe();
         let mut attempt: Option<Arc<Dial>> = None;
@@ -325,12 +335,25 @@ impl LinkHandle {
                 if let Some(active) = state.active.as_ref().filter(|active| active.is_open()) {
                     return Ok(Arc::clone(&active.connection));
                 }
+                let result = attempt.as_ref().and_then(|dial| *lock(&dial.result));
+                // Count a failed dial before replacing the attempt, including when
+                // another caller has already reserved the next outgoing dial.
+                if let Some(DialResult::Failed(error)) = result
+                    && (state.dial.is_some() || state.incoming.is_none())
+                {
+                    if !matches!(error, SendError::Timeout | SendError::Disconnected)
+                        || !std::mem::take(dial_retry_available)
+                    {
+                        return Err(error);
+                    }
+                    if start.elapsed() >= self.shared.config.send_deadline {
+                        return Err(SendError::Timeout);
+                    }
+                }
                 if let Some(pending) = &state.dial {
                     attempt = Some(Arc::clone(pending));
                 } else if state.incoming.is_none() {
-                    let result = attempt.as_ref().and_then(|dial| *lock(&dial.result));
                     match result {
-                        Some(DialResult::Failed(error)) => return Err(error),
                         Some(DialResult::Replaced) if dialed_after_replacement => {
                             return Err(SendError::Disconnected);
                         }
@@ -1211,6 +1234,61 @@ mod tests {
         })
         .await
         .expect("reject a delayed generation before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn stale_connection_cannot_change_active_stream_credit_observation() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let local = loopback_endpoint().await;
+            let remote = loopback_endpoint().await;
+            let remote_id = remote.iroh().id();
+            local
+                .authorizer()
+                .replace_peers([(remote_id, "peer".into())]);
+            remote
+                .authorizer()
+                .replace_peers([(local.iroh().id(), "peer".into())]);
+            let (shared, _inbox) = Shared::new(
+                &local,
+                LinkConfig {
+                    connect_timeout: budget,
+                    send_deadline: budget,
+                },
+            );
+            let peer = shared.peer(remote_id).unwrap();
+            let (stale, _stale_remote) = connect(&local, &remote).await;
+            let (current, _current_remote) = connect(&local, &remote).await;
+            let window = Duration::from_secs(6);
+            let since = Instant::now() - window;
+            let received = current.stats().frame_rx;
+            {
+                let mut state = peer.state();
+                assert!(
+                    shared.admit(&peer, &mut state, &current, None, [1; 16]) == DialResult::Ready
+                );
+                state.active.as_mut().unwrap().stream_credit_wait =
+                    Some(StreamCreditWait { since, received });
+            }
+            assert!(stale.close_reason().is_none());
+            assert!(peer.state().is_current(&current));
+
+            assert_eq!(peer.stream_credit_wait(&stale, window), Ok(None));
+
+            {
+                let state = peer.state();
+                assert!(state.is_current(&current));
+                let active = state.active.as_ref().unwrap();
+                let wait = active.stream_credit_wait.as_ref().unwrap();
+                assert_eq!(wait.since, since);
+                assert_eq!(wait.received, received);
+            }
+            assert!(stale.close_reason().is_none());
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("check a stale connection before the test deadline");
     }
 
     #[tokio::test]
