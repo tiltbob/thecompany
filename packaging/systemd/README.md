@@ -254,7 +254,8 @@ from the service what a relay does not need. In practice the tower:
 - cannot create or enter namespaces through `unshare(2)`, `clone(2)` or `setns(2)`, use realtime
   scheduling or change its execution domain (`personality(2)`); from systemd 251 on,
   `clone3(2)` is refused with `ENOSYS` and libc falls back to `clone(2)`, while systemd 250
-  does not cover `clone3(2)`;
+  does not cover `clone3(2)`. systemd.exec(5) says the namespace rule is enforced on x86,
+  x86-64, mips, ppc64 and s390 only, so not on arm64;
 - sees a private `/dev` with only `null`, `zero`, `full`, `random`, `urandom` and the TTY
   devices, read-only except `/dev/pts` and the host's `/dev/shm` (and `/dev/mqueue` and
   `/dev/hugepages` where the host has them), which stay writable;

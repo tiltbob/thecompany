@@ -68,8 +68,9 @@ ProtectClock=yes
 ProtectHostname=yes
 # No creating or entering namespaces (unshare(2), clone(2) and setns(2) with namespace flags).
 # From systemd 251 on, clone3(2) is refused with ENOSYS, and libc falls back to clone(2). Under
-# systemd 250, clone3(2) is not covered. systemd makes the mount and UTS namespaces of the lines
-# above before this applies; the tower's threads need none.
+# systemd 250, clone3(2) is not covered. systemd.exec(5) says this setting is enforced on x86,
+# x86-64, mips, ppc64 and s390 only, so not on arm64. systemd makes the mount and UTS namespaces
+# of the lines above before this applies; the tower's threads need none.
 RestrictNamespaces=yes
 # No realtime scheduling (SCHED_FIFO, SCHED_RR, SCHED_DEADLINE), with which a process can keep
 # the CPUs from the rest of the host. The tower uses the normal policy.
