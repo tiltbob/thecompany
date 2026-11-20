@@ -82,7 +82,7 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | Path | Contents |
 |---|---|
 | `crates/base/src/frame.rs` | `write_frame` / `read_frame`: u32 length + JSON, with the size cap and read deadline as parameters (64 KiB on the wire, 1 MiB on the local socket) |
-| `crates/base/src/keyfile.rs` | key-file helper for daemons: create with `O_EXCL`, mode 0600 inside a 0700 dir, refuse a file with the wrong owner or mode. Keys reach the libraries as bytes |
+| `crates/base/src/keyfile.rs` | key-file helper for daemons: create with `O_EXCL`, mode 0600 inside a 0700 dir, refuse a file with the wrong owner or mode. Load or create by path or relative to an already opened data directory. Keys reach the libraries as bytes |
 | `crates/tower/src/lib.rs` | `TowerConfig`, `Tower::spawn(cfg)` wrapping `iroh_relay::server::Server::spawn` in plain-HTTP mode with a per-client rate limit; `url()`, `shutdown()`; no `iroh_relay` type in its public API |
 | `crates/tower/src/main.rs` | `tower [--bind 127.0.0.1:3340]`; loopback only in M1 |
 | `crates/numbers/src/identity.rs` | `NodeId` (iroh `EndpointId`) and node-key generation |
