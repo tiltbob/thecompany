@@ -202,9 +202,10 @@ given together, is open, to be settled on #79. The record is SRV with one target
 13, settled on #38): `_numbers._tcp.example.com. SRV 0 0 443 tower1.example.com.` gives the tower
 `https://tower1.example.com/`. A target of `.` is skipped, and priority and weight are ignored.
 Every tower URL is kept in one canonical form: the host in lower case with no trailing dot, the
-port only when it is not 443, a root path. SRV targets and production towers are `https`; plain
-`http` is allowed only for a literal loopback IP address in an explicit dev URL. NXDOMAIN and an
-empty answer both mean no tower. The lookup's network waits run under its own deadline (10 s by
+scheme's default port left out (443 for `https`, 80 for `http`), a root path. SRV targets and
+production towers are `https`; plain `http` is allowed only for a literal loopback IP address in
+an explicit dev URL. NXDOMAIN and an empty answer both mean no tower.
+The lookup's network waits run under its own deadline (10 s by
 default), because the resolver's 6 s is the budget of one UDP query only; the deadline cannot
 preempt the synchronous read of the system's resolver configuration at the start of a lookup. No
 lookup is answered from an earlier one's cache: with the system's resolvers each lookup builds a
