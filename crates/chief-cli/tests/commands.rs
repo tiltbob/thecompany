@@ -7,7 +7,7 @@
 //! is bounded. Ids are placeholders (AGENTS.md, hard rule 9).
 
 use chief::api::*;
-use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
+use chief::client::{BindInstance, Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
 use chief::fake::{FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
@@ -54,7 +54,7 @@ fn parse(args: &[&str]) -> Command {
 }
 
 /// Runs `chief <args>` against `client` with no input: (exit, stdout, stderr).
-async fn exec<T: Transport>(client: &Client<T>, args: &[&str]) -> (Exit, String, String) {
+async fn exec<T: BindInstance>(client: &Client<T>, args: &[&str]) -> (Exit, String, String) {
     let command = parse(args);
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -105,7 +105,7 @@ impl Shared {
 
 /// Starts `chief chat <peer>` with a pipe for its input: the future, its stdout, its stderr and the
 /// pipe's writing end (drop it for end of input).
-fn chat<'a, T: Transport>(
+fn chat<'a, T: BindInstance>(
     client: &'a Client<T>,
     command: &'a Command,
 ) -> (
@@ -873,10 +873,474 @@ async fn chat_with_input_already_closed_shows_the_backlog_and_ends() {
     .await;
 }
 
+// One station instance per command (findings 1 and 2 of the review of #51).
+
+fn sends(fake: &FakeStation) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter_map(|r| match r {
+            Request::Send { body, .. } => Some(body),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Makes the fake restart as `INSTANCE-2` inside its `n`-th call that `pick` selects, before the
+/// fake looks at it, and log a message of `bob` there.
+fn restart_on(fake: &FakeStation, n: usize, pick: fn(&Request) -> bool) {
+    let mut seen = 0;
+    fake.on_call(move |fake, request| {
+        if pick(request) {
+            seen += 1;
+            if seen == n {
+                fake.clear_on_call();
+                fake.restart("INSTANCE-2");
+                fake.receive("bob", "from the new instance").unwrap();
+            }
+        }
+    });
+}
+
+#[tokio::test]
+async fn log_with_a_restart_between_two_pages_prints_nothing_and_exits_3() {
+    bounded(async {
+        let n = usize::try_from(LOG_PAGE_MAX_MESSAGES).unwrap() + 200;
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1").with_log_capacity(n);
+        let c = Client::new(fake.clone());
+        c.peer_add("bob", "STATION-B").await.unwrap();
+        for i in 0..n {
+            fake.receive("bob", &format!("m{i}")).unwrap();
+        }
+        restart_on(&fake, 2, |r| matches!(r, Request::Log { .. }));
+        let (exit, out, err) = exec(&c, &["log"]).await;
+        assert_eq!(exit, Exit::NoStation);
+        // No message at all, of either instance.
+        assert_eq!(out, "");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.starts_with("lost the connection to the station: "),
+            "{err}"
+        );
+        // The second page never reached the new instance.
+        assert_eq!(log_requests(&fake), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_with_a_restart_between_its_two_calls_prints_nothing_and_exits_3() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.set_tower_state(TowerState::Connected);
+        fake.set_link("bob", "STATION-B", Link::Relayed).unwrap();
+        let c = Client::new(fake.clone());
+        // The new instance's peers have every link down.
+        restart_on(&fake, 1, |r| matches!(r, Request::Peers));
+        let (exit, out, err) = exec(&c, &["status"]).await;
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(out, "");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.starts_with("lost the connection to the station: "),
+            "{err}"
+        );
+        assert!(!fake.requests().contains(&Request::Peers));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn send_with_a_restart_before_its_send_never_sends() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        restart_on(&fake, 1, |r| matches!(r, Request::Send { .. }));
+        let (exit, out, err) = exec(&c, &["send", "bob", "hello"]).await;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
+}
+
+/// A fake whose `Log` answers `fix` rewrites: `fix(before, page)`, where `before` is the request's.
+#[derive(Clone)]
+struct Cursor {
+    fake: FakeStation,
+    fix: fn(Option<u64>, LogPage) -> LogPage,
+}
+
+impl Transport for Cursor {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let before = match &request {
+            Request::Log { before, .. } => Some(*before),
+            _ => None,
+        };
+        match (before, self.fake.call(request).await?) {
+            (Some(before), Response::Log { page }) => Ok(Response::Log {
+                page: (self.fix)(before, page),
+            }),
+            (_, response) => Ok(response),
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+impl BindInstance for Cursor {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            fake: self.fake.bound_to(instance_id),
+            fix: self.fix,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_log_cursor_that_does_not_move_back_is_a_bad_reply() {
+    bounded(async {
+        let n = usize::try_from(LOG_PAGE_MAX_MESSAGES).unwrap() + 200;
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1").with_log_capacity(n);
+        Client::new(fake.clone())
+            .peer_add("bob", "STATION-B")
+            .await
+            .unwrap();
+        for i in 0..n {
+            fake.receive("bob", &format!("m{i}")).unwrap();
+        }
+        let fixes: [fn(Option<u64>, LogPage) -> LogPage; 3] = [
+            // The second page repeats the cursor it was asked with.
+            |before, page| LogPage {
+                next_before: before.or(page.next_before),
+                ..page
+            },
+            // The second page gives a cursor above the one it was asked with.
+            |before, page| LogPage {
+                next_before: before.map(|b| b + 1).or(page.next_before),
+                ..page
+            },
+            // The first page is empty and has a cursor.
+            |_, page| LogPage {
+                messages: Vec::new(),
+                ..page
+            },
+        ];
+        for (i, fix) in fixes.into_iter().enumerate() {
+            let c = Client::new(Cursor {
+                fake: fake.clone(),
+                fix,
+            });
+            let (exit, out, err) = exec(&c, &["log"]).await;
+            assert_eq!((exit, out.as_str()), (Exit::NoStation, ""), "fix {i}");
+            assert_eq!(err.lines().count(), 1, "fix {i}: {err}");
+            assert!(
+                err.starts_with("unexpected reply from the station: "),
+                "fix {i}: {err}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chat_never_sends_to_an_instance_restarted_inside_the_send() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.receive("bob", "before").unwrap();
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            out.wait_for(|s| s.ends_with("<- bob before\n")).await;
+            restart_on(&fake, 1, |r| matches!(r, Request::Send { .. }));
+            input.write_all(b"must not arrive\n").await.unwrap();
+            input
+        };
+        let (exit, _input) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        assert!(sends(&fake).is_empty());
+        // The new instance logged only its own message.
+        let bodies: Vec<String> = fake.messages().into_iter().map(|m| m.body).collect();
+        assert_eq!(bodies, ["from the new instance"]);
+        assert!(!out.text().contains("must not arrive"));
+        assert!(!out.text().contains("from the new instance"));
+    })
+    .await;
+}
+
+// chat keeps reading while a send is pending (finding 3 of the review of #51).
+
+/// Where [`Gated`] holds a `Send`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldAt {
+    /// Before the fake gets the request.
+    Request,
+    /// After the fake answered, with the answer.
+    Reply,
+}
+
+/// Counts the held `Send` calls and lets them go one permit at a time.
+struct Gate {
+    held: Mutex<usize>,
+    changed: Notify,
+    permits: tokio::sync::Semaphore,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            held: Mutex::new(0),
+            changed: Notify::new(),
+            permits: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    fn held(&self) -> usize {
+        *self.held.lock().unwrap()
+    }
+
+    fn count(&self, delta: isize) {
+        let mut held = self.held.lock().unwrap();
+        *held = held.checked_add_signed(delta).unwrap();
+        self.changed.notify_waiters();
+    }
+
+    /// Waits for one permit, counted as held meanwhile, also when the call is dropped.
+    async fn pass(&self) {
+        struct Held<'a>(&'a Gate);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.0.count(-1);
+            }
+        }
+        self.count(1);
+        let _held = Held(self);
+        self.permits.acquire().await.unwrap().forget();
+    }
+
+    async fn wait_held(&self, n: usize) {
+        loop {
+            let mut changed = pin!(self.changed.notified());
+            changed.as_mut().enable();
+            if self.held() == n {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release(&self, n: usize) {
+        self.permits.add_permits(n);
+    }
+}
+
+/// A fake whose `Send` calls wait at a [`Gate`].
+#[derive(Clone)]
+struct Gated {
+    fake: FakeStation,
+    gate: Arc<Gate>,
+    at: HoldAt,
+}
+
+impl Gated {
+    fn new(fake: &FakeStation, at: HoldAt) -> Self {
+        Self {
+            fake: fake.clone(),
+            gate: Gate::new(),
+            at,
+        }
+    }
+}
+
+impl Transport for Gated {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let send = matches!(request, Request::Send { .. });
+        if send && self.at == HoldAt::Request {
+            self.gate.pass().await;
+        }
+        let answer = self.fake.call(request).await;
+        if send && self.at == HoldAt::Reply {
+            self.gate.pass().await;
+        }
+        answer
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+impl BindInstance for Gated {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            fake: self.fake.bound_to(instance_id),
+            gate: Arc::clone(&self.gate),
+            at: self.at,
+        }
+    }
+}
+
+/// How long a test waits for something that must happen while a send is held, before it decides
+/// that the chat is stuck in the send.
+const WHILE_HELD: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn chat_shows_incoming_messages_while_a_send_is_pending() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.set_now_ms(T0);
+        let gated = Gated::new(&fake, HoldAt::Reply);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"hello\n").await.unwrap();
+            gate.wait_held(1).await;
+            fake.receive("bob", "while you wait").unwrap();
+            tokio::time::timeout(
+                WHILE_HELD,
+                out.wait_for(|s| s.ends_with("<- bob while you wait\n")),
+            )
+            .await
+            .expect("an incoming message was not shown while the send was pending");
+            assert_eq!(gate.held(), 1);
+            gate.release(1);
+            drop(input);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::Done);
+        assert_eq!(err.text(), "");
+        assert_eq!(
+            out.text(),
+            "1 2023-11-14T22:13:20Z -> bob (sending) hello\n\
+             1 -> bob now (delivered)\n\
+             2 2023-11-14T22:13:20Z <- bob while you wait\n"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_station_stopping_while_a_send_is_held_ends_the_chat_once() {
+    bounded(async {
+        // The station stops: the live view and the held send both find out.
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        let (session, _out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"hello\n").await.unwrap();
+            gate.wait_held(1).await;
+            fake.stop();
+            // If the chat still waits for the send, it now gets `Stopping`.
+            gate.release(1);
+            input
+        };
+        let (exit, _input) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+
+        // Only the send finds out: calls fail with `Stopping`, the subscription stays open.
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let (session, _out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"hello\n").await.unwrap();
+            gate.wait_held(1).await;
+            fake.fail_calls(Some(ApiError::Stopping));
+            gate.release(1);
+            input
+        };
+        let (exit, _input) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn typed_lines_are_sent_one_at_a_time_in_order() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Reply);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"one\ntwo\nthree\n").await.unwrap();
+            for (i, body) in ["one", "two", "three"].into_iter().enumerate() {
+                out.wait_for(|s| s.contains(&format!("-> bob (sending) {body}\n")))
+                    .await;
+                gate.wait_held(1).await;
+                // One in flight: the next line waits for this one's answer.
+                assert_eq!(sends(&fake).len(), i + 1);
+                gate.release(1);
+            }
+            drop(input);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::Done);
+        assert_eq!(err.text(), "");
+        assert_eq!(sends(&fake), ["one", "two", "three"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn end_of_input_with_a_send_in_flight_still_sends_it() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"last\nqueued\n").await.unwrap();
+            gate.wait_held(1).await;
+            drop(input);
+            // The chat still shows what arrives while its sends finish.
+            fake.receive("bob", "meanwhile").unwrap();
+            tokio::time::timeout(
+                WHILE_HELD,
+                out.wait_for(|s| s.contains("<- bob meanwhile\n")),
+            )
+            .await
+            .expect("nothing was shown after the end of input");
+            gate.release(2);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::Done);
+        assert_eq!(err.text(), "");
+        assert_eq!(sends(&fake), ["last", "queued"]);
+    })
+    .await;
+}
+
 // Errors of the transport and of a stopped station.
 
 /// A transport that answers every call and subscription with one error.
 struct Failing(ApiError);
+
+impl BindInstance for Failing {
+    fn bound_to(&self, _instance_id: &str) -> Self {
+        Failing(self.0.clone())
+    }
+}
 
 impl Transport for Failing {
     async fn call(&self, _request: Request) -> Result<chief::api::Response, ApiError> {

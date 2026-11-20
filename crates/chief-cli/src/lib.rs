@@ -2,8 +2,9 @@
 //!
 //! The binary (`src/main.rs`) only parses the arguments, works out the socket path with
 //! [`socket_path`], builds a [`chief::client::SocketTransport`] and calls [`run`] with the real
-//! stdin, stdout and stderr. Everything else is here, generic over the [`Transport`], so that tests
-//! run every command in-process against a fake station and capture what it prints.
+//! stdin, stdout and stderr. Everything else is here, generic over the transport
+//! ([`BindInstance`]), so that tests run every command in-process against a fake station and
+//! capture what it prints.
 //!
 //! # Commands
 //!
@@ -20,8 +21,29 @@
 //!                                  from stdin is sent to <peer>; end of input ends the chat
 //! ```
 //!
-//! End of input ends `chat` at once: the outcome of a message sent just before is not waited for
-//! (it is in `log`); `send` is the command that waits for the outcome.
+//! # One station instance per command
+//!
+//! A station gets a new instance id on every start (rule 1 in `chief::api`). A command that makes
+//! more than one call reads the status first and binds its client to that instance
+//! ([`chief::client::BindInstance`]): `status` reads the peers, `log` every page, `send` its
+//! subscription and its send, and `chat` its follower and every send through the bound client. If
+//! the station restarts in between, the next call fails before it reaches the new instance, and
+//! the command ends with exit 3 and one line, as for a lost connection: it never mixes the answers
+//! of two instances, and never sends a typed line to a station other than the one whose messages
+//! it shows. `id`, `peer ls`, `peer add` and `peer rm` make one call each and need no binding.
+//!
+//! # chat
+//!
+//! `chat` keeps showing what the station sends while a typed line is being sent. One line is sent
+//! at a time; lines typed meanwhile wait, in order. A line the station refuses (an unknown peer,
+//! an invalid body) prints its error and the chat goes on. When the station cannot be talked to
+//! any more (it stopped, restarted, or the connection broke), noticed by a send or by the live
+//! view, whichever comes first, the chat ends once, with one line on stderr and exit 3.
+//!
+//! End of input ends `chat` once the line being sent and the lines still waiting have been sent
+//! (each bounded by the transport's call timeout); what the station shows meanwhile is still
+//! printed. The outcome of the last message is not waited for (it is in `log`); `send` is the
+//! command that waits for the outcome.
 //!
 //! # Output (stable: scripts parse it)
 //!
@@ -57,7 +79,8 @@
 //! # Exit codes
 //!
 //! See [`Exit`]: 0 done (for `send`: delivered); 1 the station refused or the operation failed
-//! (for `send`: not delivered); 2 usage error; 3 cannot talk to a station.
+//! (for `send`: not delivered); 2 usage error; 3 cannot talk to a station, or the station
+//! restarted during the command (`log`, `status`, `send`), or stopped during a `chat`.
 //!
 //! # Process-global state
 //!
@@ -68,16 +91,23 @@ use chief::api::{
     ApiError, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, Message, MessageStatus, Peer,
     TowerState,
 };
-use chief::client::{Client, Transport};
+use chief::client::{BindInstance, Client};
 use chief::follow::LogUpdate;
 use chief::paths::{PathEnv, check_socket_path};
 use clap::{Parser, Subcommand};
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// How many messages `chat` shows before it goes live.
 pub const CHAT_TAIL: u32 = 50;
+
+/// How many typed lines `chat` reads ahead while one is being sent. Further lines stay unread in
+/// the input until there is room.
+const CHAT_QUEUE_MAX: usize = 64;
 
 /// The text after the options in `--help`: the exit codes and where the socket is.
 pub const AFTER_HELP: &str = "\
@@ -85,8 +115,8 @@ Exit status:
   0  done; for send: the message was delivered
   1  the station refused or the operation failed; for send: the message was not delivered
   2  usage error
-  3  cannot talk to a station: none is running, it speaks another API version, or it stopped
-     answering
+  3  cannot talk to a station: none is running, it speaks another API version, it stopped
+     answering, or it restarted during the command; for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
 set, otherwise station.sock in the station's data dir, $XDG_DATA_HOME/thecompany/station (or
@@ -136,8 +166,10 @@ pub enum Command {
     },
     /// Show the last 50 messages, then follow live; each line typed is sent to the peer
     ///
-    /// End of input (Ctrl-D) ends the chat at once, without waiting for the outcome of a message
-    /// just sent; `chief send` is the command that waits for it.
+    /// Lines are sent one at a time, in order, while the chat keeps showing new messages. End of
+    /// input (Ctrl-D) ends the chat once the lines typed so far have been sent, without waiting
+    /// for their outcome; `chief send` is the command that waits for it. The chat ends with exit 3
+    /// when the station stops or restarts.
     Chat {
         /// The peer that typed lines go to (messages of every peer are shown)
         peer: String,
@@ -174,7 +206,9 @@ pub enum Exit {
     /// 2: a usage error, reported by clap.
     Usage,
     /// 3: cannot talk to a station: none is running, it speaks another API version, the
-    /// connection broke, it did not answer in time or answered nonsense. Also when no socket path
+    /// connection broke, it did not answer in time or answered nonsense. Also when the station
+    /// restarted during a command of several calls (the next call is refused before it reaches
+    /// the new instance), when a `chat` ends because the station stopped, and when no socket path
     /// can be worked out.
     NoStation,
 }
@@ -255,6 +289,16 @@ pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, Str
 ///
 /// Normal output goes to `out`, errors to `err`, every line through [`say`]. `input` is read only
 /// by `chat`, one line per message; the binary passes stdin, tests pass whatever they like.
+///
+/// The transport must be able to bind itself to one station instance ([`BindInstance`]): a
+/// command of several calls (`status`, `log`, `send`, `chat`) reads the status first and makes
+/// every later call through a client bound to that instance (see "One station instance per
+/// command" in the crate docs). `client` itself stays unbound.
+///
+/// Exit codes ([`Exit`]): 0 done; 1 the station refused; 3 cannot talk to the station, which
+/// includes the bound instance being gone (the station restarted mid-command), a log cursor that
+/// does not move back ([`ApiError::BadReply`]), and a `chat` that ends because the station
+/// stopped. `chat` returns 0 at the end of `input`, after the lines read so far have been sent.
 pub async fn run<T, I>(
     command: &Command,
     client: &Client<T>,
@@ -263,7 +307,7 @@ pub async fn run<T, I>(
     err: &mut dyn Write,
 ) -> Exit
 where
-    T: Transport,
+    T: BindInstance,
     I: AsyncBufRead + Unpin,
 {
     let result = match command {
@@ -454,15 +498,16 @@ fn report(err: &mut dyn Write, error: &ApiError) -> Exit {
     Exit::for_error(error)
 }
 
-async fn id<T: Transport>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
+async fn id<T: BindInstance>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
     let status = client.status().await?;
     say(out, &status.station_id)?;
     Ok(Exit::Done)
 }
 
-async fn status<T: Transport>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
+async fn status<T: BindInstance>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
     let status = client.status().await?;
-    let peers = client.peers().await?;
+    // The peers of the instance whose towers are shown, or none.
+    let peers = client.bound_to(&status.instance_id).peers().await?;
     if status.towers.is_empty() {
         say(out, "no towers")?;
     }
@@ -481,7 +526,7 @@ async fn status<T: Transport>(client: &Client<T>, out: &mut dyn Write) -> Outcom
     Ok(Exit::Done)
 }
 
-async fn peer_add<T: Transport>(
+async fn peer_add<T: BindInstance>(
     client: &Client<T>,
     name: &str,
     station_id: &str,
@@ -494,7 +539,7 @@ async fn peer_add<T: Transport>(
     Ok(Exit::Done)
 }
 
-async fn peer_ls<T: Transport>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
+async fn peer_ls<T: BindInstance>(client: &Client<T>, out: &mut dyn Write) -> Outcome {
     let peers = client.peers().await?;
     if peers.is_empty() {
         say(out, "no peers")?;
@@ -505,20 +550,23 @@ async fn peer_ls<T: Transport>(client: &Client<T>, out: &mut dyn Write) -> Outco
     Ok(Exit::Done)
 }
 
-async fn peer_rm<T: Transport>(client: &Client<T>, name: &str, out: &mut dyn Write) -> Outcome {
+async fn peer_rm<T: BindInstance>(client: &Client<T>, name: &str, out: &mut dyn Write) -> Outcome {
     client.peer_remove(name).await?;
     say(out, &format!("removed {name}"))?;
     Ok(Exit::Done)
 }
 
-async fn send<T: Transport>(
+async fn send<T: BindInstance>(
     client: &Client<T>,
     peer: &str,
     text: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Outcome {
-    let message = client.send_and_wait(peer, text).await?;
+    // Bound, so that a restart between the subscription and the send cannot send the message to
+    // an instance whose outcome this command never sees.
+    let instance = client.status().await?.instance_id;
+    let message = client.bound_to(&instance).send_and_wait(peer, text).await?;
     match message.status {
         MessageStatus::Delivered => {
             say(out, &format!("delivered to {}", message.peer))?;
@@ -535,19 +583,38 @@ async fn send<T: Transport>(
     }
 }
 
-async fn log<T: Transport>(client: &Client<T>, peer: Option<&str>, out: &mut dyn Write) -> Outcome {
-    // Pages come newest first; each lists its messages oldest first (rule 6 in chief::api).
+async fn log<T: BindInstance>(
+    client: &Client<T>,
+    peer: Option<&str>,
+    out: &mut dyn Write,
+) -> Outcome {
+    // Every page from one instance: a cursor means something only with the instance it came from
+    // (rule 1 in chief::api).
+    let instance = client.status().await?.instance_id;
+    let client = client.bound_to(&instance);
+    // Pages come newest first; each lists its messages oldest first (rule 6 in chief::api). They
+    // are buffered and printed only once the whole read has succeeded.
     let mut pages: Vec<Vec<Message>> = Vec::new();
     let mut before: Option<u64> = None;
     loop {
         let page = client.log(peer, before, LOG_PAGE_MAX_MESSAGES).await?;
-        let first = page.messages.first().map(|m| m.seq);
+        let empty = page.messages.is_empty();
         pages.push(page.messages);
-        match (page.next_before, first) {
-            // Go on only while the cursor moves back, so a station that repeats itself cannot
-            // keep this loop going.
-            (Some(next), Some(_)) if before.is_none_or(|b| next < b) => before = Some(next),
-            _ => break,
+        match page.next_before {
+            None => break,
+            // Only a page of `limit: 0` may be empty with a cursor (rule 6).
+            Some(_) if empty => {
+                return Err(Stop::Api(ApiError::BadReply {
+                    detail: "the station gave an empty page of the log with a cursor".to_owned(),
+                }));
+            }
+            Some(next) if before.is_none_or(|b| next < b) => before = Some(next),
+            // A cursor that does not move back would read the same pages again, or forever.
+            Some(_) => {
+                return Err(Stop::Api(ApiError::BadReply {
+                    detail: "the cursor of the log did not move back".to_owned(),
+                }));
+            }
         }
     }
     let mut messages = pages.into_iter().rev().flatten().peekable();
@@ -569,6 +636,35 @@ async fn log<T: Transport>(client: &Client<T>, peer: Option<&str>, out: &mut dyn
     Ok(Exit::Done)
 }
 
+/// A send of `chat` in flight.
+type PendingSend<'a> = Pin<Box<dyn Future<Output = Result<Message, ApiError>> + 'a>>;
+
+/// Whether `error` means that the chat cannot go on with this station: the errors of "cannot talk
+/// to a station" ([`Exit::NoStation`]) and a station that is shutting down.
+fn station_gone(error: &ApiError) -> bool {
+    Exit::for_error(error) == Exit::NoStation || *error == ApiError::Stopping
+}
+
+/// Ends a chat because the station is gone, with one line on `err` and exit 3. `error` is what
+/// noticed it; `None` when the live view ended.
+fn end_chat(err: &mut dyn Write, error: Option<&ApiError>) -> Outcome {
+    match error {
+        // Timeout, IncompatibleApi, BadReply: one line each in `report`.
+        Some(
+            other @ (ApiError::Timeout { .. }
+            | ApiError::IncompatibleApi { .. }
+            | ApiError::BadReply { .. }),
+        ) => {
+            report(err, other);
+        }
+        // The end of the live view, or a station that stopped, restarted or went away.
+        _ => {
+            let _ = say(err, "the station stopped; the chat has ended");
+        }
+    }
+    Ok(Exit::NoStation)
+}
+
 async fn chat<T, I>(
     client: &Client<T>,
     peer: &str,
@@ -577,9 +673,12 @@ async fn chat<T, I>(
     err: &mut dyn Write,
 ) -> Outcome
 where
-    T: Transport,
+    T: BindInstance,
     I: AsyncBufRead + Unpin,
 {
+    // The follower and every send talk to this one instance, or fail (rule 1 in chief::api).
+    let instance = client.status().await?.instance_id;
+    let client = &client.bound_to(&instance);
     if !client.peers().await?.iter().any(|p| p.name == peer) {
         return Err(Stop::Api(ApiError::PeerNotFound {
             name: peer.to_owned(),
@@ -587,49 +686,64 @@ where
     }
     let mut follower = client.follow_log(None, CHAT_TAIL).await?;
     let mut lines = input.lines();
+    // Typed lines not sent yet, in order, and the one send in flight.
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut pending: Option<PendingSend<'_>> = None;
+    let mut input_open = true;
     loop {
+        if pending.is_none()
+            && let Some(text) = queue.pop_front()
+        {
+            pending = Some(Box::pin(async move { client.send(peer, &text).await }));
+        }
+        if !input_open && pending.is_none() {
+            return Ok(Exit::Done);
+        }
+        let reading = input_open && queue.len() < CHAT_QUEUE_MAX;
         tokio::select! {
             // Biased: what the station has to show goes first, so the backlog is printed before a
-            // line is read, and an outcome before the end of input.
+            // line is read, and the end of the station before a send's error.
             biased;
             // Cancel-safe: updates not yet yielded stay queued in the follower.
             update = follower.next() => match update {
                 Ok(Some(LogUpdate::Added(message))) => say(out, &format_message(&message))?,
                 Ok(Some(LogUpdate::Changed(message))) => say(out, &format_change(&message))?,
-                // The station is gone: the subscription ended, or a re-read after a `Resync`
-                // found no station. Ends the chat like the end of the subscription.
-                Ok(None)
-                | Err(
-                    ApiError::NotRunning { .. }
-                    | ApiError::Disconnected { .. }
-                    | ApiError::Stopping,
-                ) => {
-                    let _ = say(err, "the station stopped; the chat has ended");
-                    return Ok(Exit::NoStation);
-                }
+                // The subscription ended, or a re-read after a `Resync` found another instance.
+                Ok(None) => return end_chat(err, None),
+                Err(error) if station_gone(&error) => return end_chat(err, Some(&error)),
                 // Any other error ends the chat too, with its own message and exit; it is never
                 // retried, so a station that keeps failing cannot spin this loop.
                 Err(error) => return Err(Stop::Api(error)),
             },
-            // Cancel-safe: `Lines::next_line` keeps a partly read line in its own buffer.
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    let text = line.strip_suffix('\r').unwrap_or(&line);
-                    if text.trim().is_empty() {
-                        continue;
-                    }
+            // The send in flight, polled together with the follower and the input. A future is
+            // polled only here, and dropped once it is done.
+            sent = async {
+                match pending.as_mut() {
+                    Some(send) => send.await,
+                    None => std::future::pending().await,
+                }
+            }, if pending.is_some() => {
+                pending = None;
+                match sent {
                     // The outcome arrives through the follower, as a change of the message.
-                    match client.send(peer, text).await {
-                        Ok(_) => {}
-                        Err(error) if Exit::for_error(&error) == Exit::NoStation => {
-                            return Err(Stop::Api(error));
-                        }
-                        Err(error) => {
-                            report(err, &error);
-                        }
+                    Ok(_) => {}
+                    Err(error) if station_gone(&error) => return end_chat(err, Some(&error)),
+                    // A refusal of this one message: say why and go on.
+                    Err(error) => {
+                        report(err, &error);
                     }
                 }
-                Ok(None) => return Ok(Exit::Done),
+            },
+            // Cancel-safe: `Lines::next_line` keeps a partly read line in its own buffer.
+            line = lines.next_line(), if reading => match line {
+                Ok(Some(line)) => {
+                    let text = line.strip_suffix('\r').unwrap_or(&line);
+                    if !text.trim().is_empty() {
+                        queue.push_back(text.to_owned());
+                    }
+                }
+                // End of input: the lines read so far are still sent.
+                Ok(None) => input_open = false,
                 Err(error) => {
                     let _ = say(err, &format!("cannot read the input: {error}"));
                     return Ok(Exit::Failed);

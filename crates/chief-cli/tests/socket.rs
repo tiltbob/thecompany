@@ -7,9 +7,12 @@
 //!
 //! Nothing sleeps, every test is bounded, ids are placeholders (AGENTS.md, hard rule 9).
 
-use chief::api::FailReason;
-use chief::client::{Client, SocketTransport};
-use chief::fake::{FakeStation, SendOutcome};
+use chief::api::{ApiError, FailReason, Link, Request, Response, TowerState};
+use chief::client::{
+    BindInstance, Client, SUBSCRIPTION_CAPACITY, SocketTransport, Subscription, Transport,
+    subscription,
+};
+use chief::fake::{FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief_cli::{Cli, Command, Exit, run};
 use clap::Parser;
 use numbers_station::ipc::{IpcConfig, IpcServer};
@@ -20,8 +23,8 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::BufReader;
-use tokio::sync::Notify;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::sync::{Notify, watch};
 
 const BOUND: Duration = Duration::from_secs(30);
 
@@ -37,7 +40,7 @@ fn parse(args: &[&str]) -> Command {
         .command
 }
 
-async fn exec(client: &Client<SocketTransport>, args: &[&str]) -> (Exit, String, String) {
+async fn exec<T: BindInstance>(client: &Client<T>, args: &[&str]) -> (Exit, String, String) {
     let command = parse(args);
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -224,6 +227,197 @@ async fn chat_through_the_socket() {
         let (exit, _input) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
         assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_and_the_peer_book_through_the_socket() {
+    bounded(async {
+        let rig = rig().await;
+        rig.fake.set_tower_state(TowerState::Connected);
+        rig.fake
+            .set_link("bob", "STATION-B", Link::Relayed)
+            .unwrap();
+        assert_eq!(
+            exec(&rig.client, &["status"]).await,
+            (
+                Exit::Done,
+                format!("tower {FAKE_TOWER_URL} connected\npeer bob STATION-B relayed\n"),
+                String::new()
+            )
+        );
+        assert_eq!(
+            exec(&rig.client, &["peer", "add", "carol", "STATION-C"]).await,
+            (
+                Exit::Done,
+                "carol STATION-C down\n".to_owned(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            exec(&rig.client, &["peer", "ls"]).await,
+            (
+                Exit::Done,
+                "bob STATION-B relayed\ncarol STATION-C down\n".to_owned(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            exec(&rig.client, &["peer", "rm", "carol"]).await,
+            (Exit::Done, "removed carol\n".to_owned(), String::new())
+        );
+        assert_eq!(
+            exec(&rig.client, &["peer", "ls"]).await,
+            (
+                Exit::Done,
+                "bob STATION-B relayed\n".to_owned(),
+                String::new()
+            )
+        );
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+// A chat never sends to another instance that took the socket (finding 1 of the review of #51).
+
+/// Another start of the station: instance `INSTANCE-2`, with a peer `bob` of its own.
+async fn other_instance() -> FakeStation {
+    let fake = FakeStation::new("STATION-A", "INSTANCE-2");
+    Client::new(fake.clone())
+        .peer_add("bob", "STATION-OTHER-B")
+        .await
+        .unwrap();
+    fake
+}
+
+fn sends(fake: &FakeStation) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| matches!(r, Request::Send { .. }))
+        .count()
+}
+
+/// A socket transport whose subscriptions end late: after the station's end of a subscription,
+/// the subscriber sees it only once the test sets `release`. So a test can let a typed line race
+/// a subscription that has already ended underneath.
+#[derive(Clone)]
+struct LateEnd {
+    inner: SocketTransport,
+    release: watch::Receiver<bool>,
+}
+
+impl Transport for LateEnd {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        self.inner.call(request).await
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        let mut inner = self.inner.subscribe().await?;
+        let (sink, events) = subscription(SUBSCRIPTION_CAPACITY);
+        let mut release = self.release.clone();
+        tokio::spawn(async move {
+            while let Some(event) = inner.next().await {
+                if sink.push(event).is_err() {
+                    return;
+                }
+            }
+            let _ = release.wait_for(|r| *r).await;
+            drop(sink);
+        });
+        Ok(events)
+    }
+}
+
+impl BindInstance for LateEnd {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            inner: self.inner.bound_to(instance_id),
+            release: self.release.clone(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_chat_never_sends_to_another_instance_that_took_the_socket() {
+    bounded(async {
+        let rig = rig().await;
+        let path = rig.server.path().to_path_buf();
+        rig.fake.receive("bob", "from one").unwrap();
+        let (release, released) = watch::channel(false);
+        let client = Client::new(LateEnd {
+            inner: SocketTransport::new(&path),
+            release: released,
+        });
+        let command = parse(&["chat", "bob"]);
+        let (mut input, reader) = tokio::io::duplex(1024);
+        let out = Shared::default();
+        let err = Shared::default();
+        let (mut o, mut e) = (out.clone(), err.clone());
+        let session = run(&command, &client, BufReader::new(reader), &mut o, &mut e);
+        let second = other_instance().await;
+        let drive = async {
+            out.wait_for(|s| s.ends_with("<- bob from one\n")).await;
+            // The first instance goes away; the chat does not see its subscription end yet.
+            rig.server.shutdown().await;
+            let server = IpcServer::bind(second.clone(), &path, IpcConfig::default())
+                .await
+                .unwrap();
+            input.write_all(b"must not arrive\n").await.unwrap();
+            // With the fix the chat ends here. Without it, the line goes to the second instance
+            // and the chat goes on until its subscription's end is let through.
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), err.wait_for(|s| !s.is_empty())).await;
+            let _ = release.send(true);
+            (input, server)
+        };
+        let (exit, (_input, server)) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        assert_eq!(sends(&second), 0);
+        assert!(second.messages().is_empty());
+        assert_eq!(out.text().lines().count(), 1);
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_typed_line_and_the_end_of_the_instance_ready_together_never_reach_the_next_one() {
+    bounded(async {
+        let rig = rig().await;
+        let path = rig.server.path().to_path_buf();
+        rig.fake.receive("bob", "from one").unwrap();
+        let client = Client::new(SocketTransport::new(&path));
+        let command = parse(&["chat", "bob"]);
+        let (mut input, reader) = tokio::io::duplex(1024);
+        let out = Shared::default();
+        let err = Shared::default();
+        let (mut o, mut e) = (out.clone(), err.clone());
+        let session = run(&command, &client, BufReader::new(reader), &mut o, &mut e);
+        let mut session = pin!(session);
+        tokio::select! {
+            exit = &mut session => panic!("the chat ended early: {exit:?}"),
+            () = out.wait_for(|s| s.ends_with("<- bob from one\n")) => {}
+        }
+        // The chat is idle and not polled now: the line waits to be read while the first
+        // instance goes away and another takes the socket.
+        input.write_all(b"must not arrive\n").await.unwrap();
+        rig.server.shutdown().await;
+        let second = other_instance().await;
+        let server = IpcServer::bind(second.clone(), &path, IpcConfig::default())
+            .await
+            .unwrap();
+        // Both the end of the subscription and the line are ready; whichever the chat takes
+        // first, nothing reaches the second instance.
+        let exit = session.await;
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        assert_eq!(sends(&second), 0);
+        assert!(second.messages().is_empty());
+        drop(input);
+        server.shutdown().await;
     })
     .await;
 }
