@@ -426,8 +426,14 @@ impl<T: Transport> Client<T> {
     /// re-read gives [`ApiError::MessageNotFound`], which is returned: whether or not the gap hid
     /// the outcome's event, and also when the outcome has not happened yet.
     ///
-    /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
-    /// call in a timeout. Every error here comes after the station accepted the message.
+    /// Under that precondition the station's send deadline bounds the wait: the outcome comes as
+    /// an event, or a `Resync` makes it re-read the message. A caller that wants a shorter bound
+    /// wraps the call in a timeout. Every error here comes after the station accepted the
+    /// message.
+    ///
+    /// If the precondition is broken, with `events` opened after the send, an outcome pushed in
+    /// between is missed, and the wait lasts until the next [`Event::Resync`] or the end of the
+    /// subscription, which may never come: then only the caller's own timeout bounds it.
     pub async fn wait_for_outcome(
         &self,
         events: &mut Subscription,

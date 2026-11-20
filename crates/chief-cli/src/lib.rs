@@ -38,9 +38,9 @@
 //! `log` reads the whole log page by page and prints it only once every page has been read. It
 //! checks every page against rule 6 in `chief::api`: its messages ascend by `seq`, lie below the
 //! cursor it was asked with, and its cursor is the `seq` of its first message; a page with a
-//! cursor is not empty, and the cursor moves back. It stops at [`LOG_MAX_MESSAGES`] (100,000)
-//! messages, far more than a station keeps. A page that breaks a rule, or a log that runs past
-//! that, ends `log` with exit 3, one line, and nothing printed.
+//! cursor is not empty. So the cursor moves back with every page. It stops at
+//! [`LOG_MAX_MESSAGES`] (100,000) messages, far more than a station keeps. A page that breaks a
+//! rule, or a log that runs past that, ends `log` with exit 3, one line, and nothing printed.
 //!
 //! # send
 //!
@@ -52,16 +52,19 @@
 //! - Not delivered, exit 1: the station refused the message (an unknown peer, an invalid body), so
 //!   nothing was sent; or the station reported that it failed (`<peer> appears offline, or has
 //!   not added you`, `<peer> refused the message`, `<peer> was removed before the message was
-//!   delivered`). When no station can be talked to before the send, the exit is 3 with one line,
-//!   and nothing was sent either.
-//! - Unknown, exit 3, with two lines on stderr. The send got no answer it could read (it timed
-//!   out, the connection broke, or the answer was nonsense): its error, then ``the message may
-//!   still have been sent; check `chief log <peer>` before sending it again``. Or the station
-//!   accepted the message and the wait then failed (the station stopped or restarted, the message
-//!   left the log before its outcome was seen, or 120 s passed): the error, or `the station did
-//!   not report the outcome within 120 s`, then ``the station accepted the message, but its
-//!   outcome is unknown; check `chief log <peer>` before sending it again``. Once the station
-//!   has accepted the message, `send` never exits 1 unless the station reported it failed.
+//!   delivered`).
+//! - Unknown, exit 3, and stderr ends with one of two sentences. The send got no answer it could
+//!   read (it timed out, the connection broke, or the answer was nonsense): its error, then ``the
+//!   message may still have been sent; check `chief log <peer>` before sending it again``. Or the
+//!   station accepted the message and the wait then failed (the station stopped or restarted, the
+//!   message left the log before its outcome was seen, or 120 s passed): the error, or `the
+//!   station did not report the outcome within 120 s`, then ``the station accepted the message,
+//!   but its outcome is unknown; check `chief log <peer>` before sending it again``.
+//!
+//! Any other exit 3 (no station is running, it speaks another API version, it is shutting down,
+//! it restarted before the send) means that nothing was sent; its error may take more than one
+//! line. Once the station has accepted the message, `send` never exits 1 unless the station
+//! reported it failed.
 //!
 //! # chat
 //!
@@ -96,13 +99,13 @@
 //!
 //! # Output (stable: scripts parse it)
 //!
-//! Every line goes through [`say`], which replaces with a space every control character, as the
-//! station does (rule 9 in `chief::api`, hard rule 8), and also U+2028 LINE SEPARATOR, U+2029
-//! PARAGRAPH SEPARATOR and the bidirectional controls U+202A to U+202E and U+2066 to U+2069:
-//! nothing a peer or a tower wrote can move the cursor, clear the screen, forge a line, or reorder
-//! the fields of a line. Fields are separated by one space; peer names,
-//! station ids, URLs, times and status words contain no space, so only the last field of a line
-//! may.
+//! Every line goes through [`say`], which applies rule 9 of `chief::api` once more, as the last
+//! place to find out that a station did not (hard rule 8): every control character, Unicode line
+//! or paragraph separator and bidirectional control becomes a space (the set is
+//! [`chief::api::is_replaced`]). Nothing a peer or a tower wrote can move the cursor, clear the
+//! screen, forge a line, or reorder the fields of a line. Fields are separated by one space; peer
+//! names, station ids, URLs, times and status words contain no space, so only the last field of a
+//! line may.
 //!
 //! - `id`: the station id, alone on its line.
 //! - A message (`log`, `chat`): `<seq> <time> <arrow> <peer> [(<status>)] <body>`. The time is UTC,
@@ -145,7 +148,7 @@
 
 use chief::api::{
     ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message,
-    MessageStatus, Peer, TowerState,
+    MessageStatus, Peer, TowerState, clean,
 };
 use chief::client::{BindInstance, Client};
 use chief::follow::LogUpdate;
@@ -182,9 +185,11 @@ Exit status:
      (it was not sent) or reported that it failed (it was not delivered); for chat: at the end
      of the input, a line was refused, too long or not UTF-8, or the input failed
   2  usage error
-  3  cannot talk to a station: none is running, it speaks another API version, it is shutting
-     down, it stopped answering, or it restarted during the command; for send: also when the
-     outcome is unknown (see chief send --help); for chat: the station stopped or restarted
+  3  cannot talk to a station: no socket path could be worked out, none is running, it speaks
+     another API version, it is shutting down, the connection broke, it stopped answering, it
+     answered nonsense (such as a malformed page of the log, or a log longer than 100,000
+     messages), or it restarted during the command; for send: also when the outcome is unknown
+     (see chief send --help); for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
 set, otherwise station.sock in the station's data dir, $XDG_DATA_HOME/thecompany/station (or
@@ -223,11 +228,13 @@ pub enum Command {
     /// Send a message and wait for the outcome
     ///
     /// Waits at most 120 s for the outcome. Exit 0: delivered. Exit 1: the station refused the
-    /// message, so it was not sent, or reported that it failed. Exit 3 with one line: no station
-    /// could be talked to, and nothing was sent. Exit 3 with a second line: the outcome is
-    /// unknown, because the send got no answer, or because the station accepted the message and
-    /// then stopped, restarted, lost it from its log, or did not report the outcome within 120 s;
-    /// check `chief log <peer>` before sending it again.
+    /// message, so it was not sent, or reported that it failed.
+    ///
+    /// Exit 3: the outcome is unknown only if stderr ends with "the message may still have been
+    /// sent; ..." (the send got no answer) or "the station accepted the message, but its outcome
+    /// is unknown; ..." (the station accepted it, then stopped, restarted, lost it from its log,
+    /// or did not report the outcome within 120 s); check `chief log <peer>` before sending it
+    /// again. Any other exit 3 means that no station could be talked to and nothing was sent.
     Send {
         /// The peer's name
         peer: String,
@@ -291,10 +298,11 @@ pub enum Exit {
     /// 2: a usage error, reported by clap.
     Usage,
     /// 3: cannot talk to a station: none is running, it speaks another API version, it is
-    /// shutting down, the connection broke, it did not answer in time or answered nonsense. Also when the station
-    /// restarted during a command of several calls (the next call is refused before it reaches
-    /// the new instance), when a `chat` ends because the station stopped, when no socket path
-    /// can be worked out, and when the outcome of a `send` is unknown (see the crate docs).
+    /// shutting down, the connection broke, it did not answer in time or answered nonsense. Also
+    /// when the station restarted during a command of several calls (the next call is refused
+    /// before it reaches the new instance), when a `chat` ends because the station stopped, when
+    /// no socket path can be worked out, and when the outcome of a `send` is unknown (see the
+    /// crate docs).
     NoStation,
 }
 
@@ -438,29 +446,16 @@ where
     }
 }
 
-/// Writes `text` and a newline to `w`. It replaces with a space every control character in
-/// `text`: every `char` for which [`char::is_control`] is true (C0, DEL and C1, so newline,
-/// carriage return, tab and escape too), the same words and the same rule as rule 9 in
-/// `chief::api` for the station. It also replaces the characters that rule leaves, but that can
-/// break a line or reorder its fields for a reader that splits on Unicode line breaks or shows
-/// bidirectional text: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, the bidirectional
-/// embeddings and overrides U+202A to U+202E, and the bidirectional isolates U+2066 to U+2069.
+/// Writes `text` and a newline to `w`, after applying rule 9 of `chief::api` to `text` once
+/// more with [`clean`]: every control character, every Unicode line or paragraph separator and
+/// every bidirectional control becomes one space ([`chief::api::is_replaced`] defines the set).
 ///
 /// The one way this crate prints anything, so that no text from a station, a peer or a tower
-/// reaches the terminal unfiltered (hard rule 8). The station replaces control characters in peer
-/// text already; a terminal is the last place to find out it did not.
+/// reaches the terminal unfiltered (hard rule 8). The station applies rule 9 to peer text
+/// already; a terminal is the last place to find out it did not.
 pub fn say(w: &mut dyn Write, text: &str) -> io::Result<()> {
-    let clean: String = text
-        .chars()
-        .map(|c| if replaced(c) { ' ' } else { c })
-        .collect();
-    writeln!(w, "{clean}")?;
+    writeln!(w, "{}", clean(text))?;
     w.flush()
-}
-
-/// Whether [`say`] replaces `c` with a space.
-fn replaced(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Formats unix milliseconds as UTC `YYYY-MM-DDTHH:MM:SSZ`, dropping the milliseconds. Years past
@@ -794,13 +789,9 @@ async fn log<T: BindInstance>(
                     detail: "the station gave an empty page of the log with a cursor".to_owned(),
                 }));
             }
-            Some(next) if before.is_none_or(|b| next < b) => before = Some(next),
-            // A cursor that does not move back would read the same pages again, or forever.
-            Some(_) => {
-                return Err(Stop::Api(ApiError::BadReply {
-                    detail: "the cursor of the log did not move back".to_owned(),
-                }));
-            }
+            // `check_page` made sure the cursor is the first message's seq, below `before`: it
+            // moves back, so the read ends.
+            Some(next) => before = Some(next),
         }
     }
     let mut messages = pages.into_iter().rev().flatten().peekable();
@@ -949,10 +940,13 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
 
     /// The next line, or what else the input gave.
     ///
-    /// Cancel-safe, so it can be used in `select!`: the only await is `fill_buf`, which takes
+    /// Cancel-safe, so it can be used in `select!`. There are two awaits. `fill_buf` takes
     /// nothing from the input; what it returned is moved into `self` and consumed without an
-    /// await in between, so a dropped call loses nothing, and the part of a line read so far
-    /// stays in `self` for the next call.
+    /// await in between. The other is a yield after each part of a line that has not ended yet,
+    /// so that an input that is always ready but never ends a line cannot keep the `select!`
+    /// from polling its other branches; when it comes, everything read so far is in `self`. So a
+    /// dropped call loses nothing, and the part of a line read so far stays in `self` for the
+    /// next call.
     async fn next(&mut self) -> Input {
         loop {
             let (used, complete) = {
@@ -990,6 +984,8 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
             if complete {
                 return self.finish();
             }
+            // The line goes on: let the caller's other branches run before reading more.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1094,11 +1090,14 @@ where
                     // The outcome arrives through the follower, as a change of the message.
                     Ok(_) => continue,
                     // This send's own error ends the chat. Its line may have been sent when the
-                    // call ended without an answer (rule 12 in chief::api).
+                    // call ended without an answer (rule 12 in chief::api); a refusal (`Stopping`,
+                    // `NotRunning`, `IncompatibleApi`) sent nothing, so its line counts as not
+                    // sent.
                     Err(error) if station_gone(&error) => {
                         let in_flight = unanswered(&error);
+                        let not_sent = queue.len() + usize::from(!in_flight);
                         let exit =
-                            end_chat(err, ChatEnd::Gone(Some(error)), peer, in_flight, queue.len());
+                            end_chat(err, ChatEnd::Gone(Some(error)), peer, in_flight, not_sent);
                         return Ok(exit);
                     }
                     // A refusal of this one message: say why and go on.

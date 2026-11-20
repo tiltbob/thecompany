@@ -219,28 +219,28 @@ fn say_replaces_every_control_character() {
     say(
         &mut out,
         "a\u{2028}b\u{2029}c\u{202A}d\u{202B}e\u{202C}f\u{202D}g\u{202E}h\u{2066}i\u{2067}j\
-         \u{2068}k\u{2069}l",
+         \u{2068}k\u{2069}l\u{061C}m\u{200E}n\u{200F}o",
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert_eq!(text, "a b c d e f g h i j k l\n");
+    assert_eq!(text, "a b c d e f g h i j k l m n o\n");
     // Their neighbours stay.
     let mut out = Vec::new();
-    say(&mut out, "\u{2027}\u{202F}\u{2065}\u{206A}").unwrap();
+    say(
+        &mut out,
+        "\u{061B}\u{061D}\u{200D}\u{2010}\u{2027}\u{202F}\u{2065}\u{206A}",
+    )
+    .unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
-        "\u{2027}\u{202F}\u{2065}\u{206A}\n"
+        "\u{061B}\u{061D}\u{200D}\u{2010}\u{2027}\u{202F}\u{2065}\u{206A}\n"
     );
 }
 
 /// No control character but the newline at the end of each line.
 fn assert_clean(text: &str) {
     for l in text.lines() {
-        assert!(
-            !l.chars().any(|c| c.is_control()
-                || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
-            "control character in {l:?}"
-        );
+        assert!(!l.chars().any(is_replaced), "control character in {l:?}");
     }
     assert!(!text.contains('\r'));
 }
@@ -254,7 +254,8 @@ async fn station_text_cannot_reach_the_terminal_raw() {
         // typed. The CLI still replaces them with spaces, like everything else it prints.
         fake.set_now_ms(T0);
         let evil =
-            "\x1b[2J\x1b]0;owned\x07hello\nforged 9 line\u{2028}10 x\u{202E}desrever\u{2066}iso";
+            "\x1b[2J\x1b]0;owned\x07hello\nforged 9 line\u{2028}10 x\u{202E}desrever\u{2066}iso\
+             \u{061C}a\u{200E}b\u{200F}c";
         let (exit, _, _) = exec(&c, &["send", "bob", evil]).await;
         assert_eq!(exit, Exit::Done);
         let (exit, out, err) = exec(&c, &["log"]).await;
@@ -264,7 +265,7 @@ async fn station_text_cannot_reach_the_terminal_raw() {
         assert_eq!(
             out,
             "1 2023-11-14T22:13:20Z -> bob (delivered)  [2J ]0;owned hello forged 9 line 10 x \
-             desrever iso\n"
+             desrever iso a b c\n"
         );
         assert_clean(&out);
 
@@ -671,6 +672,69 @@ async fn wait_for_sending(events: &mut Subscription) {
             return;
         }
     }
+}
+
+/// A fake whose `Send` is refused with `error` before it reaches the station.
+#[derive(Clone)]
+struct SendRefused {
+    fake: FakeStation,
+    error: ApiError,
+}
+
+impl Transport for SendRefused {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        if matches!(request, Request::Send { .. }) {
+            return Err(self.error.clone());
+        }
+        self.fake.call(request).await
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+impl BindInstance for SendRefused {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            fake: self.fake.bound_to(instance_id),
+            error: self.error.clone(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_without_a_station_exits_3_with_two_lines_and_no_outcome_sentence() {
+    bounded(async {
+        let not_running = ApiError::NotRunning {
+            socket: "/run/x.sock".to_owned(),
+        };
+        let lines = "no station is running (socket: /run/x.sock)\n\
+                     start one with: station run --tower <URL>\n";
+        // No station at all, and a station that went away just before the send.
+        let fake = fake_with_peers().await;
+        let gone = Client::new(SendRefused {
+            fake: fake.clone(),
+            error: not_running.clone(),
+        });
+        for (exit, out, err) in [
+            exec(
+                &Client::new(Failing(not_running.clone())),
+                &["send", "bob", "hi"],
+            )
+            .await,
+            exec(&gone, &["send", "bob", "hi"]).await,
+        ] {
+            assert_eq!(
+                (exit, out.as_str(), err.as_str()),
+                (Exit::NoStation, "", lines)
+            );
+            assert!(!err.contains("may still have been sent"), "{err}");
+            assert!(!err.contains("outcome is unknown"), "{err}");
+        }
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1622,6 +1686,8 @@ async fn assert_bad_log(wrappers: impl IntoIterator<Item = Cursor>) {
 
 #[tokio::test]
 async fn a_log_cursor_that_does_not_move_back_is_a_bad_reply() {
+    // `log` has no check of its own for this: the page checks catch every such cursor (it is
+    // not the page's first seq, or the page is empty).
     bounded(async {
         let fake = fake_with_two_pages().await;
         let fixes: [fn(Option<u64>, LogPage) -> LogPage; 3] = [
@@ -1982,7 +2048,86 @@ async fn the_station_stopping_while_a_send_is_held_ends_the_chat_once() {
         let (exit, _input) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
         // `Stopping` is a refusal: the line was not sent.
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n1 typed line was not sent\n"
+        );
+
+        // The same, with two lines queued behind the refused one.
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let (tx, input, taken) = chunks();
+        let (session, _out, err) = chat_on(&c, &command, input);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            tx.send(b"one\ntwo\nthree\n".to_vec()).unwrap();
+            taken.wait_for(1).await;
+            gate.wait_held(1).await;
+            fake.fail_calls(Some(ApiError::Stopping));
+            gate.release(1);
+            tx
+        };
+        let (exit, _tx) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n3 typed lines were not sent\n"
+        );
+        // The refused line reached the station, which logged nothing.
+        assert_eq!(sends(&fake), ["one"]);
+        assert!(fake.messages().is_empty());
+    })
+    .await;
+}
+
+/// An input that never ends a line: the same block for ever. After `stop_after` bytes it stops
+/// `fake`; past 256 MiB it panics, so that a chat that never looks at the station again fails
+/// loudly instead of reading for ever.
+struct EndlessStopping {
+    fake: FakeStation,
+    read: usize,
+    stop_after: usize,
+}
+
+impl AsyncRead for EndlessStopping {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        assert!(
+            self.read < 256 << 20,
+            "the chat read 256 MiB without noticing that the station stopped"
+        );
+        let n = buf.remaining().min(4096);
+        buf.put_slice(&[b'x'; 4096][..n]);
+        let before = self.read;
+        self.read += n;
+        if before < self.stop_after && self.read >= self.stop_after {
+            self.fake.stop();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn a_chat_reading_an_endless_line_still_notices_the_station_stopping() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let input = EndlessStopping {
+            fake: fake.clone(),
+            read: 0,
+            stop_after: 1 << 20,
+        };
+        let (session, out, err) = chat_on(&c, &command, input);
+        assert_eq!(session.await, Exit::NoStation);
+        assert_eq!(out.text(), "");
         assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        assert!(sends(&fake).is_empty());
     })
     .await;
 }
