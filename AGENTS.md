@@ -70,25 +70,27 @@ The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed. Tes
   active milestones have Task sub-issues, one per reviewable pull request. `Decision:` and `Verify:`
   issues are attached to the milestone they gate.
 - **Pull requests** go into `main`, are small, start their body with `Closes #n`, and say how they
-  were verified (the commands and the result). The human merges. After a merge, a comment on the
-  issue records what was done, how it was verified and what was deferred.
+  were verified (the commands and the result). After a merge, a comment on the issue records what
+  was done, how it was verified and what was deferred.
 - **Docs stay true.** If a change makes `docs/` or this file wrong, fix them in the same pull
   request. If the design itself is wrong or in the way, open or comment on a `Decision:` issue with
-  the options and a recommendation; the human decides. Do not diverge silently.
+  the options and a recommendation. Do not diverge silently.
 - **Facts over memory.** iroh and the harness CLIs change quickly. Check the appendix in
   `docs/ARCHITECTURE.md`, then the published source or docs, before relying on an API.
 
 ## Two agents, one repository
 
-Claude and Codex both work here. The short rules:
+Claude and Codex both work here, and the owner has asked them to keep going without waiting for the
+owner. The review, merge and decision rules below are what makes that safe.
+
+### Claiming and branches
 
 1. **One owner per issue.** Before starting, read the issue's comments. If nobody has claimed it,
    comment `Claimed by Claude` or `Claimed by Codex` with your branch name. If you stop, comment
    `Released by <agent>` and say what state the work is in. Suggested owners are listed on the
    coordination issue; the claim comment is what counts.
 2. **Own branch, own pull request.** Claude uses `claude/…` branches, Codex uses
-   `codex/<issue>-<slug>`. Never push to the other agent's branch or to `main`, and never merge a
-   pull request yourself.
+   `codex/<issue>-<slug>`. Never push to the other agent's branch or to `main`.
 3. **Sign every comment** on its first line: `**Claude:**` or `**Codex:**`. Both agents may post
    through the same GitHub account.
 4. **Interfaces land first.** Where two tasks meet — in M1, the `chief::api` types and the
@@ -101,8 +103,64 @@ Claude and Codex both work here. The short rules:
    add your entries back.
 6. **Stay inside your task.** Do not reformat or refactor files that belong to another task. If you
    find a bug there, comment on its issue or open a Bug issue.
-7. **Keep up with `main`.** Rebase your branch before opening a pull request and whenever `main`
-   moves under an open one.
-8. **Review when asked.** When the human asks you to review the other agent's pull request, comment
-   with concrete findings (file, line, what breaks and how). Do not push to their branch.
-9. **Read the coordination issue** before starting a task and before opening a pull request.
+7. **Keep up with `main`.** Bring your branch up to date before asking for review and whenever
+   `main` moves under an open pull request.
+
+### Review and merge
+
+The owner has authorised merging without them, on these terms:
+
+- **The agent that did not write a pull request reviews it and merges it.** Nobody merges their own
+  pull request.
+- The author asks for review with a comment on the pull request: `ready for review at <sha>`. From
+  then on the author pushes to it only to address review findings.
+- The reviewer reads the whole diff, runs the checks where it can, and either comments with concrete
+  findings (file, line, what breaks and how) or comments `reviewed <sha>, merging` with what it
+  checked.
+- Merge only when all of this holds: CI is green on the reviewed commit; that commit is still the
+  head; every finding is fixed or answered; the change stays inside its task and breaks no hard
+  rule.
+- Merge with a **merge commit**, not squash or rebase, so work stacked on the merged branch stays
+  valid.
+- **`main` stays green.** If a merge breaks it, fixing or reverting comes before anything else, for
+  whoever notices first.
+- Reviews are real. Do not wave a change through to unblock yourself. If you cannot judge part of a
+  change, say so on the pull request.
+
+### Decisions
+
+- An open `Decision:` issue that blocks work may be settled without the owner **only when both
+  agents agree**. The agent that needs it comments `Proposal: option X` with its reasoning. The
+  other agent judges it independently and answers `Agree: option X`, or `Disagree` with reasons.
+  Do not agree just to unblock.
+- On agreement: comment `Decided by both agents: X` on the issue, post
+  `Decided without the owner: #n, option X` on the coordination issue, and update `docs/` in the
+  pull request that implements it. The owner can overturn it, so prefer the option that is easiest
+  to change later.
+- On disagreement: leave it open, post `Waiting for the owner: #n` on the coordination issue with
+  both positions, and work on something that does not depend on it.
+
+### Delegating
+
+- Both top-level agents run on expensive models. Each keeps for itself what needs judgment —
+  splitting work, writing briefs, reading results, review verdicts, merges and decisions — and
+  hands as much of the rest as it can to cheaper sub-agents: implementation, tests, research,
+  mechanical edits, issue housekeeping. The owner names the models in each agent's own
+  instructions.
+- A sub-agent gets a written brief: the issue, the files it owns, the hard rules that apply and the
+  commands that must pass. The top-level agent reads the result before it is pushed and stays
+  responsible for it.
+
+### Keeping going
+
+- When you finish a task, take the next unclaimed task of the active milestone. When none is left,
+  draft Task sub-issues for the next milestone, one per reviewable pull request with a suggested
+  owner each, and post the split on the coordination issue. Start on yours once the other agent has
+  acknowledged the split.
+- Anything that needs the owner — hardware, hosts, accounts, a manual demo — is skipped and posted
+  as `Waiting for the owner: …` on the coordination issue. It does not stop the rest.
+- Stop and wait for the owner when a change would break a hard rule; when the agents disagree on a
+  decision that blocks everything that is left; when `main` cannot be made green; or when something
+  needs a secret, a payment or a destructive action such as rewriting shared history.
+- Check the coordination issue and the open pull requests at the start of every working session and
+  after every task. A pull request waiting for your review comes before your own next task.
