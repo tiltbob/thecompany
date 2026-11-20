@@ -1,0 +1,20 @@
+# Certificate files instead of ACME. Install as
+# /etc/systemd/system/numbers-tower.service.d/tls-files.conf and run `systemctl daemon-reload`.
+#
+# The dynamic user cannot read a root-only key, so systemd reads both files when the service
+# starts and hands the service read-only copies in /run/credentials/numbers-tower.service/.
+# tower.toml then names those copies:
+#
+#   [tls]
+#   cert = "/run/credentials/numbers-tower.service/tls-cert.pem"
+#   key = "/run/credentials/numbers-tower.service/tls-key.pem"
+#
+# The copies do not change while the service runs: after the certificate is renewed, run
+# `systemctl restart numbers-tower`. The tower's daily reload re-reads the same copies.
+#
+# The sources below are certbot's paths for a certificate named tower1.example.com. Change them
+# to yours; symbolic links (as in certbot's live/ directory) are followed.
+
+[Service]
+LoadCredential=tls-cert.pem:/etc/letsencrypt/live/tower1.example.com/fullchain.pem
+LoadCredential=tls-key.pem:/etc/letsencrypt/live/tower1.example.com/privkey.pem
