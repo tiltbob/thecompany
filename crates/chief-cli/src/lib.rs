@@ -70,14 +70,18 @@
 //!
 //! `chat` keeps showing what the station sends while a typed line is being sent. One line is sent
 //! at a time; lines typed meanwhile wait, in order: at most 64, and the input is not read while
-//! that many wait. A line ends at a newline, without it and without one carriage return before
-//! it; the last line may end at the end of the input. An empty or blank line is not sent.
+//! that many wait. A line ends at a newline or, for the last one, at the end of the input. The
+//! newline is not part of it, and one carriage return at its end is dropped, whichever way it
+//! ends (`ab\r` sends `ab`, `ab\r\r` sends `ab\r`); a carriage return anywhere else is kept. A
+//! line of at most 16384 bytes that is empty or holds only white space is not sent, and counts
+//! for nothing.
 //!
 //! A line that cannot be sent prints one line on stderr, and the chat goes on:
 //!
 //! - one the station refuses (an unknown peer, an invalid body): the station's error;
-//! - one longer than [`BODY_MAX_BYTES`] (16384) bytes: `a line is longer than 16384 bytes and was
-//!   not sent` (the chat skips it to its end and keeps none of it beyond that bound);
+//! - one longer than [`BODY_MAX_BYTES`] (16384) bytes, whatever it holds, also only spaces: `a
+//!   line is longer than 16384 bytes and was not sent` (the chat skips it to its end and keeps
+//!   none of it, so it cannot tell whether it was blank);
 //! - one that is not valid UTF-8: `a line is not valid UTF-8 and was not sent`.
 //!
 //! If the input cannot be read, `cannot read the input: <error>`, and the chat goes on as at the
@@ -86,15 +90,20 @@
 //! When the station cannot be talked to any more (it stopped, is shutting down, restarted, or the
 //! connection broke), noticed by a send or by the live view, whichever comes first, the chat ends
 //! once, with one line on stderr and exit 3. Whenever a chat ends before the end of its input, for
-//! this or any other error, that line is followed by what was left undone: ``the last line may
-//! have been sent; check `chief log <peer>` `` if a line was being sent (also when it is that
-//! send's own timeout or lost connection that ends the chat), then `1 typed line was not sent` or
-//! `<N> typed lines were not sent` for the lines still waiting.
+//! this or any other error, that line is followed by what was left undone:
+//!
+//! - ``the last line may have been sent; check `chief log <peer>` `` when the send of a line had
+//!   started and had no answer yet, or ended without one: it timed out, the connection broke, or
+//!   the answer was nonsense (also when that send's own error is what ends the chat);
+//! - then `1 typed line was not sent` or `<N> typed lines were not sent`, counting the lines
+//!   still waiting, a line whose send had not started yet, and a line the station refused because
+//!   it is going away (`Stopping`, `NotRunning`, `IncompatibleApi`): none of those went anywhere.
 //!
 //! End of input ends `chat` once the line being sent and the lines still waiting have been sent
 //! (each bounded by the transport's call timeout); what the station shows meanwhile is still
-//! printed. The exit is then 0 if the station accepted every non-empty line, and 1 if it refused
-//! one, a line was too long or not UTF-8, or the input failed. The outcome of the last message is
+//! printed. The exit is then 0 if the station accepted every line that was sent, and no line was
+//! too long or not UTF-8, and the input did not fail; otherwise 1. Blank lines (of at most 16384
+//! bytes) do not count. The outcome of the last message is
 //! not waited for (it is in `log`); `send` is the command that waits for the outcome.
 //!
 //! # Output (stable: scripts parse it)
@@ -136,10 +145,10 @@
 //! See [`Exit`]: 0 done (for `send`: delivered); 1 the station refused or the operation failed
 //! (for `send`: refused, so not sent, or failed, so not delivered; for `chat`: at the end of the
 //! input, a line was refused or not sent, or the input failed); 2 usage error; 3 cannot talk
-//! to a station (none is running, it speaks another API version, it is shutting down, it stopped
-//! answering or answered nonsense), or the station restarted during the command (`log`,
-//! `status`, `send`), or stopped during a `chat`; for `send` also an unknown outcome (see "send"
-//! above).
+//! to a station (no socket path could be worked out, none is running, it speaks another API
+//! version, it is shutting down, the connection broke, it stopped answering or answered
+//! nonsense), or the station restarted during the command (`log`, `status`, `send`), or stopped
+//! during a `chat`; for `send` also an unknown outcome (see "send" above).
 //!
 //! # Process-global state
 //!
@@ -248,14 +257,16 @@ pub enum Command {
     },
     /// Show the last 50 messages, then follow live; each line typed is sent to the peer
     ///
-    /// Lines are sent one at a time, in order, while the chat keeps showing new messages. Blank
-    /// lines are ignored. A line longer than 16384 bytes, or not valid UTF-8, is not sent: one
-    /// line on stderr, and the chat goes on; so does a line the station refuses.
+    /// Lines are sent one at a time, in order, while the chat keeps showing new messages. One
+    /// carriage return at the end of a line is dropped. An empty or blank line of at most 16384
+    /// bytes is ignored. A line longer than 16384 bytes (even if it is only spaces), or not valid
+    /// UTF-8, is not sent: one line on stderr, and the chat goes on; so does a line the station
+    /// refuses.
     ///
     /// End of input (Ctrl-D) ends the chat once the lines typed so far have been sent, without
     /// waiting for their outcome; `chief send` is the command that waits for it. The exit is then
-    /// 0 if the station accepted every line, and 1 if it refused one, a line was not sent, or the
-    /// input could not be read.
+    /// 0 if the station accepted every line sent and no line was too long or not UTF-8, and 1 if
+    /// the station refused a line, a line was not sent, or the input could not be read.
     ///
     /// The chat ends with exit 3 when the station stops or restarts. Then stderr also says if the
     /// last line may have been sent (check `chief log <peer>`) and how many typed lines were not
@@ -902,10 +913,12 @@ fn end_chat(err: &mut dyn Write, end: ChatEnd, peer: &str, in_flight: bool, queu
 
 /// What [`LineReader::next`] read.
 enum Input {
-    /// A line, without its `\n` and without one `\r` before it: valid UTF-8 and at most
-    /// [`BODY_MAX_BYTES`] bytes.
+    /// A line, without its `\n` and without one `\r` at its end, whether it ended with a newline
+    /// or with the end of the input (`ab\r\r\n` gives `ab\r`): valid UTF-8 and at most
+    /// [`BODY_MAX_BYTES`] bytes. It may be empty or blank; the caller decides.
     Line(String),
-    /// A line longer than [`BODY_MAX_BYTES`] bytes; it was skipped to its end.
+    /// A line longer than [`BODY_MAX_BYTES`] bytes, whatever it holds (none of it was kept, so a
+    /// blank one is reported too); it was skipped to its end.
     TooLong,
     /// A line that is not valid UTF-8.
     NotUtf8,
@@ -1144,5 +1157,80 @@ where
         let in_flight = pending.is_some() && started;
         let not_sent = queue.len() + usize::from(pending.is_some() && !started);
         return Ok(end_chat(err, end, peer, in_flight, not_sent));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, BufReader, ReadBuf};
+
+    /// An input that hands over one block per read, then ends.
+    struct Blocks(VecDeque<Vec<u8>>);
+
+    impl AsyncRead for Blocks {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(block) = self.0.pop_front() {
+                assert!(block.len() <= buf.remaining());
+                buf.put_slice(&block);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One call of `next()` raced against a ready branch, as a biased `select!` in `chat` would
+    /// race it against the live view: `None` when the call was dropped at its yield.
+    async fn turn<R: AsyncBufRead + Unpin>(reader: &mut LineReader<R>) -> Option<Input> {
+        tokio::select! {
+            biased;
+            input = reader.next() => Some(input),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    fn label(input: &Input) -> String {
+        match input {
+            Input::Line(line) => format!("line {line}"),
+            Input::TooLong => "too long".to_owned(),
+            Input::NotUtf8 => "not utf-8".to_owned(),
+            Input::End => "end".to_owned(),
+            Input::Failed(error) => format!("failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reader_keeps_at_most_one_line_and_loses_nothing_when_dropped() {
+        // 1 MiB without a newline, in blocks of 4 KiB; then its newline; then a good line; then
+        // a good line in two blocks.
+        let mut blocks: VecDeque<Vec<u8>> = (0..256).map(|_| vec![b'x'; 4096]).collect();
+        blocks.extend([
+            b"\n".to_vec(),
+            b"good one\n".to_vec(),
+            b"good ".to_vec(),
+            b"two\n".to_vec(),
+        ]);
+        let mut reader = LineReader::new(BufReader::with_capacity(4096, Blocks(blocks)));
+        let mut got = Vec::new();
+        let mut dropped = 0;
+        for _ in 0..1000 {
+            match turn(&mut reader).await {
+                Some(Input::End) => break,
+                Some(input) => got.push(label(&input)),
+                None => dropped += 1,
+            }
+            // Never more than one line's worth, and nothing of a line that is too long.
+            assert!(reader.line.len() <= LINE_KEEP_MAX, "{}", reader.line.len());
+            if reader.too_long {
+                assert!(reader.line.is_empty(), "{}", reader.line.len());
+            }
+        }
+        assert_eq!(got, ["too long", "line good one", "line good two"]);
+        // Dropped at every block of the long line, and between the two halves of `good two`.
+        assert_eq!(dropped, 256 + 1);
     }
 }

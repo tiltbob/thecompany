@@ -1287,28 +1287,121 @@ async fn crlf_and_a_last_line_without_a_newline() {
 async fn a_failing_input_still_sends_the_lines_read_and_exits_1() {
     bounded(async {
         let fake = fake_with_peers().await;
-        let c = Client::new(fake.clone());
+        // The first send is held, so that `two` still waits in the queue when the input fails.
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
         let command = parse(&["chat", "bob"]);
-        let input = tokio::io::AsyncReadExt::chain(&b"one\ntwo\npart"[..], Broken);
+        let input = tokio::io::AsyncReadExt::chain(&b"one\ntwo\npart"[..], Broken::default());
         let (session, _out, err) = chat_on(&c, &command, input);
-        assert_eq!(session.await, Exit::Failed);
+        let drive = async {
+            err.wait_for(|s| s == "cannot read the input: the pipe broke\n")
+                .await;
+            gate.wait_held(1).await;
+            assert!(sends(&fake).is_empty());
+            gate.release(2);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::Failed);
         assert_eq!(err.text(), "cannot read the input: the pipe broke\n");
+        // The part of a line read before the error is dropped.
         assert_eq!(sends(&fake), ["one", "two"]);
     })
     .await;
 }
 
-/// An input that fails every read.
-struct Broken;
+/// An input whose first read fails. It is always ready, so a chat that read it again after it
+/// failed would spin inside one poll, where no timeout fires: the second read panics instead.
+#[derive(Default)]
+struct Broken {
+    failed: bool,
+}
 
 impl AsyncRead for Broken {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         _buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        assert!(
+            !self.failed,
+            "the chat read the input again after it failed"
+        );
+        self.failed = true;
         Poll::Ready(Err(std::io::Error::other("the pipe broke")))
     }
+}
+
+/// An input whose first read hands over `one\n` and stops `fake` in the same call, so that the
+/// chat's next turn finds both a new send to make and the end of the live view. Later reads
+/// never complete.
+struct OneLineThenStop {
+    fake: FakeStation,
+    done: bool,
+}
+
+impl AsyncRead for OneLineThenStop {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.done {
+            return Poll::Pending;
+        }
+        self.done = true;
+        buf.put_slice(b"one\n");
+        self.fake.stop();
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn a_send_never_polled_when_the_chat_ends_counts_as_not_sent() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let input = OneLineThenStop {
+            fake: fake.clone(),
+            done: false,
+        };
+        let (session, out, err) = chat_on(&c, &command, input);
+        assert_eq!(session.await, Exit::NoStation);
+        assert_eq!(out.text(), "");
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n1 typed line was not sent\n"
+        );
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn one_carriage_return_at_the_end_of_a_line_is_dropped() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let (exit, _, err) = chat_all(&c, b"ab\r\r\nc\rd\nef\r").await;
+        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+        assert_eq!(sends(&fake), ["ab\r", "c\rd", "ef"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_overlong_blank_line_is_reported_not_ignored() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let input = format!("{}\nafter\n", " ".repeat(BODY_MAX_BYTES + 1));
+        let (exit, _, err) = chat_all(&c, input.as_bytes()).await;
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(err, too_long());
+        assert_eq!(sends(&fake), ["after"]);
+    })
+    .await;
 }
 
 /// How many chunks a [`Chunks`] input has handed out.
