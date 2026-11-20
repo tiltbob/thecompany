@@ -1,12 +1,10 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{RelayUrl, TransportAddr, Watcher};
-use iroh_relay::quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON, QuicClient};
-use n0_future::StreamExt;
+use iroh::{TransportAddr, Watcher};
 use numbers_tower::{TlsTower, Tower, TowerConfig};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -142,50 +140,24 @@ impl ProtocolHandler for EchoChat {
     }
 }
 
-async fn probe_qad(endpoint: &Endpoint, tower: &Tower) {
-    let url: RelayUrl = checked(tower.url().parse(), "parse QAD relay URL");
-    let config = endpoint
-        .runtime
-        .relays
-        .get(&url)
-        .expect("relay in endpoint map");
-    let port = config
-        .quic
-        .as_ref()
-        .expect("QAD enabled in endpoint map")
-        .port;
-    assert_eq!(Some(port), tower.qad_port());
-    assert_eq!(tower.stats().qad_connections, 0);
-
-    // Relay-only endpoints skip automatic QAD. Exercise the QAD protocol over a
-    // separate loopback socket, using the endpoint's actual TLS trust and QAD port.
-    let socket = checked(noq::Endpoint::client(loopback()), "bind QAD client");
-    let probe_address = checked(socket.local_addr(), "read QAD client address");
-    let qad = QuicClient::new(socket, endpoint.iroh().tls_config().clone());
-    let connection = checked(
-        qad.create_conn((Ipv4Addr::LOCALHOST, port).into(), IP_HOST)
-            .await,
-        "connect to QAD port with endpoint trust",
-    );
-    let observed = connection
-        .observed_external_addr()
-        .next()
-        .await
-        .expect("receive QAD address report");
-    assert_eq!(
-        SocketAddr::new(observed.ip().to_canonical(), observed.port()),
-        probe_address
-    );
-    while tower.stats().qad_connections == 0 {
-        sleep(Duration::from_millis(10)).await;
+fn has_non_loopback_ipv4() -> bool {
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    // Like the tower's QAD test, use a UDP connect to a documentation address to
+    // select a source address without sending any packets.
+    if socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).is_err() {
+        return false;
     }
-    connection.close(QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON);
+    socket
+        .local_addr()
+        .is_ok_and(|addr| !addr.ip().is_loopback() && !addr.ip().is_unspecified())
 }
 
 #[tokio::test]
-async fn custom_roots_enable_bare_id_chat_and_a_loopback_qad_probe() {
+async fn custom_roots_enable_bare_id_chat_through_a_tls_tower() {
     timeout(TEST_TIMEOUT, async {
-        let fixture = TlsFixture::start(IP_HOST, true).await;
+        let fixture = TlsFixture::start(IP_HOST, false).await;
         let first_policy = Arc::new(Authorizer::new(&[ALPN], &[]));
         let second_policy = Arc::new(Authorizer::new(&[ALPN], &[]));
         let (first, second) = tokio::join!(
@@ -213,7 +185,6 @@ async fn custom_roots_enable_bare_id_chat_and_a_loopback_qad_probe() {
         }));
         assert!(connection.paths().iter().all(|path| !path.is_ip()));
         connection.close(0u32.into(), b"finished");
-        probe_qad(&first, &fixture.tower).await;
 
         let (first_stop, second_stop) = tokio::join!(first_router.shutdown(), second_router.shutdown());
         checked(first_stop, "stop first endpoint");
@@ -221,7 +192,47 @@ async fn custom_roots_enable_bare_id_chat_and_a_loopback_qad_probe() {
         checked(fixture.tower.shutdown().await, "stop TLS tower");
     })
     .await
-    .expect("TLS chat and explicit QAD probe timed out");
+    .expect("TLS chat timed out");
+}
+
+#[tokio::test]
+async fn endpoint_net_report_uses_the_configured_qad_port() {
+    if !has_non_loopback_ipv4() {
+        println!("skipped QAD: iroh needs a usable non-loopback IPv4 address to plan this probe");
+        return;
+    }
+
+    timeout(TEST_TIMEOUT, async {
+        let fixture = TlsFixture::start(IP_HOST, true).await;
+        assert!(fixture.tower.qad_port().is_some());
+        let config = EndpointConfig {
+            towers: fixture.towers(),
+            ip_transport: IpTransport::LoopbackOnly,
+            tls_roots: TlsRoots::CustomOnly(vec![fixture.root]),
+            dns: DnsConfig::System,
+        };
+        let endpoint = checked(
+            Endpoint::bind(
+                &generate_node_key(),
+                config,
+                Arc::new(Authorizer::new(&[ALPN], &[])),
+            )
+            .await,
+            "bind TLS endpoint with a loopback IP socket",
+        );
+        endpoint.iroh().online().await;
+        timeout(Duration::from_secs(5), async {
+            while fixture.tower.stats().qad_connections == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the endpoint's net report never reached the configured QAD port");
+        endpoint.iroh().close().await;
+        checked(fixture.tower.shutdown().await, "stop QAD-enabled TLS tower");
+    })
+    .await
+    .expect("TLS endpoint QAD test timed out");
 }
 
 #[tokio::test]
@@ -287,6 +298,36 @@ async fn the_configured_dns_server_resolves_the_tls_tower() {
     })
     .await
     .expect("TLS tower through configured DNS did not come online");
+}
+
+#[test]
+fn custom_only_excludes_the_bundled_webpki_roots() {
+    let (_, root) = private_ca();
+    for (tls_roots, expected_mode) in [
+        (TlsRoots::CustomOnly(vec![root.clone()]), "ExtraRootsOnly"),
+        (TlsRoots::WebPkiPlus(vec![root]), "EmbeddedWebPki"),
+        (TlsRoots::WebPki, "EmbeddedWebPki"),
+    ] {
+        let config = checked(tls_roots.ca_tls_config(), "build the TLS config");
+        // iroh-relay 1.5's `tls.rs` exposes the trust mode through CaTlsConfig's Debug.
+        // Check the mode offline without presenting a certificate from a public CA.
+        assert!(
+            format!("{config:?}").contains(&format!("mode: {expected_mode}")),
+            "expected the TLS trust mode {expected_mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn binding_accepts_webpki_with_no_extra_roots() {
+    let endpoint = bind(
+        TowerSet::default(),
+        TlsRoots::WebPkiPlus(vec![]),
+        DnsConfig::System,
+        Arc::new(Authorizer::new(&[ALPN], &[])),
+    )
+    .await;
+    endpoint.iroh().close().await;
 }
 
 #[tokio::test]

@@ -2061,7 +2061,6 @@ dependencies = [
  "iroh-relay",
  "n0-dns-resolver",
  "n0-future",
- "noq",
  "numbers",
  "numbers-base",
  "numbers-tower",

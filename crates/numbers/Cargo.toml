@@ -25,7 +25,6 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]
-noq.workspace = true
 # The crate itself with `testing`, for its integration tests.
 numbers = { workspace = true, features = ["test-support"] }
 numbers-tower.workspace = true

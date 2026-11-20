@@ -8,7 +8,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
-use iroh::dns::{DnsProtocol, DnsResolver};
+use iroh::dns::{Builder as DnsResolverBuilder, DnsProtocol, DnsResolver};
 use iroh::endpoint::{
     BindError, Incoming, InvalidSocketAddr, NetReportConfig, PortmapperConfig, QuicTransportConfig,
     RelayStatus, presets,
@@ -94,21 +94,21 @@ pub enum DnsConfig {
     #[default]
     System,
     /// Use this UDP nameserver with public fallback resolvers disabled.
+    /// The caller is responsible for providing a usable address and port.
     Nameserver(SocketAddr),
 }
 
 impl DnsConfig {
-    fn resolver(self) -> DnsResolver {
+    fn resolver_builder(self) -> DnsResolverBuilder {
         let builder = DnsResolver::builder().disable_fallback();
         #[allow(
             deprecated,
             reason = "NameserverConfig takes an IP and port and loses IPv6 scope"
         )]
-        let builder = match self {
+        match self {
             Self::System => builder.with_system_defaults(),
             Self::Nameserver(addr) => builder.with_nameserver(addr, DnsProtocol::Udp),
-        };
-        builder.build()
+        }
     }
 }
 
@@ -352,7 +352,7 @@ impl Endpoint {
         authorizer: Arc<Authorizer>,
     ) -> Result<Self, EndpointBindError> {
         let ca_tls_config = config.tls_roots.ca_tls_config()?;
-        let dns_resolver = config.dns.resolver();
+        let dns_resolver = config.dns.resolver_builder().build();
         let relays = config.towers.relay_map();
         let gate = Gate { authorizer };
         let mut net_report = NetReportConfig::default();

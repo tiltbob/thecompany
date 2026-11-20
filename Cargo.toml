@@ -48,8 +48,6 @@ url = "2"
 zeroize = "1"
 
 # Dev-dependencies.
-# Direct loopback QUIC address discovery probe in the endpoint tests.
-noq = { version = "1.5.0", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # Self-signed certificates for the TLS tower tests; already in the lock through iroh-relay.
 rcgen = "0.14.10"
 tempfile = "3.27"

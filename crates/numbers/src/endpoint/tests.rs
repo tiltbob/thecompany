@@ -40,6 +40,26 @@ fn dns_config_debug_hides_the_nameserver() {
 }
 
 #[test]
+fn dns_config_disables_public_fallback_for_both_modes() {
+    // iroh-dns 1.5's `dns.rs` exposes these settings through the builder's Debug.
+    // Inspecting the builder avoids resolving anything or depending on the host's DNS.
+    let system = DnsConfig::System.resolver_builder();
+    let system = format!("{system:?}");
+    assert!(system.contains("fallback_mode: Never"), "{system}");
+    assert!(system.contains("use_system_defaults: true"), "{system}");
+
+    let addr = (Ipv4Addr::LOCALHOST, 5353).into();
+    let nameserver = DnsConfig::Nameserver(addr).resolver_builder();
+    let nameserver = format!("{nameserver:?}");
+    assert!(nameserver.contains("fallback_mode: Never"), "{nameserver}");
+    assert!(
+        nameserver.contains("use_system_defaults: false"),
+        "{nameserver}"
+    );
+    assert!(nameserver.contains(&addr.to_string()), "{nameserver}");
+}
+
+#[test]
 fn denied_status_replaces_controls_with_spaces() {
     let TowerStatus::Denied { reason } = TowerStatus::denied("hello\nworld\tfrom\u{0085}tower")
     else {

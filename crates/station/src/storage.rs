@@ -220,10 +220,20 @@ impl Storage {
         bytes: &[u8],
         sync_dir: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<SaveOutcome, StorageError> {
+        self.replace_record_with_suffixes(record, bytes, random_staging_suffix, sync_dir)
+    }
+
+    fn replace_record_with_suffixes(
+        &self,
+        record: RecordFile,
+        bytes: &[u8],
+        draw_suffix: impl FnMut() -> Result<u128, getrandom::Error>,
+        sync_dir: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
         if bytes.len() > record.max_bytes() {
             return Err(StorageError::RecordTooLarge(record));
         }
-        let mut stage = StagedRecord::create(&self.dir, record)?;
+        let mut stage = StagedRecord::create(&self.dir, record, draw_suffix)?;
         stage
             .file
             .write_all(bytes)
@@ -307,9 +317,14 @@ struct StagedRecord<'a> {
 }
 
 impl<'a> StagedRecord<'a> {
-    fn create(dir: &'a File, record: RecordFile) -> Result<Self, StorageError> {
-        for index in 0..STAGING_ATTEMPTS {
-            let name = staging_name(record, index);
+    fn create(
+        dir: &'a File,
+        record: RecordFile,
+        mut draw_suffix: impl FnMut() -> Result<u128, getrandom::Error>,
+    ) -> Result<Self, StorageError> {
+        for _ in 0..STAGING_ATTEMPTS {
+            let suffix = draw_suffix().map_err(|_| StorageError::StageRecord(record))?;
+            let name = staging_name(record, suffix);
             match rustix::fs::openat(
                 dir,
                 name.as_str(),
@@ -350,8 +365,14 @@ impl Drop for StagedRecord<'_> {
     }
 }
 
-fn staging_name(record: RecordFile, index: u8) -> String {
-    format!(".{}.{}.{index}.tmp", record.name(), std::process::id())
+fn random_staging_suffix() -> Result<u128, getrandom::Error> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn staging_name(record: RecordFile, suffix: u128) -> String {
+    format!(".{}.{suffix:032x}.tmp", record.name())
 }
 
 #[derive(Serialize, Deserialize)]
