@@ -24,6 +24,7 @@ iroh-relay = { version = "1.5", default-features = false, features = ["tls-ring"
 
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
 # The SRV lookup in `numbers::bootstrap`. No default features: those add DNS over TLS and HTTPS
 # (reqwest, tokio-rustls, webpki-roots), which the plain UDP/TCP lookup does not use.
 n0-dns-resolver = { version = "0.1.1", default-features = false }
