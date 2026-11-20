@@ -735,8 +735,7 @@ fn replace(path: &Path, text: &str) {
 }
 
 /// One event from the tower's own targets: its level, its target and every field as text, the
-/// message included.
-#[derive(Debug)]
+/// message included. It has no `Debug` on purpose: nothing may print a captured event.
 struct Captured {
     level: tracing::Level,
     target: String,
@@ -779,16 +778,14 @@ impl Capture {
     }
 
     /// Fails if the level, target, a field name or a field value of any recorded event holds
-    /// `needle`.
+    /// `needle`. The failure names only what was shown, never the event: an event that fails
+    /// this check may hold more that must not reach a log, the test's own output included.
     fn assert_never_shows(&self, needle: &str, what: &str) {
         for event in self.0.lock().unwrap().iter() {
             let texts = [event.level.to_string(), event.target.clone()];
             let fields = event.fields.iter().flat_map(|(name, value)| [name, value]);
             for text in texts.iter().chain(fields) {
-                assert!(
-                    !text.contains(needle),
-                    "a log event shows {what}: {event:?}"
-                );
+                assert!(!text.contains(needle), "a log event shows {what}");
             }
         }
     }
