@@ -161,10 +161,10 @@ again. So a station watches its home tower (below).
   never adds one to its relay map and never passes one on. A chief may take one into the set
   with an explicit command (decided in #73). Automatic use would be an exception to hard rule 8
   and is the owner's to grant.
-- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
-  tower that is not connected, for some seconds, and never while the home tower is connected. Then
-  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
-  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+- **A station watches its home tower.** After some seconds with no home or a disconnected home,
+  it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
+  configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
+  connected home alone. A tower that denies the station is marked and shown with the reason. It
   is taken out of the relay map only if another tower of the set is not marked denied; if it is
   the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
@@ -645,9 +645,17 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  took it out of the map but left the home connection and the status as they were. A tower that
-  denies an endpoint can still become its home when another tower is
-  in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
+  took it out of the map but left the home connection and the raw status as they were. The same
+  can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
+  and `home_relay_status()` reports the actual home. The `numbers::Endpoint` runs a task that
+  follows `home_relay_status()` between `tower_states()` calls and clears its remembered failure
+  on an observed connection or home change.
+  Iroh's latest-value watcher can coalesce brief transitions. A map change requests a full net
+  report even when `insert_relay` keeps the same configuration, so a nudge needs no removal.
+  If a report is already running, a periodic tick or a minor network change can replace that
+  pending request with an incremental report. A tower that denies an endpoint can still become
+  its home when another tower is in the map (17 of 30) and keeps it; `remove_relay` of the denying
+  tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
