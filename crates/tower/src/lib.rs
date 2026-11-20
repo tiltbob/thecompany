@@ -11,7 +11,6 @@ use std::error::Error;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,8 +20,10 @@ use iroh_relay::server::{
     ServerConfig, TlsConfig,
 };
 
+mod certs;
 mod tls;
 
+pub use certs::TlsFileProblem;
 pub use tls::{DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, TlsTower};
 
 /// The default dev tower bind address.
@@ -185,26 +186,37 @@ pub enum TowerError {
     /// A dev tower's bind address is not a loopback address.
     #[error("the dev tower requires a loopback bind address, got {0}")]
     NonLoopbackBind(SocketAddr),
-    /// [`TlsTower::hostname`] is not a DNS name or IP literal that fits in a URL.
-    #[error("the TLS tower's host name {0:?} is not a valid URL host")]
-    InvalidHostname(String),
-    /// The certificate file is missing, unreadable, or holds no valid PEM certificate.
-    #[error("cannot use the tower's certificate file {}: {reason}", path.display())]
+    /// [`TlsTower::hostname`] is neither a DNS host name nor an IP literal.
+    ///
+    /// The error does not repeat the name; see [`TlsTower::hostname`] for the rule.
+    #[error("the TLS tower's host name is not a valid DNS host name or IP literal")]
+    InvalidHostname,
+    /// The certificate file cannot be used.
+    ///
+    /// The error names which of the two files and one fixed [`TlsFileProblem`], and
+    /// deliberately not the path: the caller configured it and knows it, and paths often
+    /// contain the tower's host name. It carries no content of the file and no upstream error,
+    /// and the variant has no source.
+    #[error("cannot use the tower's certificate file: {problem}")]
     CertificateFile {
-        /// The configured path.
-        path: PathBuf,
-        /// What is wrong with the file. It never quotes the file's contents.
-        reason: String,
+        /// What is wrong with the file.
+        problem: TlsFileProblem,
     },
-    /// The private key file is missing, unreadable, or holds no usable PEM private key.
-    #[error("cannot use the tower's private key file {}: {reason}", path.display())]
+    /// The private key file cannot be used, including when its key does not belong to the
+    /// certificate ([`TlsFileProblem::KeyMismatch`]).
+    ///
+    /// The error names which of the two files and one fixed [`TlsFileProblem`], and
+    /// deliberately not the path: the caller configured it and knows it, and paths often
+    /// contain the tower's host name. It carries no byte of the key and no upstream error, and
+    /// the variant has no source.
+    #[error("cannot use the tower's private key file: {problem}")]
     KeyFile {
-        /// The configured path.
-        path: PathBuf,
-        /// What is wrong with the file, as iroh-relay's certificate loader reports it. It never
-        /// contains key material.
-        reason: String,
+        /// What is wrong with the file.
+        problem: TlsFileProblem,
     },
+    /// [`TlsTower::reload_interval`] is zero.
+    #[error("the TLS tower's certificate reload interval must be longer than zero")]
+    InvalidReloadInterval,
     /// An entry of [`TowerConfig::allow`] is not a valid endpoint id.
     ///
     /// Neither the message nor the source contains the entry's text.
@@ -318,6 +330,8 @@ pub struct Tower {
     url: String,
     http_addr: SocketAddr,
     denied: Arc<AtomicU64>,
+    /// The certificate reload task of a TLS tower; dropping it stops the task.
+    reloader: Option<certs::Reloader>,
 }
 
 impl Tower {
@@ -335,7 +349,7 @@ impl Tower {
         let tls = match &config.tls {
             Some(tls) => {
                 tls::tower_url(&tls.hostname, tls.https_bind.port())?;
-                Some((tls, tls::cert_config(tls).await?))
+                Some((tls, tls::cert_config(tls)?))
             }
             None => None,
         };
@@ -350,9 +364,11 @@ impl Tower {
             });
         }
         let mut server_config = ServerConfig::default();
-        if let Some((tls, cert)) = tls {
+        let mut reloader = None;
+        if let Some((tls, (cert, reload))) = tls {
             relay.tls = Some(TlsConfig::new(tls.https_bind, cert));
             server_config.quic = tls.qad_bind.map(QuicConfig::new);
+            reloader = Some(reload);
         }
         server_config.relay = Some(relay);
 
@@ -372,6 +388,7 @@ impl Tower {
             url,
             http_addr,
             denied,
+            reloader,
         })
     }
 
@@ -415,6 +432,7 @@ impl Tower {
     /// second later. A test that restarts a tower should therefore check that its clients
     /// noticed.
     pub async fn shutdown(self) -> Result<(), TowerError> {
+        drop(self.reloader);
         self.server
             .shutdown()
             .await
@@ -503,6 +521,44 @@ mod tests {
         let config = TowerConfig::tls(tls).bind((Ipv4Addr::UNSPECIFIED, 0).into());
         let result = Tower::spawn(config).await;
         assert!(matches!(result, Err(TowerError::CertificateFile { .. })));
+    }
+
+    /// After a drop or a shutdown, nothing holds the certificate pair or the reload task's
+    /// provider: the reload task is gone and the key is released.
+    #[tokio::test]
+    async fn a_dropped_or_stopped_tls_tower_releases_its_key_and_stops_reloading() {
+        timeout(Duration::from_secs(20), async {
+            let dir = tempfile::tempdir().unwrap();
+            let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+            let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+            std::fs::write(&cert, generated.cert.pem()).unwrap();
+            std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+            let loopback: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+
+            for graceful in [false, true] {
+                let tls = TlsTower::new("127.0.0.1", &cert, &key)
+                    .https_bind(loopback)
+                    .qad_bind(Some(loopback))
+                    .reload_interval(Duration::from_millis(20));
+                let tower = Tower::spawn(TowerConfig::tls(tls).bind(loopback))
+                    .await
+                    .unwrap();
+                let (pair, provider) = tower.reloader.as_ref().unwrap().watch.clone();
+                assert!(pair.strong_count() > 0 && provider.strong_count() > 0);
+                if graceful {
+                    tower.shutdown().await.unwrap();
+                } else {
+                    drop(tower);
+                }
+                // The relay's own tasks end asynchronously after a drop; no event marks it.
+                let mut tick = tokio::time::interval(Duration::from_millis(10));
+                while pair.strong_count() > 0 || provider.strong_count() > 0 {
+                    tick.tick().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
