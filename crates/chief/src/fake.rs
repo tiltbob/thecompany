@@ -234,6 +234,54 @@ impl FakeStation {
         state.emit(&Event::Status { status });
     }
 
+    /// Replaces the whole list of towers, in the given order, and pushes [`Event::Status`]. An
+    /// empty list is allowed: the status then has no towers.
+    ///
+    /// The text in it came from outside, so every character of rule 9 in each `url`, each `error`
+    /// of [`TowerState::Failing`] and each `reason` of [`TowerState::Denied`] is replaced with a
+    /// space ([`crate::api::clean`]) before it is stored and before the event is pushed. The
+    /// sources are stored as given.
+    ///
+    /// A [`FakeStation::restart`] puts every tower of the list back in [`TowerState::Connecting`]
+    /// and keeps the list itself: its order, its urls and its sources.
+    pub fn set_towers(&self, towers: Vec<TowerStatus>) {
+        let towers = towers
+            .into_iter()
+            .map(|tower| TowerStatus {
+                url: clean(&tower.url).into_owned(),
+                state: match tower.state {
+                    TowerState::Failing { error } => TowerState::Failing {
+                        error: clean(&error).into_owned(),
+                    },
+                    TowerState::Denied { reason } => TowerState::Denied {
+                        reason: clean(&reason).into_owned(),
+                    },
+                    other @ (TowerState::Connecting
+                    | TowerState::Connected
+                    | TowerState::Standby) => other,
+                },
+                source: tower.source,
+            })
+            .collect();
+        let mut state = self.state();
+        state.status.towers = towers;
+        let status = state.status.clone();
+        state.emit(&Event::Status { status });
+    }
+
+    /// Sets [`Status::bootstrap_domain`] (`None` clears it) and pushes [`Event::Status`].
+    ///
+    /// The domain is the chief's own input to its station, not text from a peer or a tower, so it
+    /// is stored as given, without [`crate::api::clean`]; a frontend still cleans what it prints.
+    ///
+    /// A [`FakeStation::restart`] keeps it.
+    pub fn set_bootstrap_domain(&self, domain: Option<String>) {
+        let mut state = self.state();
+        state.status.bootstrap_domain = domain;
+        let status = state.status.clone();
+        state.emit(&Event::Status { status });
+    }
+
     /// Sets the link to one of a peer's stations and, if it changed, pushes [`Event::Peer`] (rule
     /// 10). Fails with [`ApiError::PeerNotFound`] for an unknown peer, and with
     /// [`ApiError::Invalid`] (field `station_id`) for a station the peer does not have.
@@ -347,12 +395,14 @@ impl FakeStation {
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, the tower is back in [`TowerState::Connecting`] as in a new fake (no event is
-    /// pushed: the subscriptions have ended), and calls are answered again after a
+    /// link is down, every tower is back in [`TowerState::Connecting`] as in a new fake (no event
+    /// is pushed: the subscriptions have ended), and calls are answered again after a
     /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
     /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
     /// to the new one. The peer book, the send outcome and the other test settings, the hold of
-    /// subscribes included, stay, as a station's peer book survives a restart.
+    /// subscribes included, stay, as a station's peer book survives a restart. So do the list of
+    /// towers ([`FakeStation::set_towers`]: its order, urls and sources) and the bootstrap domain
+    /// ([`FakeStation::set_bootstrap_domain`]); only the towers' states change.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();

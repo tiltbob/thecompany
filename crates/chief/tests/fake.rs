@@ -111,6 +111,149 @@ async fn standby_passes_through_the_fake() {
     assert_eq!(queued(&mut events), vec![Event::Status { status }]);
 }
 
+fn tower(url: &str, state: TowerState, source: Option<TowerSource>) -> TowerStatus {
+    TowerStatus {
+        url: url.to_owned(),
+        state,
+        source,
+    }
+}
+
+/// Three towers with every kind of text rule 9 covers.
+fn three_towers() -> Vec<TowerStatus> {
+    vec![
+        tower(
+            "https://tower-c.example.invalid/",
+            TowerState::Failing {
+                error: "no\nroute\u{1b}[31m".into(),
+            },
+            Some(TowerSource::Configured),
+        ),
+        tower(
+            "https://tower-a.example.invalid/\u{202E}x\u{2028}",
+            TowerState::Connected,
+            None,
+        ),
+        tower(
+            "https://tower-b.example.invalid/",
+            TowerState::Denied {
+                reason: "not\r\nallowed\u{7f}".into(),
+            },
+            Some(TowerSource::Srv),
+        ),
+    ]
+}
+
+/// [`three_towers`] as the fake stores them.
+fn three_towers_clean() -> Vec<TowerStatus> {
+    vec![
+        tower(
+            "https://tower-c.example.invalid/",
+            TowerState::Failing {
+                error: "no route [31m".into(),
+            },
+            Some(TowerSource::Configured),
+        ),
+        tower(
+            "https://tower-a.example.invalid/ x ",
+            TowerState::Connected,
+            None,
+        ),
+        tower(
+            "https://tower-b.example.invalid/",
+            TowerState::Denied {
+                reason: "not  allowed ".into(),
+            },
+            Some(TowerSource::Srv),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn set_towers_replaces_the_list_in_order_cleans_it_and_pushes_one_status() {
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_towers(three_towers());
+    let status = c.status().await.unwrap();
+    assert_eq!(status.towers, three_towers_clean());
+    assert_eq!(fake.status(), status);
+    assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+    // An empty list is allowed, and pushed too.
+    fake.set_towers(Vec::new());
+    let empty = c.status().await.unwrap();
+    assert!(empty.towers.is_empty());
+    assert_eq!(empty.station_id, ME);
+    assert_eq!(queued(&mut events), vec![Event::Status { status: empty }]);
+}
+
+#[tokio::test]
+async fn set_bootstrap_domain_sets_clears_and_pushes() {
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_bootstrap_domain(Some("team.example.invalid".into()));
+    let set = c.status().await.unwrap();
+    assert_eq!(
+        set.bootstrap_domain.as_deref(),
+        Some("team.example.invalid")
+    );
+    // The towers are left alone.
+    assert_eq!(set.towers, station().status().towers);
+    fake.set_bootstrap_domain(None);
+    let cleared = c.status().await.unwrap();
+    assert_eq!(cleared.bootstrap_domain, None);
+    assert_eq!(
+        queued(&mut events),
+        vec![
+            Event::Status { status: set },
+            Event::Status { status: cleared }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn set_tower_state_sets_every_tower_of_the_list() {
+    let fake = station();
+    let c = client(&fake);
+    fake.set_towers(three_towers());
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_tower_state(TowerState::Standby);
+    let status = c.status().await.unwrap();
+    let expected: Vec<TowerStatus> = three_towers_clean()
+        .into_iter()
+        .map(|t| TowerStatus {
+            state: TowerState::Standby,
+            ..t
+        })
+        .collect();
+    assert_eq!(status.towers, expected);
+    assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+}
+
+#[tokio::test]
+async fn restart_keeps_the_towers_their_sources_and_the_domain() {
+    let fake = station();
+    let c = client(&fake);
+    fake.set_towers(three_towers());
+    fake.set_bootstrap_domain(Some("team.example.invalid".into()));
+    fake.restart("INSTANCE-2");
+    let status = c.status().await.unwrap();
+    assert_eq!(status.instance_id, "INSTANCE-2");
+    assert_eq!(
+        status.bootstrap_domain.as_deref(),
+        Some("team.example.invalid")
+    );
+    let expected: Vec<TowerStatus> = three_towers_clean()
+        .into_iter()
+        .map(|t| TowerStatus {
+            state: TowerState::Connecting,
+            ..t
+        })
+        .collect();
+    assert_eq!(status.towers, expected);
+}
+
 // Peer book (rule 10).
 
 #[tokio::test]
