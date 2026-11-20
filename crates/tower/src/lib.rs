@@ -1,8 +1,10 @@
-//! An embeddable, loopback-only development relay for the numbers network.
+//! The tower: an embeddable relay for the numbers network, used by the `tower` binary and tests.
 //!
-//! The tower serves plain HTTP, limits traffic received from each relay client, and sees
-//! only ciphertext from traffic between endpoints. It can admit only a static list of endpoint
-//! ids, and it counts what it refused.
+//! A tower comes in two kinds. A development tower serves plain HTTP on a loopback address. A
+//! TLS tower serves HTTPS on any address, with its certificate read from PEM files, and can run
+//! QUIC address discovery so that endpoints learn their public address. Either kind limits the
+//! traffic received from each relay client, can admit only a static list of endpoint ids, counts
+//! what it refused, and sees only ciphertext from traffic between endpoints.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -14,7 +16,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use iroh_base::EndpointId;
 use iroh_relay::server::{
-    Access, AccessControl, ClientRateLimit, ClientRequest, RelayConfig, Server, ServerConfig,
+    Access, AccessControl, ClientRateLimit, ClientRequest, QuicConfig, RelayConfig, Server,
+    ServerConfig, TlsConfig,
+};
+
+mod certs;
+mod tls;
+
+pub use certs::TlsFileProblem;
+pub use tls::{
+    DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, MAX_RELOAD_INTERVAL, TlsTower,
 };
 
 /// The default dev tower bind address.
@@ -32,18 +43,25 @@ pub const MIN_CLIENT_RATE: u32 = 10;
 /// The reason a denied client receives from the tower.
 const DENY_REASON: &str = "not on this tower's list";
 
-/// Configuration for a plain-HTTP development tower.
+/// Configuration for a tower: a plain-HTTP development tower or a TLS tower.
 ///
-/// Build it with [`TowerConfig::dev`] or [`Default`], then adjust it with the builder-style
-/// setters. The struct is `#[non_exhaustive]` so that later fields do not break callers outside
-/// this crate. [`Tower::spawn`] checks the whole configuration.
+/// Build it with [`TowerConfig::dev`], [`TowerConfig::tls`] or [`Default`], then adjust it with
+/// the builder-style setters. The struct is `#[non_exhaustive]` so that later fields do not break
+/// callers outside this crate. [`Tower::spawn`] checks the whole configuration.
 ///
 /// Its `Debug` output shows how many endpoint ids are listed, never the ids themselves.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TowerConfig {
-    /// A loopback socket address. Port zero lets the operating system choose a port.
+    /// The plain-HTTP listener. Port zero lets the operating system choose a port.
+    ///
+    /// A dev tower serves the relay here and requires a loopback address. A TLS tower serves the
+    /// relay over HTTPS instead, but iroh-relay still binds this listener, and it cannot be
+    /// turned off: it answers only the captive-portal check (`/generate_204`), which clients send
+    /// over plain HTTP. A TLS tower may bind any address.
     pub bind: SocketAddr,
+    /// The TLS configuration, or `None` for a plain-HTTP dev tower.
+    pub tls: Option<TlsTower>,
     /// The endpoint ids that may use the relay, as text (hex or base32, as iroh prints them).
     ///
     /// `None` admits every client. `Some` admits only the listed ids, so an empty list admits
@@ -80,10 +98,28 @@ impl TowerConfig {
     pub fn dev(bind: SocketAddr) -> Self {
         Self {
             bind,
+            tls: None,
             allow: None,
             client_rate: DEFAULT_CLIENT_RATE,
             client_burst: None,
         }
+    }
+
+    /// A TLS tower, with its plain-HTTP listener on [`DEFAULT_TLS_HTTP_BIND`].
+    ///
+    /// Like a dev tower, it has no allowlist and lets each client send [`DEFAULT_CLIENT_RATE`]
+    /// bytes per second until the setters say otherwise.
+    pub fn tls(tls: TlsTower) -> Self {
+        Self {
+            tls: Some(tls),
+            ..Self::dev(DEFAULT_TLS_HTTP_BIND)
+        }
+    }
+
+    /// Sets the plain-HTTP listener; see the `bind` field for what it serves.
+    pub fn bind(mut self, addr: SocketAddr) -> Self {
+        self.bind = addr;
+        self
     }
 
     /// Admits only the listed endpoint ids, given as text; an empty list admits nobody.
@@ -129,6 +165,7 @@ impl fmt::Debug for TowerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TowerConfig")
             .field("bind", &self.bind)
+            .field("tls", &self.tls)
             .field("allow", &self.allow.as_ref().map(|ids| Listed(ids.len())))
             .field("client_rate", &self.client_rate)
             .field("client_burst", &self.client_burst)
@@ -145,12 +182,49 @@ impl fmt::Debug for Listed {
     }
 }
 
-/// An error starting or stopping a development tower.
+/// An error starting or stopping a tower.
+///
+/// The enum is `#[non_exhaustive]`: later versions add variants.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TowerError {
-    /// The bind address is not a loopback address.
+    /// A dev tower's bind address is not a loopback address.
     #[error("the dev tower requires a loopback bind address, got {0}")]
     NonLoopbackBind(SocketAddr),
+    /// [`TlsTower::hostname`] is neither a DNS host name nor an IP literal.
+    ///
+    /// The error does not repeat the name; see [`TlsTower::hostname`] for the rule.
+    #[error("the TLS tower's host name is not a valid DNS host name or IP literal")]
+    InvalidHostname,
+    /// The certificate file cannot be used.
+    ///
+    /// The error names which of the two files and one fixed [`TlsFileProblem`], and
+    /// deliberately not the path: the caller configured it and knows it, and paths often
+    /// contain the tower's host name. It carries no content of the file and no upstream error,
+    /// and the variant has no source.
+    #[error("cannot use the tower's certificate file: {problem}")]
+    #[non_exhaustive]
+    CertificateFile {
+        /// What is wrong with the file.
+        problem: TlsFileProblem,
+    },
+    /// The private key file cannot be used, including when its key does not belong to the
+    /// certificate ([`TlsFileProblem::KeyMismatch`]).
+    ///
+    /// The error names which of the two files and one fixed [`TlsFileProblem`], and
+    /// deliberately not the path: the caller configured it and knows it, and paths often
+    /// contain the tower's host name. It carries no byte of the key and no upstream error, and
+    /// the variant has no source.
+    #[error("cannot use the tower's private key file: {problem}")]
+    #[non_exhaustive]
+    KeyFile {
+        /// What is wrong with the file.
+        problem: TlsFileProblem,
+    },
+    /// [`TlsTower::reload_interval`] is zero or too long to schedule (over
+    /// [`MAX_RELOAD_INTERVAL`]).
+    #[error("the TLS tower's certificate reload interval is zero or too long to schedule")]
+    InvalidReloadInterval,
     /// An entry of [`TowerConfig::allow`] is not a valid endpoint id.
     ///
     /// Neither the message nor the source contains the entry's text.
@@ -170,14 +244,21 @@ pub enum TowerError {
     /// [`TowerConfig::client_burst`] is zero.
     #[error("the tower's client burst must be at least one byte")]
     InvalidClientBurst,
-    /// The relay server failed to start.
-    #[error("failed to start the dev tower: {0}")]
+    /// The relay server failed to start, for example because an address is in use.
+    ///
+    /// The message passes on iroh-relay's text, which can name the socket address it could not
+    /// bind; for a tower reached by an IP literal that can be the tower's own address. It never
+    /// names the host name. When this error comes back because a port was taken, a listener the
+    /// relay had already bound can stay bound until the runtime runs again: a caller that
+    /// retries at once on the same ports can see "address in use". `Tower::spawn` yields once
+    /// before returning the error, which is usually enough; there is no stronger promise.
+    #[error("failed to start the tower: {0}")]
     Start(#[source] Box<dyn Error + Send + Sync>),
-    /// The relay server started without the HTTP listener a dev tower needs.
-    #[error("the dev tower started without an HTTP listener")]
+    /// The relay server started without the listener the tower needs.
+    #[error("the tower started without an HTTP listener")]
     MissingHttpAddress,
     /// The relay server did not shut down cleanly.
-    #[error("failed to shut down the dev tower")]
+    #[error("failed to shut down the tower")]
     Shutdown(#[source] Box<dyn Error + Send + Sync>),
 }
 
@@ -196,7 +277,9 @@ pub struct TowerStats {
     pub rate_limited: u64,
     /// QUIC address discovery connections the tower accepted.
     ///
-    /// This is iroh-relay's `qad_connections`. A dev tower has no QUIC listener, so it stays 0.
+    /// This is iroh-relay's `qad_connections`. It stays 0 on a dev tower and on a TLS tower
+    /// without address discovery. An endpoint probes only when it has an IP socket and the host
+    /// has an address that is not loopback.
     pub qad_connections: u64,
 }
 
@@ -256,24 +339,41 @@ fn client_rate_limit(config: &TowerConfig) -> Result<ClientRateLimit, TowerError
     Ok(limit)
 }
 
-/// A running development tower.
+/// A running tower.
 pub struct Tower {
     server: Server,
     url: String,
+    http_addr: SocketAddr,
     denied: Arc<AtomicU64>,
+    /// The certificate reload task of a TLS tower; dropping it stops the task.
+    reloader: Option<certs::Reloader>,
 }
 
 impl Tower {
-    /// Starts a rate-limited HTTP relay on the configured loopback address.
+    /// Starts a rate-limited relay: plain HTTP on loopback, or HTTPS from the TLS configuration.
     ///
-    /// Fails before binding anything if the bind address is not loopback, an allowlist entry is
-    /// not a valid endpoint id, or the rate or burst is out of range.
+    /// Fails before binding anything if a dev tower's bind address is not loopback, an allowlist
+    /// entry is not a valid endpoint id, the rate or burst is out of range, or a TLS tower's host
+    /// name, reload interval, certificate file or key file is unusable. The files are read on
+    /// tokio's blocking pool; a regular file on a mount that stops answering blocks that read,
+    /// and then this call does not return.
+    ///
+    /// If iroh-relay fails to bind a port (it is taken, for example), a listener it had already
+    /// bound is released only when the runtime next runs its aborted tasks. This call yields once
+    /// before returning that error, as a best effort; see [`TowerError::Start`].
     pub async fn spawn(config: TowerConfig) -> Result<Self, TowerError> {
-        if !config.bind.ip().is_loopback() {
+        if config.tls.is_none() && !config.bind.ip().is_loopback() {
             return Err(TowerError::NonLoopbackBind(config.bind));
         }
         let members = config.allow.as_deref().map(parse_allowlist).transpose()?;
         let rate_limit = client_rate_limit(&config)?;
+        let tls = match &config.tls {
+            Some(tls) => {
+                tls::tower_url(&tls.hostname, tls.https_bind.port())?;
+                Some((tls, tls::cert_config(tls).await?))
+            }
+            None => None,
+        };
 
         let denied = Arc::new(AtomicU64::new(0));
         let mut relay = RelayConfig::new(config.bind);
@@ -285,22 +385,58 @@ impl Tower {
             });
         }
         let mut server_config = ServerConfig::default();
+        let mut reloader = None;
+        if let Some((tls, (cert, reload))) = tls {
+            relay.tls = Some(TlsConfig::new(tls.https_bind, cert));
+            server_config.quic = tls.qad_bind.map(QuicConfig::new);
+            reloader = Some(reload);
+        }
         server_config.relay = Some(relay);
 
-        let server = Server::spawn(server_config)
-            .await
-            .map_err(|error| TowerError::Start(Box::new(error)))?;
-        let addr = server.http_addr().ok_or(TowerError::MissingHttpAddress)?;
+        let server = match Server::spawn(server_config).await {
+            Ok(server) => server,
+            Err(error) => {
+                // Lets the runtime run the aborted tasks that still hold a listener.
+                tokio::task::yield_now().await;
+                return Err(TowerError::Start(Box::new(error)));
+            }
+        };
+        let http_addr = server.http_addr().ok_or(TowerError::MissingHttpAddress)?;
+        let url = match &config.tls {
+            Some(tls) => {
+                let https = server.https_addr().ok_or(TowerError::MissingHttpAddress)?;
+                tls::tower_url(&tls.hostname, https.port())?
+            }
+            None => format!("http://{http_addr}"),
+        };
         Ok(Self {
             server,
-            url: format!("http://{addr}"),
+            url,
+            http_addr,
             denied,
+            reloader,
         })
     }
 
-    /// Returns the URL of the bound listener, including the port selected by the OS.
+    /// Returns the tower's URL, with the port the operating system chose.
+    ///
+    /// A dev tower returns `http://` and its bound socket address, with no trailing slash, for
+    /// example `http://127.0.0.1:3340`. A TLS tower returns its canonical URL: `https`, the host
+    /// name in lower case without a trailing dot, the port only when it is not 443, and the
+    /// path `/`, for example `https://tower1.example.com/` or `https://127.0.0.1:45123/`.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Returns the bound plain-HTTP address: the relay of a dev tower, and the captive-portal
+    /// listener of a TLS tower.
+    pub fn http_addr(&self) -> SocketAddr {
+        self.http_addr
+    }
+
+    /// Returns the bound UDP port of QUIC address discovery, or `None` when it is off.
+    pub fn qad_port(&self) -> Option<u16> {
+        self.server.quic_addr().map(|addr| addr.port())
     }
 
     /// Returns what the tower has refused or limited since it started.
@@ -322,6 +458,7 @@ impl Tower {
     /// second later. A test that restarts a tower should therefore check that its clients
     /// noticed.
     pub async fn shutdown(self) -> Result<(), TowerError> {
+        drop(self.reloader);
         self.server
             .shutdown()
             .await
@@ -339,7 +476,9 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::timeout;
 
-    use super::{MIN_CLIENT_RATE, Tower, TowerConfig, TowerError, TowerStats};
+    use super::{
+        MAX_RELOAD_INTERVAL, MIN_CLIENT_RATE, TlsTower, Tower, TowerConfig, TowerError, TowerStats,
+    };
 
     fn loopback() -> TowerConfig {
         TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into())
@@ -394,6 +533,58 @@ mod tests {
             let tower = Tower::spawn(config).await.unwrap();
             assert_eq!(tower.stats(), TowerStats::default());
             tower.shutdown().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tls_tower_is_not_held_to_loopback() {
+        // The certificate check fails before anything binds, so this binds nothing either way.
+        let tls = TlsTower::new(
+            "tower.example",
+            "/nonexistent/cert.pem",
+            "/nonexistent/key.pem",
+        );
+        let config = TowerConfig::tls(tls).bind((Ipv4Addr::UNSPECIFIED, 0).into());
+        let result = Tower::spawn(config).await;
+        assert!(matches!(result, Err(TowerError::CertificateFile { .. })));
+    }
+
+    /// After a drop or a shutdown, nothing holds the certificate pair or the reload task's
+    /// provider: the reload task is gone and the key is released.
+    #[tokio::test]
+    async fn a_dropped_or_stopped_tls_tower_releases_its_key_and_stops_reloading() {
+        timeout(Duration::from_secs(20), async {
+            let dir = tempfile::tempdir().unwrap();
+            let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+            let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+            std::fs::write(&cert, generated.cert.pem()).unwrap();
+            std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+            let loopback: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+
+            for graceful in [false, true] {
+                let tls = TlsTower::new("127.0.0.1", &cert, &key)
+                    .https_bind(loopback)
+                    .qad_bind(Some(loopback))
+                    // Long enough that only the abort can end the task within the bound.
+                    .reload_interval(MAX_RELOAD_INTERVAL);
+                let tower = Tower::spawn(TowerConfig::tls(tls).bind(loopback))
+                    .await
+                    .unwrap();
+                let (pair, provider) = tower.reloader.as_ref().unwrap().watch.clone();
+                assert!(pair.strong_count() > 0 && provider.strong_count() > 0);
+                if graceful {
+                    tower.shutdown().await.unwrap();
+                } else {
+                    drop(tower);
+                }
+                // The relay's own tasks end asynchronously after a drop; no event marks it.
+                let mut tick = tokio::time::interval(Duration::from_millis(10));
+                while pair.strong_count() > 0 || provider.strong_count() > 0 {
+                    tick.tick().await;
+                }
+            }
         })
         .await
         .unwrap();
