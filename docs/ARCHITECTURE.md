@@ -448,26 +448,31 @@ loopback. The remaining iroh examples are source references.
   back without one; NXDOMAIN is `Err(Error::NxDomain {..})`, an empty answer is `Ok(vec![])`.
   `RelayUrl` equality is textual, so canonicalise once. SRV-located towers are always `https`. The
   system resolver falls back to public resolvers unless that is disabled.
-- **Claude Code and API keys.** There is no login command that reads an API key. The CLI takes
-  one from `ANTHROPIC_API_KEY`: an interactive session asks once whether to use it and remembers the
-  answer, and `-p` always uses it. The `apiKeyHelper` setting (any settings file) names a shell
-  command whose output is sent as the key; the output is cached for five minutes by default
-  (`CLAUDE_CODE_API_KEY_HELPER_TTL_MS`) and the command is re-run after a 401 or 403. Precedence:
-  cloud-provider variables, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `apiKeyHelper`,
-  `CLAUDE_CODE_OAUTH_TOKEN`, a named Anthropic profile, then a stored subscription sign-in. No setting
-  limits the CLI to API keys: `forceLoginMethod` takes `claudeai`, `console` or `gateway`, and with
-  it set the CLI refuses an `ANTHROPIC_API_KEY` or `apiKeyHelper` credential at startup.
-  `claude auth status` reports `authMethod` as `api_key` or `api_key_helper` for these. (Read in
-  the published Claude Code documentation on 2026-11-20, not checked against a CLI version.)
+- **Claude Code and API keys.** There is no login command that reads an API key. The CLI takes one
+  from `ANTHROPIC_API_KEY` (an interactive session asks once whether to use it and remembers the
+  answer; `-p` always uses it) or from the output of the shell command the `apiKeyHelper` setting
+  names, cached for five minutes by default. Other credentials can take precedence over both, among
+  them cloud-provider settings, `ANTHROPIC_AUTH_TOKEN` and a signed-in apps gateway; a stored
+  subscription sign-in does not. The full order is on the vendor's authentication page.
+  `forceLoginMethod` cannot restrict the CLI to API keys: it takes `claudeai`, `console` or
+  `gateway`, and where managed settings set it, an environment key or a helper is refused at
+  startup. Bare mode (`--bare` or `CLAUDE_CODE_SIMPLE=1`) reads no OAuth or keychain credentials
+  and, for the Anthropic API, uses `ANTHROPIC_API_KEY` or an `apiKeyHelper` given with `--settings`;
+  cloud providers still work, and it loads fewer features. `claude auth status` reports `authMethod`
+  as `api_key` or `api_key_helper`. (Read in the published Claude Code documentation on 2026-11-20,
+  not checked against a CLI version.)
 - **Codex and API keys.** `codex login --with-api-key` reads the key from stdin, refuses a terminal
   and does not check it ("Authentication is checked when you send a request"). It stores the key
   through `cli_auth_credentials_store`: `file` (`auth.json` under `CODEX_HOME`, default
-  `~/.codex`), `keyring`, `auto` or `ephemeral`. `codex login status` exits 0 or 1 and, for a key,
-  prints its first 8 and last 5 characters to stderr, so its output must not be passed on.
-  `codex logout` clears the stored credentials. `CODEX_API_KEY` is read only by `codex exec`, where
-  it overrides the stored credentials; the interactive CLI ignores it. `forced_login_method = "api"`
-  allows only API-key login; if the active credentials do not match, Codex signs the user out and
-  exits. (Read in the Codex source on 2026-11-20, `main` after release 0.171.0.)
+  `~/.codex`), `keyring` or `auto`; `ephemeral` keeps it in that process's memory only, so it cannot
+  give a key to a later `codex` process. `codex login status` exits 0 or 1 and, for a key, prints
+  its first 8 and last 5 characters to stderr. `codex logout` clears the stored credentials.
+  `CODEX_API_KEY` overrides the stored credentials in `codex exec`, in `codex review` (which runs
+  through exec) and in some other commands; an interactive session does not authenticate with it,
+  though its startup login-method check reads it. `forced_login_method = "api"` allows the API
+  credential family, Amazon Bedrock API keys and AWS access keys included, not OpenAI API keys
+  alone; if the active credentials do not match, Codex signs the user out and exits. (Read in the
+  Codex source on 2026-11-20: release 0.171.0, commit ccf9be8, and `main` after it.)
 - **Nitrokey HSM 2 (M3).** Per the vendor: RSA 1024–4096, ECC 192–521 bit (NIST P-256/384/521,
   secp256k1, brainpool) with ECDSA and ECDH, AES; no Ed25519. PKCS#11 through OpenSC. ECDSA-256
   signing takes about 80 ms. Keys can be generated on the device, and its built-in PKI can certify
