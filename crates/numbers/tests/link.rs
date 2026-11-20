@@ -243,6 +243,15 @@ async fn request<T: Serialize>(
     read_frame(&mut recv, WIRE_FRAME_MAX, Some(PROBE_TIMEOUT)).await
 }
 
+/// Opens a chat stream and sends a complete request without waiting for the reply.
+async fn open_chat(conn: &Connection, header: &StreamHeader, body: &ChatMessage) -> RecvStream {
+    let (mut send, recv) = checked(conn.open_bi().await, "open chat stream");
+    write(&mut send, header).await;
+    write(&mut send, body).await;
+    checked(send.finish(), "finish chat request");
+    recv
+}
+
 async fn wait_for_close(conn: &Connection) {
     checked(
         timeout(PROBE_TIMEOUT, conn.closed()).await,
@@ -892,6 +901,90 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
         })
         .await,
         "receiver reply deadline test timed out",
+    );
+}
+
+/// Every chat stream slot of the receiver holds a chat that the application does not answer.
+/// When they all reach the receiver's deadline, their slots must be free again, so one more
+/// chat on the same connection is delivered after about one deadline, not sixteen.
+///
+/// 16 is the link's stream limit (`STREAM_LIMIT` in `crates/numbers/src/link.rs`, which is
+/// also the endpoint's limit of concurrent bidirectional streams). This test must follow it
+/// if it changes.
+#[tokio::test]
+async fn chats_reset_at_the_receiver_deadline_release_every_stream_slot() {
+    const LINK_STREAM_LIMIT: usize = 16;
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let conn = dial(&peer, &address).await;
+            let (mut send, remote) =
+                begin_hello(&conn, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            finish_hello(&mut send, &remote).await;
+            wait_for_path(&link.handle(), peer_id, LinkPath::Direct).await;
+
+            let header = StreamHeader::chat();
+            // noq announces new stream credit only once more than 1/8 of the window (2 of
+            // 16 streams) is free again. Free two more streams after the hello so that the
+            // peer can open as many concurrent streams as the link has slots.
+            for index in 0..2 {
+                let warmup = message(&format!("warmup-{index}"), "return stream credit");
+                let (reply, ()) = tokio::join!(
+                    request(&conn, &header, &warmup),
+                    acknowledge(&mut inbox, peer_id, "second", &warmup),
+                );
+                assert_eq!(checked(reply, "read a warmup ACK"), ChatReply::Ack);
+            }
+            // The inbox holds more chats than the link has slots, so every slot can hold a
+            // delivered chat whose reply sender the application keeps. All of them reach the
+            // receiver's deadline together, so the next chat needs about one deadline.
+            let reply = checked(
+                timeout(SEND_DEADLINE + Duration::from_secs(1), async {
+                    let mut replies = Vec::new();
+                    let mut held = Vec::new();
+                    for index in 0..LINK_STREAM_LIMIT {
+                        let chat = message(&format!("held-{index}"), "occupy one stream slot");
+                        replies.push(open_chat(&conn, &header, &chat).await);
+                        let incoming = checked(
+                            timeout(PROBE_TIMEOUT, inbox.recv()).await,
+                            "deliver a chat that fills a stream slot",
+                        )
+                        .expect("link inbox remains open");
+                        assert_delivery(&incoming, peer_id, "second", &chat);
+                        held.push(incoming);
+                    }
+                    for recv in &mut replies {
+                        let reset = recv.read(&mut [0]).await;
+                        assert!(
+                            matches!(reset, Err(ReadError::Reset(code)) if code.into_inner() == 0)
+                        );
+                    }
+                    drop(held);
+
+                    let next = message("after-full-slots", "a freed slot accepts this chat");
+                    let (reply, ()) = tokio::join!(
+                        request(&conn, &header, &next),
+                        acknowledge(&mut inbox, peer_id, "second", &next),
+                    );
+                    reply
+                })
+                .await,
+                "a chat after a full set of deadline resets was not delivered",
+            );
+            assert_eq!(
+                checked(reply, "read ACK after the deadline resets"),
+                ChatReply::Ack
+            );
+            assert!(conn.close_reason().is_none());
+            checked(link.shutdown().await, "stop link after the deadline resets");
+            peer.iroh().close().await;
+        })
+        .await,
+        "stream slot release test timed out",
     );
 }
 
