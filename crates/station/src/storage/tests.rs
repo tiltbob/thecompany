@@ -9,10 +9,12 @@ use std::time::Duration;
 
 use chief::api::{ApiError, Event};
 use chief::client::{Client, Subscription};
-use numbers::node_id;
+use numbers::{TowerEntry, TowerSet, node_id};
+use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::{IpTransport, StartError, Station, StationConfig};
+use crate::towers::TowerOrigin;
+use crate::{IpTransport, StartError, Station, StationConfig, TowerInput};
 
 fn scratch() -> (TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("create scratch directory");
@@ -589,7 +591,8 @@ fn validation_failure_preserves_old_book_and_directory_sync_failure_commits() {
 fn offline_config(path: &Path) -> (StationConfig, TcpListener) {
     let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback port");
     let address = reservation.local_addr().expect("read loopback port");
-    let mut config = StationConfig::new(path, format!("http://{address}/"));
+    let set = TowerSet::from_url(&format!("http://{address}/")).expect("make offline tower set");
+    let mut config = StationConfig::new(path, TowerInput::Pinned(set));
     config.ip_transport = IpTransport::RelayOnly;
     (config, reservation)
 }
@@ -753,4 +756,226 @@ async fn an_absent_remove_confirms_an_existing_empty_book_without_creating_a_mis
     })
     .await
     .expect("empty book confirmation test timed out");
+}
+
+fn tower_record(domain: &str) -> RememberedTowers {
+    let entry = TowerEntry::from_url("http://127.0.0.1:3340").expect("make loopback tower fixture");
+    RememberedTowers::new(domain, [(entry, TowerOrigin::Srv)]).expect("make tower record fixture")
+}
+
+#[test]
+fn a_safe_corrupt_tower_record_can_be_replaced() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let tower_path = path.join(TOWER_FILE);
+    assert!(
+        storage
+            .load_towers()
+            .expect("read missing record")
+            .is_none()
+    );
+
+    write_file(&tower_path, b"bad JSON", 0o600);
+    assert!(matches!(
+        storage.load_towers(),
+        Err(StorageError::InvalidTowers(TowerRecordError::Malformed))
+    ));
+    let record = tower_record("First.Example.Invalid.");
+    assert_eq!(
+        storage.save_towers(&record).expect("replace safe record"),
+        SaveOutcome::Durable
+    );
+    assert_eq!(file_mode(&tower_path), 0o600);
+    let bytes = fs::read(&tower_path).expect("read saved record");
+    let disk: Value = serde_json::from_slice(&bytes).expect("read v1 record");
+    assert_eq!(disk["version"], 1);
+    assert_eq!(disk["bootstrap_domain"], "first.example.invalid");
+    let loaded = storage
+        .load_towers()
+        .expect("read saved record")
+        .expect("saved record exists");
+    assert_eq!(loaded.domain(), record.domain());
+    assert!(loaded.entries().eq(record.entries()));
+}
+
+#[test]
+fn tower_record_read_and_write_enforce_the_exact_size_limit() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let tower_path = path.join(TOWER_FILE);
+    let record = tower_record("fixture.example.invalid");
+    let mut bytes = record.encode().expect("encode fixture record");
+    bytes.resize(TOWER_FILE_MAX_BYTES, b' ');
+    assert_eq!(
+        storage
+            .replace_record(RecordFile::Towers, &bytes, File::sync_all)
+            .expect("save tower record at the size limit"),
+        SaveOutcome::Durable
+    );
+    assert!(matches!(storage.load_towers(), Ok(Some(_))));
+
+    bytes.push(b' ');
+    assert!(matches!(
+        storage.replace_record(RecordFile::Towers, &bytes, |_| {
+            panic!("oversize write must not reach directory sync")
+        }),
+        Err(StorageError::RecordTooLarge(RecordFile::Towers))
+    ));
+    assert!(fs::read(&tower_path).expect("read unchanged record") == bytes[..TOWER_FILE_MAX_BYTES]);
+    assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 2);
+    write_file(&tower_path, &bytes, 0o600);
+    assert!(matches!(
+        storage.load_towers(),
+        Err(StorageError::RecordTooLarge(RecordFile::Towers))
+    ));
+}
+
+#[test]
+fn unsafe_tower_records_are_neither_read_nor_replaced() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let tower_path = path.join(TOWER_FILE);
+    let record = tower_record("fixture.example.invalid");
+    let assert_rejected = || {
+        assert!(matches!(
+            storage.load_towers(),
+            Err(StorageError::PrivateRecord(RecordFile::Towers))
+        ));
+        assert!(matches!(
+            storage.save_towers(&record),
+            Err(StorageError::PrivateRecord(RecordFile::Towers))
+        ));
+    };
+
+    write_file(&tower_path, b"keep", 0o644);
+    assert_rejected();
+    assert!(fs::read(&tower_path).expect("read original bytes") == b"keep");
+    assert_eq!(file_mode(&tower_path), 0o644);
+    fs::remove_file(&tower_path).expect("remove unsafe mode fixture");
+
+    fs::create_dir(&tower_path).expect("create directory in place of tower record");
+    assert_rejected();
+    assert!(tower_path.is_dir());
+    fs::remove_dir(&tower_path).expect("remove directory fixture");
+
+    let target = path.join("target");
+    write_file(&target, b"keep", 0o600);
+    symlink(&target, &tower_path).expect("link tower fixture");
+    assert_rejected();
+    assert!(tower_path.is_symlink());
+    assert!(fs::read(target).expect("read fixture target") == b"keep");
+    assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 3);
+}
+
+#[test]
+fn tower_record_stays_with_the_locked_directory_when_an_alias_moves() {
+    let (temp, first) = scratch();
+    let second = temp.path().join("other-station");
+    let alias = temp.path().join("alias");
+    ensure_private_dir(&first).expect("create first fixture directory");
+    symlink(&first, &alias).expect("link to first fixture directory");
+    let first_storage = Storage::lock(&alias).expect("lock first directory through alias");
+    let second_storage = Storage::lock(&second).expect("lock second directory");
+    let second_record = tower_record("other.example.invalid");
+    second_storage
+        .save_towers(&second_record)
+        .expect("save second fixture");
+
+    fs::remove_file(&alias).expect("remove old alias");
+    symlink(&second, &alias).expect("retarget alias to second directory");
+    assert!(
+        first_storage
+            .load_towers()
+            .expect("read first directory")
+            .is_none()
+    );
+    let first_record = tower_record("first.example.invalid");
+    first_storage
+        .save_towers(&first_record)
+        .expect("write through first directory handle");
+    for (storage, record) in [
+        (&first_storage, &first_record),
+        (&second_storage, &second_record),
+    ] {
+        let saved = storage
+            .load_towers()
+            .expect("load from the locked directory")
+            .expect("record exists");
+        assert_eq!(saved.domain(), record.domain());
+        assert!(saved.entries().eq(record.entries()));
+    }
+    assert_eq!(file_mode(&first.join(TOWER_FILE)), 0o600);
+}
+
+#[test]
+fn tower_replacement_reports_uncertain_durability_only_after_rename() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let tower_path = path.join(TOWER_FILE);
+    let old = tower_record("old.example.invalid");
+    storage.save_towers(&old).expect("save original record");
+    let original = fs::read(&tower_path).expect("read original record");
+    let next = tower_record("next.example.invalid");
+    let proposed = next.encode().expect("encode replacement");
+
+    fs::set_permissions(&tower_path, Permissions::from_mode(0o644))
+        .expect("make destination unsafe");
+    assert!(matches!(
+        storage.replace_record(RecordFile::Towers, &proposed, |_| {
+            panic!("a failed replacement must not reach directory sync")
+        }),
+        Err(StorageError::PrivateRecord(RecordFile::Towers))
+    ));
+    assert!(fs::read(&tower_path).expect("read unchanged record") == original);
+    fs::set_permissions(&tower_path, Permissions::from_mode(0o600))
+        .expect("restore destination mode");
+
+    let outcome = storage
+        .replace_record(RecordFile::Towers, &proposed, |_| {
+            assert!(fs::read(&tower_path).expect("read visible replacement") == proposed);
+            Err(io::ErrorKind::Other.into())
+        })
+        .expect("rename committed");
+    assert_eq!(outcome, SaveOutcome::DurabilityUncertain);
+    assert!(fs::read(&tower_path).expect("read committed record") == proposed);
+    assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 2);
+}
+
+#[test]
+fn peer_and_tower_staging_names_do_not_collide() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    for index in 0..STAGING_ATTEMPTS {
+        write_file(
+            &path.join(staging_name(RecordFile::Peers, u128::from(index))),
+            b"keep",
+            0o600,
+        );
+    }
+    let stale = path.join(staging_name(RecordFile::Towers, 0));
+    write_file(&stale, b"stale", 0o600);
+    let bytes = tower_record("example.invalid")
+        .encode()
+        .expect("encode tower record");
+    let mut suffixes = [0, 1].into_iter();
+    assert_eq!(
+        storage
+            .replace_record_with_suffixes(
+                RecordFile::Towers,
+                &bytes,
+                || Ok(suffixes.next().expect("exactly two draws")),
+                File::sync_all,
+            )
+            .expect("use the tower-specific namespace"),
+        SaveOutcome::Durable
+    );
+    assert!(suffixes.next().is_none());
+    assert!(fs::read(stale).expect("read original stage fixture") == b"stale");
+    for index in 0..STAGING_ATTEMPTS {
+        assert!(
+            fs::read(path.join(staging_name(RecordFile::Peers, u128::from(index))))
+                .expect("read existing peer stage fixture")
+                == b"keep"
+        );
+    }
 }

@@ -9,7 +9,7 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// An actor with one peer `peer` whose only station has no endpoint behind it, and a
 /// subscription that starts after that add.
 async fn send_fixture(data_dir: &Path) -> (Actor, Link, Subscription) {
-    let (mut actor, link) = actor_fixture(data_dir).await;
+    let (mut actor, link, _) = actor_fixture(data_dir).await;
     actor
         .add_peer("peer", &node_id(&generate_node_key()).to_string())
         .unwrap_or_else(|_| panic!("add the peer"));

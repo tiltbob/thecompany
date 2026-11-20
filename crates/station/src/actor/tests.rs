@@ -1,12 +1,15 @@
 use std::fs::{self, File, Permissions};
 use std::future::ready;
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+use chief::api::TowerSource;
 use numbers::link::LINK_ALPN;
-use numbers::{Endpoint, EndpointConfig, generate_node_key, node_id};
+use numbers::{DnsConfig, Endpoint, EndpointConfig, TowerControl, generate_node_key, node_id};
 
 use super::*;
+use crate::TowerInput;
 
 mod book_rules;
 mod delivery_deadline;
@@ -22,12 +25,7 @@ async fn queued_event(events: &mut Subscription) -> Option<Event> {
     }
 }
 
-#[test]
-fn empty_home_relay_observation_is_standby() {
-    assert_eq!(tower_state(None), TowerState::Standby);
-}
-
-async fn actor_fixture(data_dir: &Path) -> (Actor, Link) {
+async fn actor_fixture(data_dir: &Path) -> (Actor, Link, TowerControl) {
     let storage = Storage::lock(data_dir).expect("lock actor test directory");
     let key = storage.load_node_key().expect("load actor key");
     let own_id = node_id(&key);
@@ -42,6 +40,7 @@ async fn actor_fixture(data_dir: &Path) -> (Actor, Link) {
     )
     .await
     .unwrap_or_else(|_| panic!("bind actor fixture endpoint"));
+    let control = endpoint.tower_control();
     let budget = Duration::from_secs(2);
     let (link, _incoming) = Link::start(
         endpoint,
@@ -65,14 +64,14 @@ async fn actor_fixture(data_dir: &Path) -> (Actor, Link) {
         budget,
         link.handle(),
     );
-    (actor, link)
+    (actor, link, control)
 }
 
 #[tokio::test]
 async fn duplicate_peer_add_confirms_an_uncertain_book_without_another_event() {
     let dir = tempfile::tempdir().expect("create actor test directory");
     let data_dir = dir.path().join("station");
-    let (mut actor, link) = actor_fixture(&data_dir).await;
+    let (mut actor, link, _control) = actor_fixture(&data_dir).await;
     let own_id = actor.own_id;
     let (sink, mut events) = subscription(SUBSCRIPTION_CAPACITY);
     actor.sinks.push(sink);
@@ -179,7 +178,7 @@ async fn missing_peer_remove_confirms_an_uncertain_book_without_another_event() 
     let dir = tempfile::tempdir().expect("create actor test directory");
     let data_dir = dir.path().join("station");
     let book_path = data_dir.join("peers.json");
-    let (mut actor, link) = actor_fixture(&data_dir).await;
+    let (mut actor, link, _control) = actor_fixture(&data_dir).await;
     let own_id = actor.own_id;
     let removed = node_id(&generate_node_key());
     let retained = node_id(&generate_node_key());
@@ -292,6 +291,161 @@ async fn missing_peer_remove_confirms_an_uncertain_book_without_another_event() 
             .authorize(&removed, Protocol::Stream(CHAT_PROTOCOL)),
         None
     );
+    assert!(queued_event(&mut events).await.is_none());
+    link.shutdown().await.expect("shut down actor fixture link");
+}
+
+fn domain_fixture(actor: &mut Actor, control: TowerControl) -> RuntimeTowers {
+    let mode = TowerMode::prepare(
+        TowerInput::Domain("fixture.example.invalid".to_owned()),
+        &actor.storage,
+        None,
+        DnsConfig::default(),
+    )
+    .unwrap_or_else(|_| panic!("initialize actor tower fixture"));
+    actor.status.bootstrap_domain = mode.domain().map(str::to_owned);
+    RuntimeTowers { mode, control }
+}
+
+#[tokio::test]
+async fn tower_add_preserves_state_before_rename_and_confirms_a_visible_uncertain_commit() {
+    let temp = tempfile::tempdir().expect("create actor tower fixture");
+    let data_dir = temp.path().join("station");
+    let record_path = data_dir.join("towers.json");
+    let (mut actor, link, control) = actor_fixture(&data_dir).await;
+    let mut towers = domain_fixture(&mut actor, control);
+    let (sink, mut events) = subscription(SUBSCRIPTION_CAPACITY);
+    actor.sinks.push(sink);
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve a tower port");
+    let url = format!(
+        "http://{}/",
+        reservation.local_addr().expect("read tower port")
+    );
+    let url = url.as_str();
+
+    let old = fs::read(&record_path).expect("read durable empty record");
+    actor.storage.fail_next_tower_sync();
+    fs::set_permissions(&record_path, Permissions::from_mode(0o644))
+        .expect("make destination unsafe");
+    assert!(matches!(
+        actor.add_tower(&mut towers, url).await,
+        Err(ApiError::Internal { .. })
+    ));
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain)
+        if domain.lookup.is_some() && !domain.uncertain && domain.record.set().is_empty()));
+    assert!(towers.control.tower_states().unwrap().is_empty());
+    assert!(actor.status.towers.is_empty());
+    assert!(queued_event(&mut events).await.is_none());
+    assert!(fs::read(&record_path).expect("read unchanged record") == old);
+    fs::set_permissions(&record_path, Permissions::from_mode(0o600))
+        .expect("restore destination mode");
+
+    assert!(matches!(
+        actor.add_tower(&mut towers, url).await,
+        Err(ApiError::Internal { .. })
+    ));
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain)
+        if domain.lookup.is_none() && domain.uncertain && domain.record.set().urls().eq([url])));
+    assert!(
+        towers
+            .control
+            .tower_states()
+            .unwrap()
+            .iter()
+            .map(|state| state.url())
+            .eq([url])
+    );
+    let Some(Event::Status { status }) = queued_event(&mut events).await else {
+        panic!("visible replacement must publish status despite sync failure");
+    };
+    assert!(status.towers.len() == 1 && status.towers[0].source == Some(TowerSource::Configured));
+    let visible = File::open(&record_path).expect("hold uncertain record open");
+    let visible_inode = visible.metadata().expect("read uncertain inode").ino();
+    let bytes = fs::read(&record_path).expect("read visible record");
+
+    actor.storage.fail_next_tower_sync();
+    assert!(matches!(
+        actor.add_tower(&mut towers, url).await,
+        Err(ApiError::Internal { .. })
+    ));
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain) if domain.uncertain));
+    let replayed = File::open(&record_path).expect("hold rewritten record open");
+    let replayed_inode = replayed.metadata().expect("read rewritten inode").ino();
+    assert_ne!(visible_inode, replayed_inode);
+    assert!(fs::read(&record_path).expect("read rewritten record") == bytes);
+
+    assert!(matches!(
+        actor.add_tower(&mut towers, url).await,
+        Ok(Response::TowerAdd {
+            outcome: TowerAddOutcome::AlreadyInSet,
+            ..
+        })
+    ));
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain) if !domain.uncertain));
+    let durable_inode = fs::metadata(&record_path)
+        .expect("read durable inode")
+        .ino();
+    assert_ne!(replayed_inode, durable_inode);
+    assert!(fs::read(&record_path).expect("read durable record") == bytes);
+
+    assert!(matches!(
+        actor.add_tower(&mut towers, url).await,
+        Ok(Response::TowerAdd {
+            outcome: TowerAddOutcome::AlreadyInSet,
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::metadata(&record_path).expect("read same inode").ino(),
+        durable_inode
+    );
+    assert!(queued_event(&mut events).await.is_none());
+    link.shutdown().await.expect("shut down actor fixture link");
+}
+
+#[tokio::test]
+async fn an_absent_remove_confirms_the_original_sources_after_uncertain_discovery() {
+    let temp = tempfile::tempdir().expect("create actor tower fixture");
+    let data_dir = temp.path().join("station");
+    let record_path = data_dir.join("towers.json");
+    let (mut actor, link, control) = actor_fixture(&data_dir).await;
+    let mut towers = domain_fixture(&mut actor, control);
+    let (sink, mut events) = subscription(SUBSCRIPTION_CAPACITY);
+    actor.sinks.push(sink);
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve a tower port");
+    let found = TowerEntry::from_url(&format!(
+        "http://{}/",
+        reservation.local_addr().expect("read tower port")
+    ))
+    .expect("make locator entry");
+
+    actor.storage.fail_next_tower_sync();
+    assert!(actor.located(&mut towers, Ok(vec![found.clone()])).await);
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain)
+        if domain.lookup.is_none() && domain.uncertain && domain.record.entries().eq([(&found, TowerOrigin::Srv)])));
+    assert!(
+        matches!(queued_event(&mut events).await, Some(Event::Status { status })
+        if status.towers.len() == 1 && status.towers[0].source == Some(TowerSource::Srv))
+    );
+    let old = File::open(&record_path).expect("hold uncertain creation open");
+    let old_inode = old.metadata().expect("read original inode").ino();
+    let bytes = fs::read(&record_path).expect("read discovered record");
+
+    assert!(matches!(
+        actor.remove_tower(&mut towers, "http://127.0.0.1:1").await,
+        Ok(Response::TowerRemove {
+            outcome: TowerRemoveOutcome::NotInSet,
+            ..
+        })
+    ));
+    assert!(matches!(&towers.mode, TowerMode::Domain(domain) if !domain.uncertain));
+    assert_ne!(
+        fs::metadata(&record_path)
+            .expect("read durable inode")
+            .ino(),
+        old_inode
+    );
+    assert!(fs::read(record_path).expect("read confirmed record") == bytes);
     assert!(queued_event(&mut events).await.is_none());
     link.shutdown().await.expect("shut down actor fixture link");
 }

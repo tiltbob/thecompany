@@ -21,7 +21,7 @@ impl BookFixture {
     async fn start() -> Self {
         let dir = tempfile::tempdir().expect("create actor test directory");
         let data_dir = dir.path().join("station");
-        let (mut actor, link) = actor_fixture(&data_dir).await;
+        let (mut actor, link, _) = actor_fixture(&data_dir).await;
         let kept = node_id(&generate_node_key());
         actor
             .add_peer("kept", &kept.to_string())

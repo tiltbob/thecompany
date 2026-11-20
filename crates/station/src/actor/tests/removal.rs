@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chief::api::{ApiError, Event, FailReason, MessageStatus, Request, Response, Status};
+use chief::api::{ApiError, Event, FailReason, MessageStatus, Response, Status};
 use chief::client::{SUBSCRIPTION_CAPACITY, Subscription, subscription};
 use iroh::EndpointAddr;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -232,11 +232,8 @@ impl Fixture {
         self.finished(seq).await;
     }
 
-    fn status_of(&mut self, seq: u64) -> MessageStatus {
-        let Ok(Response::Message { message }) = self.actor.call(Request::Message { seq }) else {
-            panic!("the log holds the message");
-        };
-        message.status
+    fn status_of(&self, seq: u64) -> MessageStatus {
+        checked(self.actor.history.message(seq), "the log holds the message").status
     }
 
     /// The next queued event, which must be a final message event.

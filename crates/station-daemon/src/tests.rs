@@ -1,10 +1,11 @@
-use super::{Args, RunError, RunningStation, print_argument_exit, resolve};
+use super::{Action, Args, RunError, RunningStation, print_argument_exit, resolve};
 use chief::api::{ApiError, Direction, Event, MessageStatus, TowerState};
 use chief::client::{Client, SocketTransport, Transport};
 use chief::paths::PathEnv;
 use clap::Parser;
+use numbers::TowerSet;
 use numbers_station::ipc::{IpcConfig, IpcError, IpcServer};
-use numbers_station::{IpTransport, StartError, Station, StationConfig};
+use numbers_station::{IpTransport, StartError, Station, StationConfig, TowerInput};
 use numbers_tower::{Tower, TowerConfig};
 use std::future::{pending, ready};
 use std::net::Ipv4Addr;
@@ -108,7 +109,10 @@ fn data_directory_and_socket_follow_the_shared_rules() {
     let (config, socket) = resolve(parse(&["run", "--tower", TOWER]), &env).unwrap();
     assert_eq!(config.data_dir, Path::new("/data/thecompany/station"));
     assert_eq!(socket, Path::new("/run/user/thecompany/station.sock"));
-    assert_eq!(config.tower_url, TOWER);
+    let TowerInput::Pinned(towers) = config.tower_input else {
+        panic!("the daemon must pin the supplied tower URL");
+    };
+    assert!(towers.urls().eq(["http://127.0.0.1:3340/"]));
 
     let (config, socket) = resolve(
         parse(&["run", "--tower", TOWER, "--data-dir", "/data/second"]),
@@ -194,20 +198,25 @@ fn startup_errors_omit_storage_details_and_socket_paths_and_sources() {
     }
 }
 
-#[tokio::test]
-async fn invalid_tower_diagnostic_omits_the_url() {
+#[test]
+fn invalid_tower_diagnostic_omits_the_url() {
     let scratch = tempfile::tempdir().expect("create test directory");
     let data_dir = scratch.path().join("station");
-    let socket = data_dir.join("station.sock");
-    let url = format!("https://{PRIVATE_MARKER}@{PRIVATE_HOST}/");
-    let Err(error @ RunError::Station(StartError::InvalidTower(_))) =
-        RunningStation::start(loopback_config(&data_dir, &url), &socket).await
-    else {
+    let args = Args {
+        action: Action::Run {
+            data_dir: Some(data_dir.clone()),
+            tower: format!("https://{PRIVATE_MARKER}@{PRIVATE_HOST}/"),
+        },
+    };
+    let Err(error @ RunError::TowerUrl) = resolve(args, &PathEnv::default()) else {
         panic!("expected a tower URL with credentials to be rejected");
     };
     let message = error.to_string();
     assert_private_values_omitted(&message);
-    assert!(message.starts_with("invalid --tower URL"));
+    assert_eq!(
+        message,
+        "invalid --tower URL; use an HTTPS root URL or a loopback HTTP root URL without credentials, query, or fragment"
+    );
     assert!(!data_dir.exists());
 }
 
@@ -217,7 +226,8 @@ fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
 }
 
 fn loopback_config(data_dir: &Path, tower: &str) -> StationConfig {
-    let mut config = StationConfig::new(data_dir, tower);
+    let towers = checked(TowerSet::from_url(tower), "validate loopback tower URL");
+    let mut config = StationConfig::new(data_dir, TowerInput::Pinned(towers));
     config.ip_transport = IpTransport::LoopbackOnly;
     config.connect_timeout = Duration::from_secs(3);
     config.send_deadline = Duration::from_secs(6);

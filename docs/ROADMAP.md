@@ -209,7 +209,7 @@ unlisted station denied.
 | `crates/numbers/src/testing.rs` | `FakeDns` (cargo feature `test-support`): a DNS server on 127.0.0.1 answering SRV and A from a table the test sets, able to stay silent, recording every query. The station tests reuse it | #72, Claude |
 | `crates/numbers/src/proto/towers.rs`, `crates/numbers/src/link/` | The opt-in `towers` v1 stream sends one HTTPS working-set snapshot per side on each admitted transport. The link validates the whole list and hands it to the station with the exact connection identity. | #128, Codex |
 | `crates/station/src/towers.rs` | The station supplies its working set to the link and keeps the latest accepted candidate snapshot per peer. | #81, Codex |
-| `crates/station/src/towers.rs` | owned by the actor: `towers.json` in the data dir (the set, each entry's source, the bootstrap domain), written atomically and only by the actor; the start order; `StationConfig` gains a tower input (`Pinned(TowerSet) \| Domain(String) \| Remembered`), a locator, `tls_roots` and `dns`; fills `source` and `bootstrap_domain` | #77, Codex |
+| `crates/station/src/towers.rs` | `towers.json` in the locked data dir holds the set, each entry's original source and the bootstrap domain. Startup and the actor replace it atomically. `StationConfig` takes `Pinned(TowerSet) \| Domain(String) \| Remembered`, an optional locator, `tls_roots` and `dns`. Status includes each tower's source and the effective bootstrap domain. | #77, Codex |
 | `crates/station/src/towers.rs` | the watchdog on the home tower, the `Denied` state, and the return to SRV (below) | #78, Codex |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] [--domain DOMAIN] [--tower URL]... [--tower-ca PEM]`, and a hidden `--dns-server ADDR` for tests or none (open in #79). A first run with no `--tower`, no `--domain` and no remembered set is refused with a plain message. The rustls provider install stays in `main` | #79, Codex |
 | `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`) and `Status.bootstrap_domain: Option<String>`. `Standby` represents a tower whose state is unobserved, including when the home tower state is unavailable. Introduced in API version 2. | #68, Codex |
@@ -241,13 +241,15 @@ touch. SRV
 carries no QAD port, so a tower found through SRV is assumed to serve QAD on UDP 7842; a closed QAD
 port costs every station that runs QAD 3 s at each first net report.
 
-**Finding towers.** A station takes its towers in this order: the `--tower` pins given for this
-run, which also switch off SRV and are never written to `towers.json`; else the set it remembered
-in `towers.json`; else one SRV lookup for its bootstrap domain. Pins and a remembered set skip the
-SRV lookup, not all DNS: a tower's host name can still need an A or AAAA lookup. `--domain` is
-stored on first use.
-What happens when `--domain` differs from the stored one, and when `--tower` and `--domain` are
-given together, is open, to be settled on #79. The record is SRV with one target per tower (decision
+**Finding towers.** Pins apply to one run and leave `towers.json` untouched. Otherwise, a station
+uses the remembered domain and set unless the chief supplies a different domain. Domain comparison
+uses lowercase names with the final dot removed. On the first use of a domain or a real domain
+change, the station durably stores the new domain and an empty set before starting discovery. It
+also rewrites and syncs a reloaded empty set before running one asynchronous SRV lookup. Pins and
+a nonempty remembered set skip SRV. A tower's host name can still need an A or AAAA lookup. The daemon
+introduces mutually exclusive `--tower` and `--domain` flags in #79 (decision #108).
+
+The record is SRV with one target per tower (decision
 13, settled on #38): `_numbers._tcp.example.com. SRV 0 0 443 tower1.example.com.` gives the tower
 `https://tower1.example.com/`. A target of `.` is skipped, and priority and weight are ignored.
 Every tower URL is kept in one canonical form: the host in lower case with no trailing dot, the
@@ -260,6 +262,16 @@ preempt the synchronous read of the system's resolver configuration at the start
 lookup is answered from an earlier one's cache: with the system's resolvers each lookup builds a
 fresh resolver, and with an explicit nameserver the cache is cleared first. Neither the SRV
 resolver nor iroh's resolver for the tower host names falls back to a public resolver.
+
+`towers.json` is a version-1 record limited to 16 KiB. An unusable record is reported and ignored.
+An explicit domain can recover by replacing a safe corrupt file. Reloaded towers show `Remembered`
+in Status and retain their original provenance on disk. In a domain-backed run, a chief can add
+or remove a tower explicitly. The station writes the entire replacement, applies it to the endpoint,
+and publishes Status before replying. If directory sync fails after rename, the visible set still
+takes effect and the request reports the failure. An already-installed add or absent remove repeats
+the entire write while durability is uncertain, without another Status event. A nonempty record
+loaded on startup remains uncertain until a successful checked rewrite, since a previous process
+may already have received a writeback error for it.
 
 **Watching the home tower** (decision 17, settled on #74). iroh alone is slow in three situations
 that the lab measured: a tower that was down at start (online 14 to 24 s after it is up), a home

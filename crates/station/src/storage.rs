@@ -2,7 +2,8 @@
 //!
 //! As with `numbers_base::keyfile`, ancestors of the data directory must be writable only by
 //! the station user or root. The node key and state records are opened relative to the checked
-//! directory's descriptor. The actor is the only peer-book writer. Stop it before editing the book.
+//! directory's descriptor. The station holds the lock when writing state records. The actor
+//! is the only peer-book writer. Stop it before editing the book.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -19,12 +20,16 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
+use crate::towers::{RememberedTowers, TowerRecordError};
+
 const LOCK_FILE: &str = "lock";
 const KEY_FILE: &str = "node.key";
 const PEER_FILE: &str = "peers.json";
+const TOWER_FILE: &str = "towers.json";
 const PEER_FILE_VERSION: u32 = 1;
 // This also leaves room for the link records in `Response::Peers` under the 1 MiB IPC cap.
 const PEER_FILE_MAX_BYTES: usize = 256 * 1024;
+const TOWER_FILE_MAX_BYTES: usize = 16 * 1024;
 const STAGING_ATTEMPTS: u8 = 16;
 const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const OPEN_PRIVATE: OFlags = OFlags::NOFOLLOW
@@ -52,24 +57,28 @@ pub(crate) enum SaveOutcome {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RecordFile {
     Peers,
+    Towers,
 }
 
 impl RecordFile {
     fn name(self) -> &'static str {
         match self {
             Self::Peers => PEER_FILE,
+            Self::Towers => TOWER_FILE,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Peers => "peer book",
+            Self::Towers => "tower record",
         }
     }
 
     fn max_bytes(self) -> usize {
         match self {
             Self::Peers => PEER_FILE_MAX_BYTES,
+            Self::Towers => TOWER_FILE_MAX_BYTES,
         }
     }
 }
@@ -100,6 +109,8 @@ pub(super) enum StorageError {
     ReadRecord(RecordFile),
     #[error("invalid peers.json: {0}")]
     InvalidPeers(&'static str),
+    #[error("invalid towers.json: {0}")]
+    InvalidTowers(TowerRecordError),
     #[error("{} exceeds the {} KiB limit", .0.label(), .0.max_bytes() / 1024)]
     RecordTooLarge(RecordFile),
     #[error("could not create a private staging file for {}", .0.name())]
@@ -118,6 +129,8 @@ pub(crate) struct Storage {
     _lock: File,
     #[cfg(test)]
     fail_peer_sync: Cell<bool>,
+    #[cfg(test)]
+    fail_tower_sync: Cell<bool>,
 }
 
 impl Storage {
@@ -161,6 +174,8 @@ impl Storage {
                     _lock: lock,
                     #[cfg(test)]
                     fail_peer_sync: Cell::default(),
+                    #[cfg(test)]
+                    fail_tower_sync: Cell::default(),
                 })
             }
             Err(TryLockError::WouldBlock) => Err(StorageError::AlreadyRunning),
@@ -204,6 +219,35 @@ impl Storage {
     #[cfg(test)]
     pub(super) fn fail_next_peer_sync(&self) {
         self.fail_peer_sync.set(true);
+    }
+
+    pub(super) fn load_towers(&self) -> Result<Option<RememberedTowers>, StorageError> {
+        self.read_record(RecordFile::Towers)?
+            .map(|bytes| RememberedTowers::decode(&bytes))
+            .transpose()
+            .map_err(StorageError::InvalidTowers)
+    }
+
+    /// Any error leaves the previous tower record unchanged.
+    pub(super) fn save_towers(
+        &self,
+        record: &RememberedTowers,
+    ) -> Result<SaveOutcome, StorageError> {
+        let bytes = record
+            .encode()
+            .map_err(|_| StorageError::WriteRecord(RecordFile::Towers))?;
+        self.replace_record(RecordFile::Towers, &bytes, |dir| {
+            #[cfg(test)]
+            if self.fail_tower_sync.replace(false) {
+                return Err(io::ErrorKind::Other.into());
+            }
+            dir.sync_all()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_tower_sync(&self) {
+        self.fail_tower_sync.set(true);
     }
 
     /// Reads a checked private record. An absent entry is distinct from a read error.
