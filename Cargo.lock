@@ -2058,11 +2058,14 @@ version = "0.0.0"
 dependencies = [
  "iroh",
  "iroh-relay",
+ "n0-dns-resolver",
  "n0-future",
+ "numbers",
  "numbers-base",
  "numbers-tower",
  "serde",
  "serde_json",
+ "simple-dns",
  "thiserror 2.0.21",
  "tokio",
  "url",
@@ -2104,6 +2107,8 @@ name = "numbers-tower"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "iroh",
+ "iroh-base",
  "iroh-relay",
  "rustls",
  "thiserror 2.0.21",
