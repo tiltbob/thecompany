@@ -12,6 +12,8 @@
 //! 2. The client sends [`wire::Hello`]; the server always answers [`wire::HelloReply`] with its
 //!    [`API_VERSION`], its station id and its instance id, and closes the connection if the
 //!    versions differ.
+//!    A client bound to one instance ([`BindInstance`]) closes the connection here, without
+//!    sending anything more, when the instance id is not the one it is bound to.
 //! 3. The client sends [`wire::Open`]. For [`wire::Open::Call`] the server answers one
 //!    [`wire::Reply`] and closes. For [`wire::Open::Subscribe`] it answers
 //!    [`wire::Reply::Subscribed`] once the station has registered the subscription, then sends one
@@ -33,8 +35,11 @@
 //! Unix only.
 
 use crate::api::{API_VERSION, ApiError, Event, Request, Response};
-use crate::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription};
+use crate::client::{
+    BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
+};
 use numbers_base::{FrameError, LOCAL_FRAME_MAX, encode_frame, read_frame, write_frame};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -130,11 +135,31 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// too large or does not decode. A request too large for one frame is refused with
 /// [`ApiError::BadRequest`] before the transport connects, so nothing is sent.
 ///
+/// It implements [`BindInstance`]: a transport made by [`BindInstance::bound_to`] compares the
+/// instance id of the hello reply with the one it is bound to, after the uid check and after the
+/// API-version check (a station of another version is still [`ApiError::IncompatibleApi`]), and
+/// before it writes [`wire::Open`]. On a mismatch it closes the connection and fails with
+/// [`ApiError::Disconnected`]; the station never sees the request or the subscribe. Calls and
+/// subscriptions share that handshake, so both are covered.
+///
 /// Needs a tokio runtime with the time driver; [`Transport::subscribe`] spawns a task on it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SocketTransport {
     path: PathBuf,
     call_timeout: Duration,
+    /// The instance this transport is bound to, if any ([`BindInstance`]).
+    instance: Option<String>,
+}
+
+/// Shows whether the transport is bound, never the instance id it is bound to.
+impl fmt::Debug for SocketTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SocketTransport")
+            .field("path", &self.path)
+            .field("call_timeout", &self.call_timeout)
+            .field("bound", &self.instance.is_some())
+            .finish()
+    }
 }
 
 impl SocketTransport {
@@ -143,11 +168,12 @@ impl SocketTransport {
         Self {
             path: path.into(),
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            instance: None,
         }
     }
 
     /// Sets how long a call may take, connecting, the hello and the reply together. It also bounds
-    /// opening a subscription, but never an open subscription.
+    /// opening a subscription, but never an open subscription. Keeps the binding, if any.
     pub fn with_call_timeout(self, timeout: Duration) -> Self {
         Self {
             call_timeout: timeout,
@@ -179,8 +205,8 @@ impl SocketTransport {
             })
     }
 
-    /// Connects, checks who serves the socket, and exchanges the hello. Then sends `open`, a whole
-    /// frame made by [`encode_open`].
+    /// Connects, checks who serves the socket, exchanges the hello and, if this transport is bound,
+    /// checks the instance. Then sends `open`, a whole frame made by [`encode_open`].
     async fn open(&self, open: &[u8]) -> Result<UnixStream, ApiError> {
         let mut stream = UnixStream::connect(&self.path)
             .await
@@ -204,6 +230,15 @@ impl SocketTransport {
                 station: hello.api,
                 client: API_VERSION,
             });
+        }
+        if let Some(bound) = &self.instance
+            && hello.instance_id != *bound
+        {
+            // Dropping the stream closes the connection before `Open`: the server never reads a
+            // request or a subscribe from it.
+            return Err(disconnected(
+                "the station restarted: another instance serves the socket now",
+            ));
         }
         async {
             stream.write_all(open).await?;
@@ -244,6 +279,17 @@ impl SocketTransport {
             Reply::Ok { .. } => Err(ApiError::BadReply {
                 detail: "the station answered a subscription as if it were a call".to_owned(),
             }),
+        }
+    }
+}
+
+impl BindInstance for SocketTransport {
+    /// The same socket and call timeout, bound to `instance_id`: the hello's instance id is checked
+    /// before every call and every subscribe (see [`SocketTransport`]).
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            instance: Some(instance_id.to_owned()),
+            ..self.clone()
         }
     }
 }
