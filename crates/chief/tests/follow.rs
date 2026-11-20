@@ -1221,7 +1221,27 @@ async fn an_evicted_sends_outcome_after_a_tail_0_attach_with_a_peer_filter_is_no
 }
 
 #[tokio::test]
-async fn an_evicted_sends_outcome_after_a_backlog_that_reached_the_end_of_the_log_is_not_shown() {
+async fn an_evicted_sends_outcome_after_a_tail_attach_with_an_empty_backlog_is_not_shown() {
+    let fake = fake_with_peers().with_log_capacity(2);
+    fake.set_outcome(SendOutcome::Hold);
+    let c = Client::new(fake.clone());
+    assert_eq!(c.send("bob", "hi").await.unwrap().seq, 1);
+    receive_n(&fake, "alice", 2); // 2 and 3: the log no longer holds any message of bob
+    // A tail, and no backlog: the floor is where the log ended (4). Nothing was added, so only
+    // the floor keeps the outcome of 1 out.
+    let mut f = c.follow_log(Some("bob"), 10).await.unwrap();
+    assert!(ready(&mut f).is_empty());
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![]);
+    fake.receive("bob", "new").unwrap();
+    assert_eq!(ready(&mut f), added([4]));
+}
+
+/// Guards the behaviour, not one mechanism: after a backlog (2 and 3), both the floor (the oldest
+/// backlog message) and the ascending rule of `LogUpdate::Added` keep the outcome of the evicted 1
+/// out. The two tests above pin the floor.
+#[tokio::test]
+async fn an_evicted_sends_outcome_after_a_nonempty_backlog_is_not_shown() {
     let fake = fake_with_peers().with_log_capacity(2);
     fake.set_outcome(SendOutcome::Hold);
     let c = Client::new(fake.clone());
@@ -1276,21 +1296,24 @@ fn a_gap_of_257(fake: &FakeStation) -> u64 {
     SUBSCRIPTION_CAPACITY as u64 + 1
 }
 
-/// Takes `rounds` rounds of 200 live messages while the re-read of `kind` is held, polling one
-/// `next()` between them, then releases the calls; returns everything yielded.
+/// Takes `total` live messages, in rounds of at most 200, while the re-read of `kind` is held,
+/// polling one `next()` between them, then releases the calls; returns everything yielded.
 async fn overflow_the_hold_back(
     fake: &FakeStation,
     h: &Held,
     f: &mut LogFollower<'_, Held>,
     kind: Kind,
-    rounds: usize,
+    total: usize,
 ) -> Vec<(bool, u64, u32)> {
     let mut yielded = Vec::new();
     {
         let mut next = pin!(tokio::task::unconstrained(f.next()));
         assert!(poll_now(next.as_mut()).is_none());
-        for _ in 0..rounds {
-            receive_n(fake, "bob", 200);
+        let mut left = total;
+        while left > 0 {
+            let round = left.min(200);
+            receive_n(fake, "bob", round);
+            left -= round;
             assert!(poll_now(next.as_mut()).is_none());
         }
         match kind {
@@ -1316,7 +1339,7 @@ async fn held_messages_overflowing_are_all_yielded_with_the_default_log() {
     let (logs, statuses) = (h.logs.received(), h.statuses.received());
     // 21 rounds: 4,200 live messages while the page call is held, 104 more than may be held back.
     let rounds = FOLLOW_MEMORY / 200 + 1;
-    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Log, rounds).await;
+    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Log, 200 * rounds).await;
     let newest = lost + 200 * rounds as u64;
     // The page, read on release, holds the newest 1,000; with the 4,096 held back, every live
     // message once, oldest first. 1..=257 have left the log.
@@ -1340,7 +1363,7 @@ async fn messages_dropped_while_the_hold_back_is_full_are_recovered_by_another_r
     h.statuses.hold_after(1);
     let (logs, statuses) = (h.logs.received(), h.statuses.received());
     let rounds = FOLLOW_MEMORY / 200 + 1;
-    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Status, rounds).await;
+    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Status, 200 * rounds).await;
     let newest = lost + 200 * rounds as u64;
     // The re-read gives 1..=257 and the 4,096 held back; the next re-read, two checks and one page
     // more, the 104 dropped ones.
@@ -1480,13 +1503,16 @@ async fn a_live_message_and_a_stop_as_the_final_check_answers_end_the_follower()
 }
 
 #[tokio::test]
-async fn a_live_message_and_a_stop_as_a_page_answers_end_the_follower() {
+async fn a_live_message_and_a_stop_as_a_page_fails_end_the_follower_without_the_error() {
     let fake = fake_with_peers();
     let a = AfterAnswer::new(&fake);
     let c = Client::new(a.clone());
     let mut f = c.follow_log(None, 0).await.unwrap();
     a_gap_with_a_pending_send(&fake, &c).await;
-    a.after(Kind::Log, 1, false, live_then_stop);
+    // Both are ready when the page call fails: the end, behind the message, wins over the error.
+    // (After a page that answers, the next call's race finds the end first anyway, so only a
+    // failing page shows that the subscription is drained after a page call.)
+    a.after(Kind::Log, 1, true, live_then_stop);
     assert_eq!(within(f.next()).await, Ok(None));
     assert_eq!(f.next().await, Ok(None));
 }
@@ -1576,4 +1602,90 @@ async fn a_failed_second_page_of_a_reread_goes_on_with_its_cursor() {
     expected.insert(3, whole_calls[2].clone());
     assert_eq!(fake.requests()[start..].to_vec(), expected);
     assert_eq!(interrupted, whole);
+}
+
+// Bounds and order the review of #105 found unpinned.
+
+#[tokio::test]
+async fn the_hold_back_holds_exactly_follow_memory_messages() {
+    let fake = fake_with_peers().with_log_capacity(10);
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    // The instance check and the page (248..=257, the 10 the log keeps) pass; the final check is
+    // held.
+    h.statuses.hold_after(1);
+    // 258..=4374: the first FOLLOW_MEMORY (258..=4353) are held back, the 21 after them dropped.
+    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Status, FOLLOW_MEMORY + 21).await;
+    let newest_held = lost + FOLLOW_MEMORY as u64;
+    let newest = newest_held + 21;
+    // The re-read: its page and the held-back ones. The extra re-read: what the log still holds of
+    // the dropped ones (the newest 10); 4354..=4364 have left the log.
+    let mut expected = added(lost - 9..=newest_held);
+    expected.extend(added(newest - 9..=newest));
+    assert_eq!((newest_held, newest), (4353, 4374));
+    assert_eq!(yielded, expected);
+}
+
+#[tokio::test]
+async fn a_reread_reads_back_at_most_follow_memory_messages() {
+    let fake = fake_with_peers().with_log_capacity(FOLLOW_MEMORY + 1000);
+    let c = Client::new(fake.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    // 1..=4500, lost in one gap; the log holds them all.
+    receive_n(&fake, "bob", 4500);
+    // Four pages of 1,000 and one of 96: the newest FOLLOW_MEMORY, 405..=4500.
+    assert_eq!(ready(&mut f), added(4500 - FOLLOW_MEMORY as u64 + 1..=4500));
+    assert_eq!(4500 - FOLLOW_MEMORY + 1, 405);
+}
+
+#[tokio::test]
+async fn the_follower_remembers_exactly_follow_memory_messages() {
+    let fake = fake_with_peers();
+    fake.set_outcome(SendOutcome::Hold);
+    let c = Client::new(fake.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    // FOLLOW_MEMORY + 1 sends, each shown (read in rounds the subscription holds).
+    let total = FOLLOW_MEMORY as u64 + 1;
+    for seq in 1..=total {
+        assert_eq!(c.send("bob", "x").await.unwrap().seq, seq);
+        if seq % 100 == 0 || seq == total {
+            assert_eq!(ready(&mut f), added(seq - (seq - 1) % 100..=seq));
+        }
+    }
+    // 1 was forgotten; 2 is the oldest it remembers.
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![]);
+    fake.resolve(2, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![(false, 2, 1)]);
+}
+
+#[tokio::test]
+async fn held_back_revisions_of_one_message_come_in_rev_order() {
+    let fake = fake_with_peers();
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    h.logs.hold_next();
+    let mut yielded = Vec::new();
+    {
+        let mut next = pin!(tokio::task::unconstrained(f.next()));
+        assert!(poll_now(next.as_mut()).is_none());
+        // While the page call is held: 258 is sent (rev 0) and delivered (rev 1); both events are
+        // held back. The page, read on release, holds 258 at rev 1.
+        fake.set_outcome(SendOutcome::Hold);
+        assert_eq!(c.send("bob", "held").await.unwrap().seq, lost + 1);
+        fake.resolve(lost + 1, MessageStatus::Delivered).unwrap();
+        assert!(poll_now(next.as_mut()).is_none());
+        h.logs.release();
+        let first = within(next.as_mut()).await.unwrap().unwrap();
+        let m = first.message();
+        yielded.push((matches!(first, LogUpdate::Added(_)), m.seq, m.rev));
+    }
+    yielded.extend(ready(&mut f));
+    let mut expected = added(1..=lost + 1);
+    expected.push((false, lost + 1, 1));
+    assert_eq!(yielded, expected);
 }
