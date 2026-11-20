@@ -384,8 +384,9 @@ pub struct Message {
     pub peer: String,
     /// Whether this station sent or received the message.
     pub direction: Direction,
-    /// The text. In an incoming message, every control character is replaced by a space (rule
-    /// 9).
+    /// The text, at most [`BODY_MAX_BYTES`] bytes. In an incoming message, every control
+    /// character is replaced by a space (rule 9), and the text may be empty: only
+    /// [`Request::Send`] has a lower bound.
     pub body: String,
     /// When this station logged the message, by its own clock, in unix milliseconds. For an
     /// incoming message that is when it arrived; the sender's clock is never used.

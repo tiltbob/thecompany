@@ -238,8 +238,10 @@ impl FakeStation {
     /// It follows the limits a station applies to what arrives, and a refused message changes
     /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
     /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
-    /// peer not in the book; [`ApiError::Invalid`] with field `body` for an empty body or one over
-    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). Only a message that
+    /// peer not in the book; [`ApiError::Invalid`] with field `body` for a body over
+    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). An empty body is
+    /// accepted: only [`Request::Send`] has a lower bound (rule 7), and a peer may send an empty
+    /// body. Only a message that
     /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
     /// with [`ApiError::Internal`] in the one case where that new id is already in the receipt
     /// window, which happens only when a test passed an id of the fake's own form to
@@ -263,8 +265,8 @@ impl FakeStation {
     /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
     /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
     /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
-    /// `body` for an empty body or one over [`BODY_MAX_BYTES`] (counted before control characters
-    /// are replaced); and only then the duplicate check of rule 8.
+    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before control characters are replaced;
+    /// an empty body is accepted); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -596,9 +598,8 @@ impl State {
                 &format!("must be 1 to {MESSAGE_ID_MAX_BYTES} ASCII letters, digits, '_' or '-'"),
             ));
         }
-        if body.is_empty() {
-            return Err(invalid("body", "must not be empty"));
-        }
+        // An empty body is accepted: rule 7's lower bound is for `Send`, and the chat protocol
+        // lets a peer send an empty one.
         if body.len() > BODY_MAX_BYTES {
             return Err(invalid(
                 "body",
