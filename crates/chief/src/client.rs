@@ -7,7 +7,9 @@
 //!
 //! [`SocketTransport`] (Unix) is the transport over the station's local socket; it lives in
 //! `crate::socket` with the socket's envelope. The attach order for a live view of the log is
-//! [`Client::follow_log`] in [`crate::follow`].
+//! [`Client::follow_log`] in [`crate::follow`]. A transport that implements [`BindInstance`] can
+//! be bound to one instance of the station ([`Client::bound_to`]), so that an operation of several
+//! calls is answered by that one instance or fails.
 
 #[cfg(unix)]
 pub use crate::socket::{DEFAULT_CALL_TIMEOUT, SocketTransport};
@@ -61,6 +63,32 @@ impl<T: Transport> Transport for Arc<T> {
     fn subscribe(&self) -> impl Future<Output = Result<Subscription, ApiError>> + Send {
         T::subscribe(self)
     }
+}
+
+/// A [`Transport`] that can bind itself to one instance of the station (rule 1 in [`crate::api`]).
+///
+/// A frontend that makes several calls as one operation (pages of the log, a status and then the
+/// peers, a follower and the sends of a chat) binds its transport to the instance it read first,
+/// so that a station restarted in between cannot answer the rest. Instance ids never come back,
+/// so a bound transport talks to one start of the station only, and once that one is gone it talks
+/// to none.
+///
+/// The contract of the transport [`BindInstance::bound_to`] returns:
+///
+/// - Every call and every subscription is made only with the instance `instance_id`.
+/// - When another instance answers, the call or the subscribe fails with
+///   [`ApiError::Disconnected`] before the request reaches that instance: the request is not
+///   sent, and the subscription is not registered. To that instance it is as if nothing had
+///   happened. The error's detail names no instance id.
+/// - Everything else is unchanged: the same station, the same settings (such as a timeout), the
+///   same errors when the bound instance answers. It replaces an earlier binding of `self`.
+///
+/// A call that the bound instance accepted and that ends without an answer is still a call
+/// without an answer (rule 12): the binding decides only who may receive a request.
+pub trait BindInstance: Transport + Sized {
+    /// A transport like `self` that talks only to the instance `instance_id`
+    /// ([`crate::api::Status::instance_id`]); see the [trait docs](BindInstance) for the contract.
+    fn bound_to(&self, instance_id: &str) -> Self;
 }
 
 /// Makes a connected pair: an [`EventSink`] for the transport and a [`Subscription`] for the
@@ -413,5 +441,17 @@ impl<T: Transport> Client<T> {
                 return Ok(current);
             }
         }
+    }
+}
+
+impl<T: BindInstance> Client<T> {
+    /// A client whose every call and subscription is made only with the station instance
+    /// `instance_id`, typically the [`Status::instance_id`] this client read first: when another
+    /// instance answers, they fail with [`ApiError::Disconnected`] before the request reaches it
+    /// ([`BindInstance`]). So a composite operation on the bound client, such as
+    /// [`Client::send_and_wait`] or the pages of a log, is answered by one instance or fails
+    /// (rule 1 in [`crate::api`]).
+    pub fn bound_to(&self, instance_id: &str) -> Client<T> {
+        Client::new(self.transport.bound_to(instance_id))
     }
 }

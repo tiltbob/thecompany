@@ -4,7 +4,8 @@
 //!   local socket as JSON and, later, FFI. Its module docs hold the rules every station and frontend
 //!   follows.
 //! - [`client`]: the seam between a frontend and a station. [`client::Transport`] carries calls and
-//!   subscriptions; [`client::Client`] gives them typed methods.
+//!   subscriptions; [`client::Client`] gives them typed methods; [`client::BindInstance`] binds a
+//!   transport to one instance of the station.
 //! - [`follow`]: [`client::Client::follow_log`], the attach order for a live view of the log.
 //! - [`paths`]: the default data dir and the socket path, as pure functions.
 //! - `socket` (Unix): the local socket's envelope and `SocketTransport`, its client.
