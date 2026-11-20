@@ -387,7 +387,8 @@ depends on `chief` for the API types, never the reverse.
 
 These notes draw on published sources. CI checks the M0 `numbers` dependency set with
 `cargo check -p numbers --locked` and tests the M1 [dev tower](../crates/tower/src/lib.rs) over
-loopback. The remaining iroh examples are source references.
+loopback. The iroh snippets behind these facts were also compiled and run in a loopback lab (see
+[notes/iroh-snippets.md](notes/iroh-snippets.md)); the measured numbers below come from it.
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
   (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and
@@ -395,17 +396,26 @@ loopback. The remaining iroh examples are source references.
   `fast-apple-datapath` (private Apple APIs) and `portmapper` out of the libraries. Install the
   rustls crypto provider only in a binary's `main`.
 - **Endpoint.** `Endpoint::builder(presets::Minimal)` with `.secret_key`, `.relay_mode(RelayMode::
-  Custom(map))`, `.address_lookup(..)`, `.hooks(..)`, `.portmapper_config(PortmapperConfig::Disabled)`;
-  `.clear_ip_transports()` gives a relay-only endpoint; tests add `.bind_addr((LOCALHOST, 0))`.
-- **Relay map.** The bare-URL constructors assume QAD on UDP 7842; against a plain-HTTP tower that
-  stalls every net report about 3 s. Use `iroh::RelayConfig::new(url, None)` for `http://` towers.
-  Switch off only the captive-portal check (`NetReportConfig::default()` with
+  Custom(map))`, `.address_lookup(..)`, `.hooks(..)`,
+  `.portmapper_config(PortmapperConfig::Disabled)`, `.net_report_config(..)` and
+  `.transport_config(..)` (stream caps); `.clear_ip_transports()` gives a relay-only endpoint with
+  no socket. `bind_addr` returns a `Result` and replaces only the default IPv4 socket, keeping
+  `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
+  `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
+  takes 3–5 ms, with or without a reachable tower.
+- **Relay map.** The bare-URL constructors assume QAD on UDP 7842. A net report plans QAD probes
+  only for an endpoint with IP sockets on a host with a routed IPv4 interface; there, against a
+  plain-HTTP tower, `online()` took 3.0 s instead of 0.22 s. Relay-only endpoints and loopback-only
+  namespaces pay nothing, so the cost depends on the host. Use `iroh::RelayConfig::new(url, None)`
+  for `http://` towers (`iroh_relay::RelayQuicConfig` for a QAD port): it behaves the same
+  everywhere. Switch off only the captive-portal check (`NetReportConfig::default()` with
   `captive_portal_check = false`); `NetReportConfig::minimal()` also disables the HTTPS probes, and
-  then no home tower is ever chosen.
+  then no home tower is ever chosen (not online after 30 s).
 - **Dial by id.** An `AddressLookup` returning every tower URL for any id makes
   `endpoint.connect(id, ALPN)` work with no other service. All listed relays are tried in parallel
   and the relay need not be in the dialer's own map — current behaviour, not a documented contract.
-  Each extra tower costs one dead path per connection (budget 8).
+  Each extra tower costs one dead path per connection (budget 8). Measured: `connect()` 17–34 ms;
+  with callee and dialer homed on different towers and a dead URL in the list, 43–51 ms.
 - **Tower.** `iroh_relay::server::{Server, ServerConfig, RelayConfig}` are `#[non_exhaustive]`: start
   from defaults and assign fields. `tls = None` serves plain HTTP; `server.http_addr()` gives the
   bound address (`http_url()` is test-utils only). Defaults are `AllowAll` and no rate limit: set
@@ -414,23 +424,40 @@ loopback. The remaining iroh examples are source references.
   `iroh_relay::server::RelayConfig`. In TLS mode the server also binds a plain-HTTP listener (port
   80, captive-portal responder); ACME is tls-alpn-01 on port 443 only and needs `cache_path`; QAD
   needs TLS; `Server::spawn` cannot add HTTP routes. A relay and a separate iroh endpoint can run in
-  one process; the relay does not advertise that endpoint's id.
+  one process; the relay does not advertise that endpoint's id. iroh-relay does not re-export
+  `RelayUrl`; it comes from `iroh`. `Server::shutdown()` can leave a client that connected just
+  before attached (8 of 180 runs shut down right after the client came online); shutting down at
+  least 1 s after the last connect, or stopping the tower's own runtime, never showed it (observed).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
   right after `open_bi`. `EndpointHooks::after_handshake` runs for every ALPN in both directions (keep
   it ALPN-aware; it must not hold an `Endpoint`) and only after iroh has registered the connection, so
   only the pre-handshake filter limits address disclosure — and for relayed attempts the claimed id
-  comes from the tower.
+  comes from the tower. On our own dials the hook runs as `Side::Client`, so a gate that ignores the
+  ALPN refuses them (`ConnectingError::LocallyRejected`). An error returned from `accept` reaches
+  the dialer as close code 0 with no reason; to send our code, call `conn.close(code, reason)`
+  first.
 - **Liveness.** An endpoint binds with an empty relay map and takes towers later through
-  `insert_relay` / `remove_relay`. A first home tower comes only from a net report, which re-runs
-  every 20–26 s or when the relay map changes, so a station started before its tower can take that
-  long to come online. `Endpoint::online()` has no timeout: wrap it, and report
-  `home_relay_status()`. Keep-alive is 5 s and idle timeout 30 s; a dial to an offline peer fails
-  only by timeout. Two processes on one node key: the relay keeps only the newest. Sockets close only
-  when every `Endpoint` clone is dropped. iOS kills an app that holds a file lock while suspended.
+  `insert_relay` / `remove_relay`; it came online about 220 ms after the insert. A first home tower
+  comes only from a net report, which re-runs every 20–26 s or when the relay map changes. With its
+  tower down at start, an endpoint came online 14–24 s after the tower did; meanwhile
+  `home_relay_status()` was empty with no error, and `network_change()` did not help. Removing and
+  re-inserting the tower brought it online in about 220 ms (observed, not documented). Under heavy
+  load an endpoint occasionally missed its first report and came online only after 21–24 s.
+  `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. A stopped tower
+  showed as not connected within 51 ms; the reconnect backoff (10 ms–16 s) has jitter, and gaps
+  between attempts reached about 31 s. Keep-alive is 5 s and idle timeout 30 s; a dial to an
+  offline peer, or one whose filter ignores us, fails only by that timeout (30.0 s), and a peer
+  killed without closing is noticed after 30.0 s. Two processes on one node key: the relay keeps
+  only the newest, and the older one notices nothing (measured with two endpoints in one process).
+  Sockets close only when every `Endpoint` clone is dropped; a rebind of the same port right after
+  the last drop failed in about 6 of 45 runs and succeeded on a retry within 11 ms. With healthy
+  peers, `router.shutdown()` including the close took 2–11 ms. iOS kills an app that holds a file
+  lock while suspended.
 - **Paths.** `conn.paths()`, `conn.paths_stream().wait_any(..)`, `conn.path_events()`; a path reports
-  `is_relay()`, `is_ip()`, `is_selected()`.
+  `is_relay()`, `is_ip()`, `is_selected()`. On one host a connection starts on the relay and selects
+  the direct path 33–47 ms after `connect()` starts.
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
   equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket path is limited to
   108 bytes on Linux, 104 on Apple. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no

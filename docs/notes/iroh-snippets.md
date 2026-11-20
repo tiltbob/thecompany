@@ -1,9 +1,11 @@
 # iroh snippets for M1 (and M2)
 
-> **Not compiled.** These snippets were read from the published sources of **iroh 1.5.0**,
-> **iroh-relay 1.5.0** and **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked
-> by a second reviewer; where it was corrected, the corrected version is written here. Nothing was
-> built or run, so expect small fixes (imports, argument types). The summary is the appendix of
+> These snippets were read from the published sources of **iroh 1.5.0**, **iroh-relay 1.5.0** and
+> **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked by a second reviewer.
+> Sections 2 to 10 were then compiled and run against iroh 1.5.0 and iroh-relay 1.5.0 in a lab of
+> loopback tests (127.0.0.1, also inside a network namespace with only loopback); the code there is
+> the code that compiled, and the numbers are measured. Section 1's feature claims and section 11
+> are still source reading only. The summary is the appendix of
 > [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
 
 ## 1. Cargo dependencies and features
@@ -35,7 +37,7 @@ assign fields. With `tls = None` everything (`/relay`, `/ping`, `/generate_204`,
 HTTP address. Defaults are `AllowAll` and no rate limit, so set `client_rx` even here.
 ```rust
 use std::{net::Ipv4Addr, num::NonZeroU32};
-use iroh_base::RelayUrl;
+use iroh::RelayUrl; // iroh-relay does not re-export it, and iroh-base is no direct dependency
 use iroh_relay::server::{ClientRateLimit, RelayConfig, Server, ServerConfig};
 let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0)); // tls: None => plain HTTP
 relay.limits.client_rx =                                    // bytes/s per client (plus burst)
@@ -45,19 +47,30 @@ config.relay = Some(relay);
 let server = Server::spawn(config).await?;
 let addr = server.http_addr().expect("relay enabled");      // https_addr() is None in this mode
 let url: RelayUrl = format!("http://{addr}").parse()?;      // Tower::url(); http_url() is test-utils only
-server.shutdown().await?;                                   // graceful; dropping the Server also stops it
+server.shutdown().await?;                                   // Err: SupervisorError; see below
 ```
 
 `iroh::RelayConfig` (client map entry) is a different type; `accept_conn_*` limits are unimplemented.
 
+`shutdown()` does not always disconnect a client that connected just before (likely because the
+WebSocket upgrade runs in a detached task). Shut down right after a client's `online()`, the client
+still reported itself connected 3 s later (once for over 40 s) in 8 of 180 isolated runs and in 3
+of 7 runs of the whole suite. Neither of two ways ever showed it (0 of 180 each): shutting down at
+least 1 s after the last client connected, or running the tower on its own Tokio runtime and
+stopping that with `Runtime::shutdown_background()`. A tower-restart test should also assert that
+the client noticed.
+
 ## 3. Relay map and net-report setting
 `RelayMode::custom(urls)`, `RelayMap::from_iter(urls)`, `RelayMap::from(url)` and
-`RelayConfig::from(url)` all assume QAD on UDP 7842. Against a plain-HTTP tower every net report
-waits out the 3 s QAD probe timeout, so home-tower choice and `online()` take ~3 s, on every report.
-`TowerSet` carries a QAD setting per tower instead:
+`RelayConfig::from(url)` all assume QAD on UDP 7842. A net report plans QAD probes only for an
+endpoint with IP sockets on a host with a routed IPv4 interface; against a plain-HTTP tower it then
+waits out the 3 s probe timeout: `online()` took 3.02 s instead of 0.22 s (measured for the first
+report). A relay-only endpoint, or any endpoint in a network namespace with only loopback, plans no
+QAD and pays nothing, so the cost depends on the host. `RelayConfig::new(url, None)` behaves the
+same everywhere. `TowerSet` carries a QAD setting per tower instead:
 ```rust
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
-// RelayQuicConfig: used this way in iroh's src/test_utils.rs; import path not recorded.
+use iroh_relay::RelayQuicConfig; // not re-exported by iroh: needs the direct iroh-relay dependency
 
 /// One entry per tower: canonical URL and QAD port. None = no QAD (every http:// tower);
 /// a bare https:// URL defaults to 7842 (RelayQuicConfig::default()).
@@ -76,12 +89,16 @@ random ports, or a tower with UDP 7842 blocked, needs the port per tower. Withou
 no public address, so the M1 dev tower gives direct paths only on one host or LAN. Tests must not
 touch the network, so switch off only the captive-portal check:
 ```rust
-// NetReportConfig: iroh-1.5.0 src/net_report.rs; the Builder method that takes it was not recorded.
+use iroh::NetReportConfig; // also iroh::endpoint::NetReportConfig
 let mut net_report = NetReportConfig::default();
 net_report.captive_portal_check = false; // no GET http://<tower-host>/generate_204 on port 80
+// Passed with Builder::net_report_config(net_report) (section 5).
 // NOT NetReportConfig::minimal(): it also sets https_probes = false. With no QAD the HTTPS probe is
 // the only latency source, so no home tower is ever chosen and online() never resolves.
 ```
+
+Measured: with the captive-portal check off, `online()` 221–229 ms; `minimal()` was not online after
+30 s, with `home_relay_status()` empty throughout.
 
 ## 4. TowerLookup
 Answering every `EndpointId` with the tower URLs makes `ep.connect(id, ALPN)` work with no pkarr or
@@ -116,36 +133,55 @@ an offline peer fails by timeout, never `NoAddress`. With several towers all are
 and the callee answers over its home relay (current behaviour, not a contract): every node needs the
 same set, SRV priority/weight are ignored, and each extra tower is one dead path per connection
 (budget 8). Keep two or three; canonicalise URLs once, since `RelayUrl` equality is textual.
+Measured: a dial by bare id connected in 17–34 ms; with the callee on tower A, the dialer homed on
+tower B and the lookup listing a dead URL, B and A, it connected in 43–51 ms.
 
 ## 5. Building the endpoint
 `presets::Minimal` adds no n0 relays or lookup, only the crypto provider. Pass no ALPNs when a
 `Router` is used (section 7). The key reaches the library as bytes, never as a path.
 ```rust
 use std::net::Ipv4Addr;
-use iroh::{Endpoint, RelayMap, RelayMode, endpoint::{PortmapperConfig, presets}};
+use iroh::{Endpoint, RelayMap, RelayMode, SecretKey, endpoint::{PortmapperConfig, presets}};
 let mut builder = Endpoint::builder(presets::Minimal)
-    .secret_key(secret)                             // iroh SecretKey from the 32 key bytes
+    .secret_key(SecretKey::from_bytes(&key_bytes))  // key_bytes: [u8; 32]
     .relay_mode(relay_mode(&towers))                // or RelayMode::Custom(RelayMap::empty())
     .address_lookup(lookup.clone())                 // section 4
     .hooks(Gate { auth: auth.clone() })             // section 6
-    .portmapper_config(PortmapperConfig::Disabled); // no UPnP/PCP/NAT-PMP; exported without the feature
+    .portmapper_config(PortmapperConfig::Disabled)  // no UPnP/PCP/NAT-PMP; exported w/o the feature
+    .net_report_config(net_report)                  // section 3
+    .transport_config(stream_caps);                 // below
 if cfg.loopback_only {
-    // tests: default binds 0.0.0.0 and [::] and advertises LAN addresses; "all on 127.0.0.1" also
-    // needs port mapping and the captive-portal check off (bind_addr's return type not recorded)
-    builder = builder.bind_addr((Ipv4Addr::LOCALHOST, 0));
+    // bind_addr replaces only the default IPv4 socket (0.0.0.0); the default [::] socket stays.
+    // Clearing the IP transports first leaves exactly one socket, on 127.0.0.1.
+    builder = builder.clear_ip_transports().bind_addr((Ipv4Addr::LOCALHOST, 0))?;
 }
 if cfg.relay_only {
-    builder = builder.clear_ip_transports(); // no UDP sockets, no QAD, no direct; online() still works
+    // After bind_addr, so it removes that socket too: no UDP socket, no QAD, no direct path.
+    builder = builder.clear_ip_transports(); // online() still works
 }
-let ep = builder.bind().await?;
+let ep = builder.bind().await?; // Result<Endpoint, BindError>; 3–5 ms, with or without a tower
 ```
+
+- **`bind_addr`** is `fn bind_addr<A>(self, addr: A) -> Result<Self, InvalidSocketAddr> where
+  A: ToSocketAddr, <A as ToSocketAddr>::Err: Into<InvalidSocketAddr>`. Without
+  `clear_ip_transports()` first, `[::]` stays bound (upstream test `test_bind_addr_no_clear`; the
+  lab host had no IPv6, so it showed only `127.0.0.1`). `clear_ip_transports()` after `bind_addr`
+  undoes it: a relay-only endpoint with no socket. The default build binds `0.0.0.0` (and `[::]`).
 
 - **Empty map first.** `bind()` with `RelayMap::empty()` succeeds (logs "skipping net_report, empty
   RelayMap"); the endpoint comes online once `ep.insert_relay(..)` adds a tower (upstream test
   `test_endpoint_online_add_relay`, which contradicts the doc comment saying a relay is required);
   `ep.remove_relay(..)` drops one. This is how `Station::start` returns without the network.
-- Stream caps: noq defaults to 100 bidi + 100 uni; lower with `QuicTransportConfig::builder()
-  .max_concurrent_bidi_streams(..).max_concurrent_uni_streams(..)` (Builder hook not recorded). No 0-RTT.
+  Measured: online 216–222 ms after `insert_relay`, also when it follows `bind()` at once (60 runs).
+- Stream caps: noq defaults to 100 bidi + 100 uni streams and a 30 s idle timeout; iroh sets
+  keep-alive to 5 s. The Builder hook is `transport_config`. No 0-RTT.
+  ```rust
+  use iroh::endpoint::{QuicTransportConfig, VarInt};
+  let stream_caps = QuicTransportConfig::builder()
+      .max_concurrent_bidi_streams(VarInt::from_u32(16)) // example values
+      .max_concurrent_uni_streams(VarInt::from_u32(16))
+      .build(); // Builder::transport_config(stream_caps)
+  ```
 - The default DNS resolver falls back to Cloudflare, Google and Quad9; to avoid that:
   `.dns_resolver(DnsResolver::builder().with_system_defaults().disable_fallback().build())`.
 
@@ -164,7 +200,7 @@ struct Gate { auth: Arc<Authorizer> } // our type; must NOT hold an Endpoint (re
 impl EndpointHooks for Gate {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         // Gate member-only ALPNs; numbers/join/0 (M3) goes to its own invite check. Shape from upstream
-        // examples/auth-hook.rs (`conn.alpn() == ALPN || ..`); alpn()'s return type not recorded.
+        // examples/auth-hook.rs (`conn.alpn() == ALPN || ..`); conn.alpn() returns &[u8].
         if conn.alpn() != LINK_ALPN || self.auth.contains(&conn.remote_id()) {
             AfterHandshakeOutcome::Accept
         } else {
@@ -188,6 +224,16 @@ let router = Router::builder(ep)
 
 - **ALPN-aware (correction):** the hook runs for dialed and accepted connections alike, so an M3
   roster gate on every ALPN would refuse the invitee, and the inviter on the invitee's side.
+  Measured: on our own dial the hook runs with `conn.side() == Side::Client`. A gate that ignores
+  the ALPN refused our dial on `numbers/join/0` to an id not in its list: `connect()` failed after
+  about 20 ms with `ConnectError::Connecting { source: ConnectingError::LocallyRejected }`
+  ("Connection was rejected locally"). The ALPN-aware gate let it through. On `numbers/0` the
+  ALPN-aware gate likewise refuses our own dial to an id we have not added.
+- **Types.** `AfterHandshakeOutcome::Reject { error_code: VarInt, reason: Vec<u8> }`
+  (`403u32.into()` works). `IncomingFilter` is
+  `Arc<dyn Fn(&Incoming) -> IncomingFilterOutcome + Send + Sync + 'static>`. `IncomingFilterOutcome`
+  (`Accept`, `Retry`, `Reject`, `Ignore`) and `IncomingAddr` (`Ip`, `Relay { url, endpoint_id }`,
+  `Custom`) are `#[non_exhaustive]`, so the `_` arm is required.
 - **Hook limits:** TLS accepts any client key, and iroh registers the connection (queues the
   station's LAN, public and port-mapped candidates, honours REACH_OUT probes) before the hook runs.
 - **Filter limits:** a relayed packet's source id is what the tower says, so a hostile tower (or SRV
@@ -195,6 +241,10 @@ let router = Router::builder(ep)
 - `Ignore` looks like a timeout: the CLI says "appears offline, or has not added you". Keep a
   per-protocol check in the link; peer `id`/`sent_at` are untrusted. Test: the hook rejects an
   unknown id, and a relayed attempt from one gets no response at all.
+- Measured: an ignored dialer's `connect()` fails after 30.0 s with "timed out" (the idle timeout);
+  the filter ran once per retransmitted Initial (15 times), and neither the hook nor the handler
+  ran. Let through the filter and rejected by the hook, the dialer's `connect()` succeeds (~20 ms),
+  then the connection closes with code 403 and our reason about 15 ms later; `accept` never runs.
 
 ## 7. Router and ProtocolHandler rules
 The link is one `ProtocolHandler` on `numbers/0`; these lifecycle rules decide how it is written.
@@ -205,20 +255,26 @@ impl ProtocolHandler for Link {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id(); // infallible after the handshake
         while let Ok((send, recv)) = conn.accept_bi().await { /* StreamHeader, check, dispatch */ }
+        // send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream
         Ok(()) // returning drops and closes the connection
     }
 }
-// Refuse: Err(n0_error::e!(AcceptError::NotAllowed)) or AcceptError::from_err(..) (hidden meta field)
+// Refuse (see rule 5): close with our code first, then return the error.
+conn.close(CLOSE_NOT_ALLOWED.into(), b"not allowed");
+return Err(n0_error::e!(AcceptError::NotAllowed)); // or AcceptError::from_err(..) (hidden meta)
 ```
 
 1. `spawn()` (`#[must_use]`) calls `endpoint.set_alpns`, overriding builder ALPNs: our bind takes none.
 2. Dropping the `Router` aborts the accept loop; `router.shutdown().await` (`Result<(), JoinError>`)
-   also closes the endpoint, so peers see a close, not a timeout. Call it on Ctrl-C and shutdown.
+   also closes the endpoint, so peers see a close, not a timeout (code 0, within 2–11 ms with one
+   open connection). Call it on Ctrl-C and shutdown.
 3. When `accept()` returns the connection closes: loop on `accept_bi` until closed.
 4. Streams are lazy: the peer's `accept_bi` returns only after the opener writes, so write the
    header right after `open_bi`.
 5. A refusal in `accept` comes after the handshake: the dialer's `connect()` succeeds, then sees an
-   application close with our code. (The loop's stream types were not checked against noq.)
+   application close. Returning the error alone gives the dialer close code 0 with an empty reason,
+   the same as a normal close; our code reaches the dialer only if the handler calls
+   `conn.close(code, reason)` before it returns the error (the two lines above).
 
 ## 8. Relay versus direct paths
 A connection usually starts on the relay and moves to a direct path, so "relayed" belongs to the
@@ -236,20 +292,44 @@ assert!(on_relay);
 assert!(conn.paths().iter().all(|p| !p.is_ip()));
 ```
 
+Measured: the assertion holds, and still holds 3 s later. With IP sockets on both sides (127.0.0.1)
+the connection starts on the relay and selects the direct path 33–47 ms after `connect()` started;
+the relay path stays open but unselected. With one side relay-only it never goes direct.
+
 ## 9. Liveness facts
 - `online()` resolves once a home tower handshake completes. It has **no timeout** and pends forever
   with no tower, no WAN or a denying tower: always wrap it; tests await the callee's `online()` under
-  a timeout before dialing. Report state from `ep.home_relay_status()` (a watcher).
+  a timeout before dialing. Report state from `ep.home_relay_status()` (a watcher of
+  `Vec<iroh::endpoint::RelayStatus>`; `iroh::Watcher` gives `get()` and `updated()`).
+- Measured: `online()` took 216–236 ms on loopback. Under heavy parallel load an endpoint twice
+  missed its first net report and came online only with the next one, after 21 and 24 s.
 - A first home tower comes only from a net report (every 20–26 s, or when the relay map changes), so
   a station started before its tower can take that long. One home tower at a time, lowest latency
-  with hysteresis; the relay actor reconnects forever (10 ms–16 s backoff) and pings every 15 s.
+  with hysteresis; the relay actor reconnects forever and pings every 15 s.
+- Measured, tower down at start: `home_relay_status()` stays empty, with no error, until a home
+  tower is chosen; once the tower was up, `online()` followed 14–24 s later. `network_change()` did
+  not help (19–23 s). `remove_relay` then `insert_relay` of the same tower brought it online in
+  215–220 ms (observed behaviour, not documented).
+- Measured, tower stopped after the endpoint was online: `connected` turned false within 0–51 ms,
+  with `last_error` "Failed to connect to relay server". The reconnect backoff (10 ms–16 s) has
+  jitter: gaps between attempts reached about 31 s. After a 1 s outage the endpoint was back
+  0.05–2 s after the tower; after a 35 s outage, 10–28 s after it.
 - Keep-alive 5 s, idle timeout 30 s: after an outage over 30 s every connection is dead and
   `conn.closed()` triggers the re-dial; keep-alive defeats the idle timeout, so time out every frame
   read. A dial to an offline peer fails only by timeout (~30 s): wrap it (`connect_timeout`).
+- Measured: a dial to an offline id failed after 30.0 s with "timed out"
+  (`ConnectingError::ConnectionError` with `ConnectionError::TimedOut`); a peer killed without
+  closing (SIGKILL, relay or direct path) was reported closed after 30.0 s; a healthy connection
+  idle for 45 s still worked.
 - Two processes on one key: the relay keeps only the newest connection active (the older one only
-  logs a warning; no API shows it) and re-promotes the older when the newer leaves.
+  logs a warning; no API shows it) and re-promotes the older when the newer leaves. Measured with
+  two endpoints in one process: the newer got the dial while the older still reported itself
+  connected; after the newer left, the older got the next dial (34–38 ms).
 - `Endpoint::close` takes up to ~3 s, and UDP sockets close only when **every** `Endpoint` clone is
-  dropped (router, handlers, caches), which the start → shutdown → start test needs.
+  dropped (router, handlers, caches), which the start → shutdown → start test needs. Measured with
+  healthy peers: `router.shutdown()`, close included, took 2–11 ms. A rebind on the same port while
+  one clone was alive failed ("Failed to bind sockets"); after the last drop, the first rebind still
+  failed in about 6 of 45 runs and succeeded on a retry within 11 ms.
 
 ## 10. The data-dir lock
 `Station::start` takes the lock first and holds it for the node's lifetime. `chief` reaches the
