@@ -7,18 +7,20 @@ mod close_wait_tests;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::pending;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, ConnectionError, Side};
+use iroh::endpoint::{Connection, ConnectionError, FrameStats, RecvStream, SendStream, Side};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
+use crate::endpoint::QUIC_KEEPALIVE;
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
 use crate::proto::{CHAT_PROTOCOL, Hello};
 use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
@@ -35,6 +37,7 @@ const CLOSE_REPLACED: u32 = 409;
 const CLOSE_LINK: u32 = 0;
 const STREAM_LIMIT: usize = 16;
 const MAILBOX_CAPACITY: usize = 32;
+const STREAM_CREDIT_MARGIN: Duration = Duration::from_secs(1);
 
 /// Time budgets for a link and its chat operations.
 #[derive(Debug, Clone, Copy)]
@@ -42,9 +45,9 @@ pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
     ///
     /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
-    /// The early progress check on an established connection needs a positive interval
-    /// shorter than the remaining send budget. Choose a positive value below the send
-    /// deadline to allow time for that check and a retry.
+    /// The progress check after writing a message needs a positive interval shorter
+    /// than the remaining send budget. A wait for stream credit also allows time for
+    /// a transport keepalive, and its progress observation can span several sends.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
@@ -515,6 +518,7 @@ impl Shared {
                 replaced_locally: AtomicBool::new(false),
             }),
             path,
+            stream_credit_wait: None,
         });
         publish_path(&self.paths, peer.id, old_path, path);
         DialResult::Ready
@@ -566,6 +570,41 @@ impl Peer {
         }
     }
 
+    fn stream_credit_wait(
+        &self,
+        connection: &Connection,
+        window: Duration,
+    ) -> Result<Option<Duration>, SendError> {
+        let mut state = self.state();
+        let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.matches(connection) && active.is_open())
+        else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let received = connection.stats().frame_rx;
+        let wait = active.stream_credit_wait.get_or_insert(StreamCreditWait {
+            since: now,
+            received,
+        });
+        // Keep the observation on the connection so a later caller can finish checking
+        // after an earlier send timed out or was cancelled. Authenticated traffic resets it.
+        if wait.received != received {
+            *wait = StreamCreditWait {
+                since: now,
+                received,
+            };
+        }
+        let remaining = window.saturating_sub(now.duration_since(wait.since));
+        if remaining.is_zero() {
+            connection.close(CLOSE_LINK.into(), b"");
+            return Err(SendError::Disconnected);
+        }
+        Ok(Some(remaining))
+    }
+
     fn update_path(&self, paths: &broadcast::Sender<PathUpdate>, connection: &Connection) {
         let mut state = self.state();
         if let Some(active) = state
@@ -608,6 +647,12 @@ impl PeerState {
 struct Active {
     connection: Arc<EstablishedConnection>,
     path: LinkPath,
+    stream_credit_wait: Option<StreamCreditWait>,
+}
+
+struct StreamCreditWait {
+    since: Instant,
+    received: FrameStats,
 }
 
 impl Active {
@@ -638,6 +683,52 @@ async fn wait_for_close(
     }
 }
 
+async fn open_chat_stream(
+    peer: &Peer,
+    connection: &Connection,
+    config: LinkConfig,
+    start: Instant,
+    check_progress: bool,
+) -> Result<(SendStream, RecvStream), SendError> {
+    let open = async {
+        connection
+            .open_bi()
+            .await
+            .map_err(|_| SendError::Disconnected)
+    };
+    if !check_progress {
+        return open.await;
+    }
+    // A blocked noq open queues STREAMS_BLOCKED without waking the driver. A quiet
+    // connection may need the next keepalive and time for the peer's ACK to arrive.
+    let window = config
+        .connect_timeout
+        .max(QUIC_KEEPALIVE + STREAM_CREDIT_MARGIN);
+    let check = async {
+        loop {
+            let remaining = config.send_deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let Some(wait) = peer.stream_credit_wait(connection, window)? else {
+                break;
+            };
+            if wait >= remaining {
+                break;
+            }
+            sleep(wait).await;
+        }
+        pending().await
+    };
+    tokio::select! {
+        biased;
+        // Only check credit progress after a real pending open. Prefer newly
+        // available credit if the open and the check wake up together.
+        result = open => result,
+        result = check => result,
+    }
+}
+
 async fn send_chat(
     peer: &Peer,
     connection: &Connection,
@@ -646,18 +737,16 @@ async fn send_chat(
     start: Instant,
     check_progress: bool,
 ) -> Result<ChatReply, SendError> {
-    let (send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|_| SendError::Disconnected)?;
+    let (send, mut recv) =
+        open_chat_stream(peer, connection, config, start, check_progress).await?;
     // In noq, frame_rx counts decoded frames after packet authentication, including QUIC
     // ACKs and PINGs. Application handling can lag while the connection keeps making progress.
     let received = check_progress.then(|| connection.stats().frame_rx);
     write_chat_request(send, message).await?;
     let remaining = config.send_deadline.saturating_sub(start.elapsed());
     let reply = read_chat_reply(&mut recv, remaining);
-    // Only start a checkpoint after queuing the request. Waiting for stream credit
-    // or the ability to write doesn't give the peer a request to acknowledge.
+    // Start the reply checkpoint after queuing the request so the peer has a request
+    // to acknowledge for the full interval.
     let Some(received) = received
         .filter(|_| !config.connect_timeout.is_zero() && config.connect_timeout < remaining)
     else {
