@@ -980,6 +980,107 @@ async fn a_client_that_half_closes_after_open_is_treated_as_gone() {
     .await;
 }
 
+/// Waits until the server's write to `stream` is stuck on a full socket buffer: the bytes queued
+/// for the client are above zero and stop growing (two equal readings 100 ms apart). Returns how
+/// many are queued.
+async fn wait_until_the_server_write_is_stuck(stream: &UnixStream) -> u64 {
+    tokio::time::timeout(READ_BOUND, async {
+        let mut last = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let queued = rustix::io::ioctl_fionread(stream).unwrap();
+            if queued > 0 && queued == last {
+                return queued;
+            }
+            last = queued;
+        }
+    })
+    .await
+    .expect("the server's write never got stuck")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscriber_that_stops_reading_then_half_closes_is_treated_as_gone() {
+    bounded(async {
+        let rig = rig_with(one_slot()).await;
+        // About 4 MiB of events of 16 KiB each: far more than the socket buffers hold (about
+        // 208 KiB by default on Linux), and fewer than the subscription's queue, so no Resync.
+        const EVENTS: usize = 250;
+        let body = "x".repeat(BODY_MAX_BYTES);
+        // First a half-close, then a full close as the positive control.
+        for full_close in [false, true] {
+            let mut raw = raw_open(rig.path(), &Open::Subscribe).await;
+            assert_eq!(
+                raw_read::<Reply>(&mut raw).await.unwrap(),
+                Reply::Subscribed
+            );
+            receive_n(&rig.fake, EVENTS, &body);
+            // One byte of the first event: forwarding has started.
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(READ_BOUND, raw.read_exact(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            // The client reads no more; the server's write blocks with most events still to go.
+            let queued = wait_until_the_server_write_is_stuck(&raw).await;
+            assert!(
+                usize::try_from(queued).unwrap() < EVENTS * BODY_MAX_BYTES / 2,
+                "the socket buffered {queued} bytes: the write did not block"
+            );
+            let kept = if full_close {
+                drop(raw);
+                None
+            } else {
+                // Only the write half: the read half stays open and unread.
+                raw.shutdown().await.unwrap();
+                Some(raw)
+            };
+            tokio::time::timeout(READ_BOUND, rig.fake.wait_for_subscribers(0))
+                .await
+                .expect("the server kept the subscription of a client that left");
+            // The only slot is free: the next client is served, by the same server.
+            assert_eq!(rig.client.status().await.unwrap(), rig.fake.status());
+            drop(kept);
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_stops_reading_its_reply_then_half_closes_is_treated_as_gone() {
+    bounded(async {
+        // The frame timeout is far beyond this test's bound: only noticing the half-close can
+        // free the slot in time.
+        let rig = rig_with(one_slot()).await;
+        // A page of about 512 KiB: more than the socket buffers hold.
+        receive_n(&rig.fake, 40, &"x".repeat(BODY_MAX_BYTES));
+        let open = Open::Call {
+            request: Request::Log {
+                peer: None,
+                before: None,
+                limit: 100,
+            },
+        };
+        let mut raw = raw_open(rig.path(), &open).await;
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(READ_BOUND, raw.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = wait_until_the_server_write_is_stuck(&raw).await;
+        assert!(
+            usize::try_from(queued).unwrap() < 40 * BODY_MAX_BYTES / 2,
+            "the socket buffered {queued} bytes: the write did not block"
+        );
+        raw.shutdown().await.unwrap();
+        // The only slot is free: the next client is served, by the same server.
+        let client = Client::new(SocketTransport::new(rig.path()).with_call_timeout(READ_BOUND));
+        assert_eq!(client.status().await.unwrap(), rig.fake.status());
+        drop(raw);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_answer_reaches_a_client_that_waits() {
     bounded(async {
