@@ -919,8 +919,13 @@ mod tests {
     /// A value of the configuration that the tower refuses is a configuration error.
     #[test]
     fn a_refused_config_value_exits_with_78() {
+        let bind: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        assert_eq!(status_of(TowerError::NonLoopbackBind(bind)), EXIT_CONFIG);
         assert_eq!(status_of(TowerError::InvalidHostname), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::InvalidReloadInterval), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::AcmeNeedsDnsName), EXIT_CONFIG);
         assert_eq!(status_of(TowerError::InvalidAcmeContact), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::InvalidClientRate(0)), EXIT_CONFIG);
         assert_eq!(status_of(TowerError::InvalidClientBurst), EXIT_CONFIG);
         let entry = TowerError::InvalidAllowlistEntry {
             position: 1,
@@ -933,6 +938,8 @@ mod tests {
     #[test]
     fn a_refused_acme_cache_exits_with_78() {
         assert_eq!(status_of(TowerError::AcmeCacheNotPrivate), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::AcmeCacheNotOwned), EXIT_CONFIG);
+        assert_eq!(status_of(TowerError::AcmeCacheNotADirectory), EXIT_CONFIG);
         assert_eq!(
             status_of(TowerError::AcmeCacheUnusable(
                 io::ErrorKind::PermissionDenied
@@ -975,6 +982,9 @@ mod tests {
     #[test]
     fn a_stopped_relay_or_another_error_exits_with_1() {
         assert_eq!(status_of(TowerError::Stopped), EXIT_FAILURE);
+        assert_eq!(status_of(TowerError::MissingHttpAddress), EXIT_FAILURE);
+        assert_eq!(status_of(TowerError::Start("x".into())), EXIT_FAILURE);
+        assert_eq!(status_of(TowerError::Shutdown("x".into())), EXIT_FAILURE);
         let other: Box<dyn std::error::Error + Send + Sync> = Box::new(io::Error::other("x"));
         assert_eq!(exit_status(&*other), EXIT_FAILURE);
     }
