@@ -289,6 +289,11 @@ impl IpcServer {
     /// - Every directory above the socket's directory is writable only by this user or by root
     ///   (see "What the checks do not cover" in `numbers_base::keyfile`): the directory is
     ///   checked, then used by path to lock and to bind.
+    /// - `transport` is one station instance for as long as the server serves. The hello carries
+    ///   the instance id read in step 2, and a client bound to an instance
+    ///   ([`chief::client::BindInstance`]) decides by it whether to send its request. A station is
+    ///   one instance for its whole life, and a new instance binds a new server; a transport that
+    ///   changed its instance behind a running server would be advertised under its old id.
     ///
     /// Must be called within a tokio runtime with I/O and time enabled; the server runs as tasks
     /// on it.

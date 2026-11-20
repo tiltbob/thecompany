@@ -8,7 +8,9 @@
 
 use chief::API_VERSION;
 use chief::api::*;
-use chief::client::{Client, SUBSCRIPTION_CAPACITY, SocketTransport, Subscription, Transport};
+use chief::client::{
+    BindInstance, Client, SUBSCRIPTION_CAPACITY, SocketTransport, Subscription, Transport,
+};
 use chief::fake::{FakeStation, SendOutcome};
 use chief::follow::LogUpdate;
 use chief::socket::wire::{Hello, HelloReply, Open, Reply};
@@ -1788,6 +1790,136 @@ async fn a_request_too_large_for_a_frame_is_refused_before_connecting() {
         };
         assert!(detail.contains("limit"), "{detail}");
         assert!(!detail.contains("MARKER"), "{detail}");
+    })
+    .await;
+}
+
+// A transport bound to one instance (`chief::client::BindInstance`).
+
+/// A fake of another start of the station on another instance, with a peer `bob` of its own.
+async fn other_instance() -> FakeStation {
+    let fake = FakeStation::new("STATION-A", "INSTANCE-2");
+    Client::new(fake.clone())
+        .peer_add("bob", "STATION-OTHER-B")
+        .await
+        .unwrap();
+    fake
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_transport_never_talks_to_another_instance_on_the_same_path() {
+    bounded(async {
+        let rig = rig().await;
+        let path = rig.path().to_path_buf();
+        let bound = SocketTransport::new(&path).bound_to("INSTANCE-1");
+        // A transport with another timeout keeps its binding.
+        let bound_slow = bound.clone().with_call_timeout(Duration::from_secs(20));
+        let client = Client::new(bound.clone());
+        assert_eq!(client.status().await.unwrap().instance_id, "INSTANCE-1");
+        client.send("bob", "to instance one").await.unwrap();
+        let events = client.subscribe().await.unwrap();
+        rig.fake.wait_for_subscribers(1).await;
+        drop(events);
+
+        rig.server.shutdown().await;
+        let second = other_instance().await;
+        let server = bind_when_free(&second, &path).await;
+        // What the second fake has received so far: its own setup and the server's status call.
+        let recorded = second.requests();
+
+        for transport in [bound.clone(), bound_slow.clone()] {
+            let err = transport
+                .call(Request::Send {
+                    peer: "bob".into(),
+                    body: "must not arrive".into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ApiError::Disconnected { .. }), "{err:?}");
+            assert!(!err.to_string().contains("INSTANCE"), "{err}");
+            let err = transport.subscribe().await.unwrap_err();
+            assert!(matches!(err, ApiError::Disconnected { .. }), "{err:?}");
+        }
+        let err = client.status().await.unwrap_err();
+        assert!(matches!(err, ApiError::Disconnected { .. }), "{err:?}");
+        // Nothing reached the second instance: no request, no subscriber, nothing logged.
+        assert_eq!(second.requests(), recorded);
+        assert_eq!(second.subscriber_count(), 0);
+        assert!(second.messages().is_empty());
+
+        // An unbound transport talks to whoever serves the path.
+        let unbound = Client::new(SocketTransport::new(&path));
+        assert_eq!(unbound.status().await.unwrap().instance_id, "INSTANCE-2");
+        unbound.send("bob", "to instance two").await.unwrap();
+        let _events = unbound.subscribe().await.unwrap();
+        second.wait_for_subscribers(1).await;
+        // And so does one bound to the instance that serves it now.
+        let rebound = Client::new(bound.bound_to("INSTANCE-2"));
+        assert_eq!(rebound.status().await.unwrap().instance_id, "INSTANCE-2");
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_transport_still_reports_a_station_of_another_version() {
+    bounded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("station.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _: Hello = raw_read(&mut stream).await.unwrap();
+            let reply = HelloReply {
+                api: API_VERSION + 1,
+                station_id: "STATION-A".into(),
+                instance_id: "INSTANCE-2".into(),
+            };
+            write_frame(&mut stream, &reply, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+        });
+        // Bound to another instance than the one in the hello: the version is checked first.
+        let c = Client::new(SocketTransport::new(&path).bound_to("INSTANCE-1"));
+        assert_eq!(
+            c.status().await.unwrap_err(),
+            ApiError::IncompatibleApi {
+                station: API_VERSION + 1,
+                client: API_VERSION
+            }
+        );
+        server.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bound_transport_closes_the_connection_before_open() {
+    bounded(async {
+        let (_dir, path, listener) = raw_listener();
+        // The server answers the hello as another instance and then expects the connection to
+        // end without an `Open` frame.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _: Hello = raw_read(&mut stream).await.unwrap();
+            let reply = HelloReply {
+                api: API_VERSION,
+                station_id: "STATION-A".into(),
+                instance_id: "INSTANCE-2".into(),
+            };
+            write_frame(&mut stream, &reply, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+            let open: Result<Open, FrameError> = raw_read(&mut stream).await;
+            assert!(matches!(open, Err(FrameError::Closed)), "{open:?}");
+        });
+        let err = SocketTransport::new(&path)
+            .bound_to("INSTANCE-1")
+            .call(Request::Status)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Disconnected { .. }), "{err:?}");
+        server.await.unwrap();
     })
     .await;
 }
