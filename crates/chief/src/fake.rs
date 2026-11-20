@@ -7,7 +7,8 @@
 //! [`FakeStation::set_now_ms`]. It is the reference that frontend tests trust, so its own tests
 //! check it against the rules.
 //!
-//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of every call,
+//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of a call (for one
+//! call at a time: a call that starts while the hook runs for another is answered without it),
 //! [`FakeStation::fail_calls`] makes every call fail, and [`FakeStation::hold_subscribes`] keeps
 //! `subscribe` from returning until the test lets it.
 //!
@@ -22,7 +23,7 @@ use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
     LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
     PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
-    check_peer_name,
+    check_peer_name, clean,
 };
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
@@ -57,7 +58,8 @@ type CallHook = Box<dyn FnMut(&FakeStation, &Request) + Send>;
 
 /// The hook of [`FakeStation::on_call`], and how often it was set or removed. A hook is taken out
 /// of the slot while it runs, and is put back afterwards only if the slot was not changed
-/// meanwhile: a hook that removes or replaces itself stays removed or replaced.
+/// meanwhile: a hook that removes or replaces itself stays removed or replaced. While it is out, the
+/// slot is empty, so a call that starts meanwhile (on another thread or task) runs no hook.
 #[derive(Default)]
 struct HookSlot {
     hook: Option<CallHook>,
@@ -212,15 +214,15 @@ impl FakeStation {
     /// Sets the state of the one tower and pushes [`Event::Status`].
     ///
     /// The text in the state (the `error` of [`TowerState::Failing`], the `reason` of
-    /// [`TowerState::Denied`]) came from outside, so every control character in it is replaced with
-    /// a space (rule 9) before it is stored and before the event is pushed.
+    /// [`TowerState::Denied`]) came from outside, so every character of rule 9 in it is replaced
+    /// with a space ([`crate::api::clean`]) before it is stored and before the event is pushed.
     pub fn set_tower_state(&self, tower: TowerState) {
         let tower = match tower {
             TowerState::Failing { error } => TowerState::Failing {
-                error: scrub(&error),
+                error: clean(&error).into_owned(),
             },
             TowerState::Denied { reason } => TowerState::Denied {
-                reason: scrub(&reason),
+                reason: clean(&reason).into_owned(),
             },
             other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
         };
@@ -262,14 +264,14 @@ impl FakeStation {
     }
 
     /// Logs a message from `peer` with a new id (rule 8) and pushes its event, as a station does
-    /// with a message that arrived from a peer's station. Every control character in `body` is
-    /// replaced with a space (rule 9).
+    /// with a message that arrived from a peer's station. Every character of rule 9 in `body` is
+    /// replaced with a space ([`crate::api::clean`]).
     ///
     /// It follows the limits a station applies to what arrives, and a refused message changes
     /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
     /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
     /// peer not in the book; [`ApiError::Invalid`] with field `body` for a body over
-    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). An empty body is
+    /// [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are replaced). An empty body is
     /// accepted: only [`Request::Send`] has a lower bound (rule 7), and a peer may send an empty
     /// body. Only a message that
     /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
@@ -295,8 +297,8 @@ impl FakeStation {
     /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
     /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
     /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
-    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before control characters are replaced;
-    /// an empty body is accepted); and only then the duplicate check of rule 8.
+    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are
+    /// replaced; an empty body is accepted); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -308,18 +310,23 @@ impl FakeStation {
 
     /// Gives a held outgoing message its final status (`Delivered` or `Failed`): rev 1 and its
     /// event (rule 7), also when the log has evicted the message meanwhile (the log then stays as
-    /// it is). Fails with [`ApiError::Invalid`] when `status` is not a final outgoing status (field
-    /// `status`), or when the `seq` is in the log but is not an outgoing message still `Sending`
-    /// (field `seq`); and with [`ApiError::MessageNotFound`] for any other `seq` that is not a
-    /// held message.
+    /// it is). The checks run in this order: [`ApiError::Stopping`] after [`FakeStation::stop`]
+    /// (rule 7 promises no outcome after a stop), and nothing changes; [`ApiError::Invalid`] when
+    /// `status` is not a final outgoing status (field `status`), or when the `seq` is in the log
+    /// but is not an outgoing message still `Sending` (field `seq`); and
+    /// [`ApiError::MessageNotFound`] for any other `seq` that is not a held message.
     pub fn resolve(&self, seq: u64, status: MessageStatus) -> Result<Message, ApiError> {
+        let mut state = self.state();
+        if state.stopped {
+            return Err(ApiError::Stopping);
+        }
         if !matches!(
             status,
             MessageStatus::Delivered | MessageStatus::Failed { .. }
         ) {
             return Err(invalid("status", "must be delivered or failed"));
         }
-        self.state().finish(seq, status)
+        state.finish(seq, status)
     }
 
     /// Stops the station: every subscription ends (rule 11), and every later call and subscribe
@@ -340,11 +347,12 @@ impl FakeStation {
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, and calls are answered again after a [`FakeStation::stop`]. A subscribe that
-    /// is waiting at [`FakeStation::hold_subscribes`] wakes up and fails with
-    /// [`ApiError::Stopping`]: it belonged to the old instance and never attaches to the new one.
-    /// The peer book, the send outcome and the other test settings, the hold of subscribes
-    /// included, stay, as a station's peer book survives a restart.
+    /// link is down, the tower is back in [`TowerState::Connecting`] as in a new fake (no event is
+    /// pushed: the subscriptions have ended), and calls are answered again after a
+    /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
+    /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
+    /// to the new one. The peer book, the send outcome and the other test settings, the hold of
+    /// subscribes included, stay, as a station's peer book survives a restart.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();
@@ -356,6 +364,9 @@ impl FakeStation {
             state.next_seq = 1;
             state.stopped = false;
             state.generation += 1;
+            for tower in &mut state.status.towers {
+                tower.state = TowerState::Connecting;
+            }
             for stations in state.peers.values_mut() {
                 for station in stations {
                     station.link = Link::Down;
@@ -446,9 +457,13 @@ impl FakeStation {
         self.state().status.clone()
     }
 
-    /// Runs `hook` at the start of every later call, before the fake looks at the request, with
-    /// the fake unlocked: the hook may change the station (receive a message, for example), so a
-    /// test can make things happen exactly between a client's calls. Replaces an earlier hook.
+    /// Runs `hook` at the start of later calls, before the fake looks at the request, with the
+    /// fake unlocked: the hook may change the station (receive a message, for example), so a test
+    /// can make things happen exactly between a client's calls. Replaces an earlier hook.
+    ///
+    /// The hook runs for one call at a time: a call that starts while the hook is running for
+    /// another call (on another thread or task) is answered without running the hook. A test that
+    /// needs the hook before a particular call makes its calls one at a time.
     ///
     /// A call through a handle bound to an instance that is already gone (see "A bound handle" on
     /// [`FakeStation`]) is refused before the hook, which then does not run for it. `subscribe`
@@ -698,7 +713,7 @@ impl State {
             peer,
             id,
             Direction::Incoming,
-            scrub(body),
+            clean(body).into_owned(),
             MessageStatus::Received,
         )))
     }
@@ -909,13 +924,6 @@ fn is_message_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Rule 9: every control character replaced with a space.
-fn scrub(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 /// Wakes its own task once and returns `Pending`, then is ready: one turn back to the runtime.

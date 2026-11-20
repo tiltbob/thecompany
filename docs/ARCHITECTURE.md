@@ -237,10 +237,10 @@ The station is the node; frontends hold no network state.
 - **The admin key stays in the frontend.** The frontend builds the statement itself from the user's
   command and shows what will be signed; it never signs bytes or a description the station supplied.
   The key file never crosses the socket.
-- **A station takes input from peers, never orders.** It strips control characters from every
-  peer-supplied string before a frontend sees it, never opens a URL or file on a peer's say-so,
-  accepts files only as answers to its own pulls or as quarantined offers, and offers no reverse
-  forwards.
+- **A station takes input from peers, never orders.** It replaces control characters, line
+  separators and bidi controls (API rule 9) in every peer-supplied string before a frontend sees
+  it, never opens a URL or file on a peer's say-so, accepts files only as answers to its own pulls
+  or as quarantined offers, and offers no reverse forwards.
 - **iOS.** There are no daemons, so the app embeds the station core and is a foreground-only station
   that stops before the app is suspended. Messages for a phone wait in airspace.
 
