@@ -573,6 +573,110 @@ async fn each_method_sends_its_request_and_returns_its_answer() {
 }
 
 #[tokio::test]
+async fn tower_client_methods_send_one_typed_call_and_pass_through_errors() {
+    const URL: &str = "https://tower.synthetic.invalid/";
+    const TYPED: &str = "https://Tower.SYNTHETIC.INVALID.:443";
+    let page = TowerCandidatesPage {
+        groups: vec![TowerCandidateGroup {
+            peer: "bob".into(),
+            candidates: vec![TowerCandidate { url: URL.into() }],
+        }],
+        next_after_peer: None,
+    };
+    let tower = TowerStatus {
+        url: URL.into(),
+        state: TowerState::Standby,
+        source: Some(TowerSource::Peer),
+    };
+    let candidates = Request::TowerCandidates {
+        after_peer: Some("alice".into()),
+        limit: 1,
+    };
+    let add = Request::TowerAdd { url: TYPED.into() };
+    let remove = Request::TowerRemove { url: TYPED.into() };
+    let (client, fake) = client(vec![
+        step(
+            candidates.clone(),
+            vec![],
+            Ok(Response::TowerCandidates { page: page.clone() }),
+        ),
+        step(
+            add.clone(),
+            vec![],
+            Ok(Response::TowerAdd {
+                tower: tower.clone(),
+                outcome: TowerAddOutcome::AlreadyInSet,
+            }),
+        ),
+        step(
+            remove.clone(),
+            vec![],
+            Ok(Response::TowerRemove {
+                url: URL.into(),
+                outcome: TowerRemoveOutcome::NotInSet,
+            }),
+        ),
+        step(add.clone(), vec![], Err(ApiError::TowerSetFull { max: 8 })),
+        step(remove.clone(), vec![], Err(ApiError::TowersPinned)),
+        step(
+            candidates,
+            vec![],
+            Ok(Response::TowerRemove {
+                url: "https://marker.synthetic.invalid/".into(),
+                outcome: TowerRemoveOutcome::Removed,
+            }),
+        ),
+        step(add, vec![], Ok(Response::Done)),
+        step(remove, vec![], Ok(Response::Done)),
+    ]);
+    assert_eq!(client.tower_candidates(Some("alice"), 1).await, Ok(page));
+    assert_eq!(
+        client.tower_add(TYPED).await,
+        Ok(TowerAddResult {
+            tower,
+            outcome: TowerAddOutcome::AlreadyInSet,
+        })
+    );
+    assert_eq!(
+        client.tower_remove(TYPED).await,
+        Ok(TowerRemoveResult {
+            url: URL.into(),
+            outcome: TowerRemoveOutcome::NotInSet,
+        })
+    );
+    assert_eq!(
+        client.tower_add(TYPED).await,
+        Err(ApiError::TowerSetFull { max: 8 })
+    );
+    assert_eq!(
+        client.tower_remove(TYPED).await,
+        Err(ApiError::TowersPinned)
+    );
+    for (result, detail) in [
+        (
+            client.tower_candidates(Some("alice"), 1).await.map(drop),
+            "expected a tower_candidates response, got a tower_remove response",
+        ),
+        (
+            client.tower_add(TYPED).await.map(drop),
+            "expected a tower_add response, got a done response",
+        ),
+        (
+            client.tower_remove(TYPED).await.map(drop),
+            "expected a tower_remove response, got a done response",
+        ),
+    ] {
+        assert_eq!(
+            result,
+            Err(ApiError::BadReply {
+                detail: detail.into()
+            })
+        );
+    }
+    fake.assert_script_done();
+}
+
+#[tokio::test]
 async fn a_wrong_response_variant_is_a_bad_reply() {
     let wrong = |request: Request| step(request, vec![], Ok(Response::Done));
     let (client, fake) = client(vec![
