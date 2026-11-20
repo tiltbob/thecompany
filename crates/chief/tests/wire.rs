@@ -42,6 +42,7 @@ fn tower(port: u16, state: TowerState) -> TowerStatus {
     TowerStatus {
         url: format!("http://127.0.0.1:{port}/"),
         state,
+        source: None,
     }
 }
 
@@ -50,6 +51,7 @@ fn status(towers: Vec<TowerStatus>) -> Status {
         station_id: "STATION-A".into(),
         instance_id: "INSTANCE-1".into(),
         towers,
+        bootstrap_domain: None,
     }
 }
 
@@ -288,6 +290,7 @@ fn tower_states() -> Vec<TowerState> {
         TowerState::Denied {
             reason: "not on the allowlist".into(),
         },
+        TowerState::Standby,
     ]
 }
 
@@ -374,13 +377,14 @@ fn error_variant(value: &ApiError) -> usize {
     }
 }
 
-const TOWER_STATE_VARIANTS: usize = 4;
+const TOWER_STATE_VARIANTS: usize = 5;
 fn tower_state_variant(value: &TowerState) -> usize {
     match value {
         TowerState::Connecting => 0,
         TowerState::Connected => 1,
         TowerState::Failing { .. } => 2,
         TowerState::Denied { .. } => 3,
+        TowerState::Standby => 4,
     }
 }
 
@@ -551,6 +555,35 @@ fn label_enums_are_bare_strings() {
         texts,
         [r#""no_answer""#, r#""refused""#, r#""peer_removed""#]
     );
+    assert_golden(&[
+        (TowerSource::Configured, r#""configured""#),
+        (TowerSource::Remembered, r#""remembered""#),
+        (TowerSource::Srv, r#""srv""#),
+        (TowerSource::Peer, r#""peer""#),
+    ]);
+}
+
+#[test]
+fn status_has_observed_and_standby_towers_with_optional_metadata() {
+    let mut observed = tower(3340, TowerState::Connected);
+    observed.source = Some(TowerSource::Configured);
+    let unobserved = TowerStatus {
+        url: "https://relay.team.example.invalid/".into(),
+        state: TowerState::Standby,
+        source: Some(TowerSource::Srv),
+    };
+    let mut snapshot = status(vec![observed, unobserved]);
+    snapshot.bootstrap_domain = Some("team.example.invalid".into());
+    let response = Response::Status { status: snapshot };
+    assert_golden(&[(
+        response,
+        concat!(
+            r#"{"type":"status","status":{"station_id":"STATION-A","instance_id":"INSTANCE-1","towers":["#,
+            r#"{"url":"http://127.0.0.1:3340/","state":{"type":"connected"},"source":"configured"},"#,
+            r#"{"url":"https://relay.team.example.invalid/","state":{"type":"standby"},"source":"srv"}],"#,
+            r#""bootstrap_domain":"team.example.invalid"}}"#,
+        ),
+    )]);
 }
 
 // 3. What decoding accepts and refuses.
@@ -654,6 +687,7 @@ fn an_unknown_type_does_not_decode() {
     assert!(serde_json::from_value::<Link>(json!("connecting")).is_err());
     assert!(serde_json::from_value::<Direction>(json!("sideways")).is_err());
     assert!(serde_json::from_value::<FailReason>(json!("quota")).is_err());
+    assert!(serde_json::from_value::<TowerSource>(json!("unknown")).is_err());
 
     // The decoder's message names the unknown variant: the socket server passes it on in
     // `ApiError::BadRequest`.
@@ -701,6 +735,29 @@ fn a_page_without_a_cursor_reads_as_none_and_none_is_not_written() {
     assert_eq!(written, json!({"type": "log", "page": {"messages": []}}));
 }
 
+#[test]
+fn legacy_status_and_null_metadata_read_as_none() {
+    let legacy = json!({
+        "station_id": "STATION-A",
+        "instance_id": "INSTANCE-1",
+        "towers": [{"url": "http://127.0.0.1:3340/", "state": {"type": "connected"}}]
+    });
+    let expected = status(vec![tower(3340, TowerState::Connected)]);
+    assert_eq!(
+        serde_json::from_value::<Status>(legacy.clone()).unwrap(),
+        expected
+    );
+
+    let mut with_null = legacy.clone();
+    with_null["bootstrap_domain"] = Value::Null;
+    with_null["towers"][0]["source"] = Value::Null;
+    assert_eq!(
+        serde_json::from_value::<Status>(with_null).unwrap(),
+        expected
+    );
+    assert_eq!(serde_json::to_value(&expected).unwrap(), legacy);
+}
+
 // Display texts, which frontends show as they are.
 
 #[test]
@@ -742,8 +799,8 @@ fn fail_reasons_follow_the_peer_name() {
 }
 
 #[test]
-fn api_version_is_one_and_exported_at_the_root() {
-    assert_eq!(chief::API_VERSION, 1);
+fn api_version_is_two_and_exported_at_the_root() {
+    assert_eq!(chief::API_VERSION, 2);
     assert_eq!(chief::API_VERSION, chief::api::API_VERSION);
 }
 

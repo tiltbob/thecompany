@@ -162,7 +162,9 @@ impl FakeStation {
                 towers: vec![TowerStatus {
                     url: FAKE_TOWER_URL.to_owned(),
                     state: TowerState::Connecting,
+                    source: None,
                 }],
+                bootstrap_domain: None,
             },
             peers: BTreeMap::new(),
             log: VecDeque::new(),
@@ -220,7 +222,7 @@ impl FakeStation {
             TowerState::Denied { reason } => TowerState::Denied {
                 reason: scrub(&reason),
             },
-            other @ (TowerState::Connecting | TowerState::Connected) => other,
+            other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
         };
         let mut state = self.state();
         for t in &mut state.status.towers {

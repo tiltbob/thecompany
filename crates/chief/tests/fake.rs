@@ -77,11 +77,13 @@ async fn status_has_the_ids_and_one_tower() {
     let status = client(&fake).status().await.unwrap();
     assert_eq!(status.station_id, ME);
     assert_eq!(status.instance_id, "INSTANCE-1");
+    assert_eq!(status.bootstrap_domain, None);
     assert_eq!(
         status.towers,
         vec![TowerStatus {
             url: FAKE_TOWER_URL.into(),
-            state: TowerState::Connecting
+            state: TowerState::Connecting,
+            source: None,
         }]
     );
 }

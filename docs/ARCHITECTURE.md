@@ -169,6 +169,9 @@ again. So a station watches its home tower (below).
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
   only when the set changes or at a long interval. The station limits its own attempts; it does not
   control iroh's own retries (decided in #74, built in #78).
+  Station API version 2 represents an unobserved tower as `Standby`, including when there is no
+  home tower observation. An explicit refusal remains `Denied`. Status can also carry the source
+  of each tower and the SRV bootstrap domain.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
