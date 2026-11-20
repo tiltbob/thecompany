@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# The whole CLI is a library, so that tests run every command in-process: no test may start the
+# binary (hard rule 1 forbids naming a process-spawning type anywhere outside `safehouse`).
+[lib]
+name = "chief_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "chief"
 path = "src/main.rs"
@@ -12,7 +18,20 @@ doc = false
 
 [dependencies]
 chief.workspace = true
-numbers-base.workspace = true
+clap.workspace = true
+# `rt` and `io-std` for the binary's runtime and stdin, `io-util` for reading lines, `macros` for
+# `select!` in `chat`, `time` for the bound on the outcome of `send`; never `process`.
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "time"] }
+
+[dev-dependencies]
+chief = { workspace = true, features = ["fake"] }
+# Only for tests/socket.rs: the real socket server (`numbers_station::ipc::IpcServer`) serving a
+# fake station, so a few tests go through the socket exactly as the binary does. A dev-dependency
+# never ships; `[dependencies]` stays free of `numbers` and iroh (hard rule 5).
+numbers-station.workspace = true
+tempfile.workspace = true
+# `test-util` for the paused clock of the test of the bound on `send`.
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "test-util", "time"] }
 
 [lints]
 workspace = true

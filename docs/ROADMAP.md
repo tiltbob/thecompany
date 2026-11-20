@@ -100,7 +100,7 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; replaces the characters of API rule 9 in peer text; usable in-process as a `Transport` |
 | `crates/station/src/ipc.rs` | the socket server (rules below), generic over any `Transport`. The hello carries the client's API version. The reply gives the station's API version, station id and per-start instance id. The server closes the connection if the versions differ. Each call or subscription uses one connection. Both ends check the uid and cap frames at 1 MiB. Calls have frame deadlines. An open subscription has no deadline. The server holds `<socket>.lock` while serving. |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
-| `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
+| `crates/chief-cli/src/lib.rs`, `main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log`; the whole CLI is a library generic over `Transport` (tested in-process), `main.rs` only wires it to the socket; exit 0 done, 1 refused or failed, 2 usage, 3 no station |
 
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when
@@ -109,7 +109,8 @@ station takes the data-dir lock first; the socket server then locks `<socket>.lo
 another station is serving (two data dirs can name the same socket path) is never taken away, and
 only then removes a leftover socket, binds and sets 0600.
 The directory is created 0700, and an existing one must be owned by the same user with no group or
-other access. A path too long for a socket address is refused with a message naming `--data-dir`.
+other access. A path too long for a socket address is refused with a message naming `--data-dir`
+(by `chief`, naming `--station`).
 The peer uid comes from `tokio::net::UnixStream::peer_cred()`.
 
 **CLI surface**
@@ -121,7 +122,9 @@ station run --tower http://127.0.0.1:3340     # the chief's node; keeps running
 chief id                                      # this station's id, to hand to the other chief
 chief peer add bob <station-id> | peer ls | peer rm bob
 chief chat bob                                # last 50 lines, then live; shows other peers too
-chief send bob "on my way"                    # waits for the outcome: exit 0 delivered, 1 failed
+chief send bob "on my way"                    # waits up to 120 s for the outcome once the station
+                                              # accepted it: exit 0 delivered, 1 refused or failed,
+                                              # 3 outcome unknown
 chief log [bob]                               # print the message log and exit
 chief status                                  # tower state, peers, relayed or direct
 ```
