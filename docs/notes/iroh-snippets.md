@@ -2,15 +2,15 @@
 
 > These snippets were read from the published sources of **iroh 1.5.0**, **iroh-relay 1.5.0** and
 > **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked by a second reviewer.
-> The code fences of sections 2 to 10 compile against iroh 1.5.0 and iroh-relay 1.5.0: a generator
+> The code fences of sections 2 to 11 compile against iroh 1.5.0 and iroh-relay 1.5.0: a generator
 > copies every line of them into a lab crate that builds with `--features verbatim`. It changes
 > nothing but indentation: it moves `use` lines to module level and wraps the rest in functions and
 > scaffolding that supply what a fence leaves out (free variables, our own types, and in section 7
 > the imports). The measured numbers come from that lab's loopback tests (127.0.0.1, also inside a
 > network namespace with only loopback), which exercise equivalent code, not these exact fences.
-> Section 1's feature claims and section 11 are still source reading only. The summary is the
-> appendix of
-> [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
+> Section 11 (M2) was measured the same way and its fences are generated into the same build; it
+> marks what was not tested. Section 1's feature claims are still source reading only. The summary
+> is the appendix of [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
 
 ## 1. Cargo dependencies and features
 Libraries take iroh without default features (`portmapper`, `metrics`, and `fast-apple-datapath`,
@@ -372,105 +372,286 @@ pub fn lock_data_dir(dir: &Path) -> io::Result<InstanceLock> {
 }
 ```
 
-## 11. Later (M2): TLS tower, allowlist, SRV
-**Not M1.** With `relay.tls` set, `Server::spawn` also binds plain HTTP serving only `/generate_204`
-(clients probe port 80 whatever the URL says). ACME is tls-alpn-01 only, validated on TCP 443, and
-needs `cache_path` or every restart orders a certificate. QAD inherits the relay TLS config (none:
-`TlsNotConfigured`). Open 443/tcp, 80/tcp, 7842/udp. Install ring as default in the tower's `main`.
+## 11. M2: TLS tower, allowlist, rate limit, SRV, several towers
+**Not M1.** Everything here was compiled and measured in the lab (`tests/m2.rs`, T20–T27, on
+127.0.0.1, also inside a namespace with only loopback). Not tested: a relayed connection while QAD
+runs (on one host, endpoints with sockets always go direct), a real network split between two
+towers, the captive-portal probe, an SRV target of `"."`, ACME, and the system DNS configuration.
+
+**TLS tower from certificate files.** The provider is passed explicitly; nothing installs a
+process-wide default. Measured: `CryptoProvider::get_default()` was still `None` after every TLS
+test, and nothing panicked.
 ```rust
 use std::sync::Arc;
-use iroh_relay::server::{AcmeConfig, CertConfig, DEFAULT_CERT_RELOAD_INTERVAL, QuicConfig,
-    RelayConfig, Server, ServerConfig, TlsConfig, reloading_resolver};
+use iroh_relay::server::{CertConfig, DEFAULT_CERT_RELOAD_INTERVAL, QuicConfig, RelayConfig};
+use iroh_relay::server::{Server, ServerConfig, TlsConfig, reloading_resolver};
 
 let provider = Arc::new(rustls::crypto::ring::default_provider());
-let tls_builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
     .with_safe_default_protocol_versions()?
-    .with_no_client_auth();
-let cert = match source {
-    CertSource::Files { cert, key } => CertConfig::Manual {   // renewals picked up without restart
-        server_config: tls_builder.with_cert_resolver(
-            reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL).await?,
-        ),
-    },
-    CertSource::Acme { hostname, contact, cache_dir, production } => CertConfig::LetsEncrypt {
-        acme_config: AcmeConfig::letsencrypt(production)
-            .domains(vec![hostname]).contact(vec![contact]).cache_path(cache_dir),
-        server_config_builder: tls_builder,
-    },
-};
-let mut relay = RelayConfig::new(http_bind);        // 0.0.0.0:80
-relay.tls = Some(TlsConfig::new(https_bind, cert)); // 0.0.0.0:443: /relay, /ping, ACME
+    .with_no_client_auth()
+    .with_cert_resolver(                 // PEM files, re-read every 24 h: renewals need no restart
+        reloading_resolver(&provider, cert_path, key_path, DEFAULT_CERT_RELOAD_INTERVAL).await?,
+    );
+let mut relay = RelayConfig::new(http_bind);  // with TLS still bound: serves /generate_204 only
+// the HTTPS listener: /relay, /ping
+relay.tls = Some(TlsConfig::new(https_bind, CertConfig::Manual { server_config }));
+relay.access = Arc::new(Members::default());  // the allowlist, below
+relay.limits.client_rx = Some(limit);         // the rate limit, below
 let mut config = ServerConfig::default();
 config.relay = Some(relay);
-config.quic = Some(QuicConfig::new(qad_bind));      // 0.0.0.0:7842 UDP
+config.quic = Some(QuicConfig::new(qad_bind)); // QAD (UDP); inherits the relay's TLS config
 let server = Server::spawn(config).await?;
 ```
 
-Build the tower URL from the hostname, not the socket address. Stations trust WebPKI roots; a private
-CA needs `CaTlsConfig::with_extra_roots`, and the CI test trusts its self-signed certificate with
-`CaTlsConfig::custom_roots`. `Server::spawn` cannot add HTTP routes.
+- **Listeners.** HTTPS on `TlsConfig::https_bind_addr`. In TLS mode a plain-HTTP listener is always
+  bound on `RelayConfig::http_bind_addr` (the required argument of `RelayConfig::new`; the library
+  has no default, the iroh-relay binary uses `[::]:80`); it cannot be turned off. Measured: it
+  answers `/generate_204` with 204 and `/ping`, `/relay`, `/healthz`, `/` with 404. Firewall:
+  the HTTPS port, the HTTP port and the QAD port (UDP).
+- **Check the certificate file yourself.** `reloading_resolver` fails at once on a missing,
+  unreadable or non-PEM key file ("cert loading: reading key: ..."). A certificate file that holds
+  no PEM certificate passes: the PEM reader skips what it does not know, the chain is empty and
+  `Server::spawn` succeeds (found while building the tower, #70; not a lab experiment).
+- ACME (`CertConfig::LetsEncrypt`) is tls-alpn-01 on the HTTPS port and needs `cache_path`, or
+  every restart orders a certificate (source reading, not tested). `Server::spawn` cannot add
+  HTTP routes. Build the tower URL from the host name, not the socket address.
+- Measured: `Server::spawn` with TLS 1–2 ms; an endpoint that trusts the certificate came online
+  over `https://127.0.0.1:<port>/` in 223–325 ms.
 
-**Allowlist.** `on_connect` runs once per relay connection after the client proved its key and sees
-the id, headers, URI and query, not the IP. `on_disconnect` allows advisory duplicate-id bookkeeping;
-`Server::relay_service()` offers `set_client_rate_limit` and `clients().disconnect(id, ..)`. No shared
-bearer token: a hijacked SRV record would collect it. A denied station sees
-`RelayStatus::auth_denied_reason()`, and its `online()` never resolves.
+**Client side.** Stations trust the embedded WebPKI roots (`CaTlsConfig::default()`); a private CA
+needs `CaTlsConfig::with_extra_roots` (not tested). Tests trust only their certificate:
 ```rust
-use std::{collections::HashSet, num::NonZeroU32, sync::{Arc, RwLock}};
-use iroh_base::EndpointId;
-use iroh_relay::server::{Access, AccessControl, ClientRateLimit, ClientRequest, RelayConfig};
+use iroh::tls::CaTlsConfig;
+// tower_cert: rustls::pki_types::CertificateDer<'static> (from rcgen in the tests)
+let builder = builder.ca_tls_config(CaTlsConfig::custom_roots([tower_cert]));
+```
+
+- `CaTlsConfig::custom_roots([])` makes `bind()` fail: "Invalid CA root configuration <- no root
+  trust anchors were provided".
+- **A certificate the endpoint does not trust is silent.** The HTTPS latency probe fails TLS too,
+  so no home tower is ever chosen. Measured with default roots against the self-signed tower:
+  `home_relay_status()` stayed `[]` with no `last_error`, `online()` did not resolve in 12 s, and
+  the tower saw 0 relay connections and 3 HTTPS connections (the probes).
+
+**QAD.** It needs TLS: a `QuicConfig` without `relay.tls` fails `Server::spawn` with "Failed to bind
+QAD listener <- TLS not configured". The relay map carries the QAD port per tower (section 3).
+Without an unstable feature, the tower's counters show that QAD ran (`Counter::get` is inherent):
+```rust
+use iroh_relay::RelayQuicConfig;
+let entry = iroh::RelayConfig::new(tower_url, Some(RelayQuicConfig::new(qad_port)));
+let ran = server.metrics().server.qad_connections.get(); // also qad_incoming, qad_incoming_error
+```
+
+- Measured, bind → online: QAD on 223–317 ms (the tower counted one QAD connection per endpoint);
+  QAD configured but the UDP port closed **3020–3030 ms** (the 3 s probe timeout, every first
+  report); QAD off 224–271 ms. A relay-only endpoint, or one in a namespace with only loopback,
+  ran no QAD and paid nothing.
+- On loopback `ep.addr()` does not change (the observed address is the bound socket). With iroh's
+  `unstable-net-report` (lab only) `ep.net_report()` showed `udp_v4 = true`, `global_v4` = the own
+  socket and a `QadIpv4` probe next to `Https`.
+
+**Allowlist.** `on_connect` runs once per relay connection, after the client proved its key; it sees
+the id, headers, URI and query, not the IP. No shared bearer token: a hijacked SRV record would
+collect it.
+```rust
+use std::{collections::HashSet, sync::RwLock};
+use iroh::EndpointId; // not iroh_base: no direct dependency
+use iroh_relay::server::{Access, AccessControl, ClientRequest};
 
 #[derive(Debug, Default)]
-struct Members(RwLock<HashSet<EndpointId>>);
+pub struct Members(pub RwLock<HashSet<EndpointId>>);
 
 impl AccessControl for Members {
     async fn on_connect(&self, req: &ClientRequest) -> Access {
-        let allowed = self.0.read().expect("lock").contains(&req.endpoint_id());
-        if allowed { Access::Allow } else { Access::Deny { reason: None } }
+        if self.0.read().is_ok_and(|ids| ids.contains(&req.endpoint_id())) {
+            Access::Allow
+        } else {
+            // reason None reaches the client as "not authorized"
+            Access::Deny { reason: Some("not a member of this network".into()) }
+        }
     }
+    // fn on_disconnect(&self, EndpointId, ConnectionId): defaulted, once per admitted connection
 }
-
-let mut relay = RelayConfig::new(bind_addr);
-relay.access = Arc::new(Members::default());
-relay.limits.client_rx =
-    Some(ClientRateLimit::new(NonZeroU32::new(2 * 1024 * 1024).expect("non-zero")));
 ```
 
-**SRV.** `iroh::dns::DnsResolver` offers only A/AAAA/TXT and iroh-dns re-exports nothing from
-n0-dns-resolver, hence the direct dependency. `SrvRecordData { priority, weight, port, target }`.
-```rust
-use iroh::RelayUrl;
-use n0_dns_resolver::{DnsResolver, Error, SrvRecordData};
-use numbers::canonical_tower_url;
+- **What a denied station sees.** `RelayStatus::auth_denied_reason()` is `Some(reason)`;
+  `last_error()` says only "Failed to connect to relay server"; `online()` does not resolve while
+  the denying tower is its home. It keeps retrying with the relay backoff (10 ms–16 s, jitter).
+  Measured: 12–13 `on_connect` calls in 60 s, at about 0.3, 0.35, 0.4, 0.45, 0.6, 0.9, 1.3, 2, 4,
+  8, 15, 34 and 51–60 s.
+- **The list gates `/relay` only.** Measured: a denied station used the tower's QAD (3 QAD
+  connections in 60 s) and its HTTPS `/ping` probe (that is how the tower became its home), and
+  `/generate_204` answered 204. A listed station and an unlisted one could not reach each other
+  through that tower in either direction (nothing within 10 s; neither handler ran).
+- **A denying tower can capture a station.** With a denying and an admitting tower in its map, the
+  station takes the lower-latency one as home whatever the list says, and the hysteresis keeps it.
+  Measured: the denying tower became home in 2–5 of 6 stations per run (17 of 30), and they stayed
+  denied for 45 s (one moved after 44.8 s). `remove_relay(denying)` brought each online through the
+  other in 215–301 ms; `insert_relay` of the admitting tower while homed on the denying one did not
+  help (2 of 15 online in about 220 ms, 4 after 46–50 s, 9 not within 60 s) (observed, not
+  documented). What a station does on `auth_denied_reason()` is decided in #74: it marks the
+  tower as denied and shows the reason. It takes the tower out of the relay map only if another
+  tower of the set is not marked denied. If it is the only tower, or every tower denies, the
+  station changes nothing in the map, does not nudge and does not ask DNS because of the denial.
+  Putting a denied tower back and asking DNS again happen only when the set changes or at a long
+  interval: the station limits its own attempts, not iroh's own retries, which go on.
+- **Changing the list.** Removing an id does not end its open relay connection. The service handle
+  does:
+  ```rust
+  if let Some(service) = server.relay_service() {
+      service.clients().disconnect(id, None); // bool: was it connected; None = all its connections
+      service.set_client_rate_limit(None);    // the rate limit can also change live
+  }
+  ```
+  Measured: after `disconnect` the removed station showed not connected and `auth_denied_reason()`
+  21–22 ms later (it reconnected and was denied); listed again, it was connected 20–44 ms later.
 
-pub async fn lookup(domain: &str) -> Result<Vec<RelayUrl>, LocateError> {
-    let name = format!("_numbers._tcp.{}.", domain.trim_end_matches('.')); // FQDN: no search list
-    let resolver = DnsResolver::builder().use_system_config().build();
-    let recs: Vec<SrvRecordData> = match resolver.lookup_srv(name).await {
-        Ok(recs) => recs,                          // NODATA is Ok(vec![])
-        Err(Error::NxDomain { .. }) => Vec::new(), // non_exhaustive: `{ .. }` required
-        Err(err) => return Err(LocateError::Dns(err)),
+**Rate limit.** Per client, on what the tower reads from that client:
+```rust
+use std::num::NonZeroU32;
+use iroh_relay::server::ClientRateLimit;
+// bytes per second read from each client
+let mut limit = ClientRateLimit::new(NonZeroU32::new(2 * 1024 * 1024).expect("non-zero"));
+limit.max_burst_bytes = None; // #[non_exhaustive]: assign the field
+```
+
+- The sender sees only slowness: no error, no disconnect, no status change. Measured with 64 KiB/s
+  and eight 60 000-byte echoes over a relayed connection: 13.5–13.9 s (34–35 KiB/s each way;
+  the echo passes the limit twice), against 77–136 ms unlimited and 68–140 ms after
+  `set_client_rate_limit(None)`. The tower counts `bytes_rx_ratelimited_total` and
+  `conns_rx_ratelimited_total`; the client has only a warning in its log and the
+  `relay_conns_ratelimited` counter behind iroh's `metrics` feature.
+- Declared but not implemented in iroh-relay 1.5: `Limits::accept_conn_limit` and
+  `accept_conn_burst` ("setting this has no effect"). Fixed in code (source reading): 30 s for the
+  WebSocket upgrade, authentication and access check; 2 s server write timeout.
+
+**SRV.** The bootstrap record is SRV: decision 13, settled in #38. `iroh::dns::DnsResolver` offers
+only A/AAAA/TXT and re-exports nothing from n0-dns-resolver, hence the direct dependency. Two
+resolvers are involved, and neither may fall back to public resolvers:
+```rust
+use std::net::SocketAddr;
+use iroh::RelayUrl;
+use n0_dns_resolver::{DnsProtocol, DnsResolver, Nameserver, SrvRecordData};
+
+/// For the SRV lookup. A fresh n0-dns-resolver Builder reads nothing from the host and has an
+/// empty fallback tier. Production would use `.use_system_config()` instead (not tested).
+/// NOT `DnsResolver::system_with_fallback()`: Cloudflare, Google and Quad9 behind the system.
+pub fn srv_resolver(ns: SocketAddr) -> DnsResolver {
+    DnsResolver::builder()
+        .nameserver(Nameserver::new(ns, DnsProtocol::Udp))
+        .build()
+}
+
+/// iroh's own resolver, for the tower host names (relay dial, HTTPS probe, QAD).
+/// NOT `iroh::dns::DnsResolver::with_nameserver(addr)`: it keeps the default fallback mode
+/// (Deferred) and so adds the public resolvers behind the given one.
+pub fn iroh_resolver(ns: SocketAddr) -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::builder()
+        .add_nameserver_config(iroh::dns::NameserverConfig::udp(ns.ip()).with_port(ns.port()))
+        .disable_fallback()
+        .build()
+}
+
+/// The canonical tower URL: no trailing dot.
+pub fn tower_url(rec: &SrvRecordData) -> Option<RelayUrl> {
+    let host = rec.target.trim_end_matches('.'); // targets arrive without the dot anyway
+    if host.is_empty() {
+        return None; // target "." means "not available" (not tested)
+    }
+    format!("https://{host}:{}/", rec.port).parse().ok()
+}
+
+pub async fn lookup(
+    resolver: &DnsResolver,
+    domain: &str,
+) -> Result<Vec<RelayUrl>, n0_dns_resolver::Error> {
+    let name = format!("_numbers._tcp.{}.", domain.trim_end_matches('.')); // FQDN
+    let recs = match resolver.lookup_srv(name).await {
+        Ok(recs) => recs,                                           // NODATA: Ok(vec![])
+        Err(n0_dns_resolver::Error::NxDomain { .. }) => Vec::new(), // #[non_exhaustive]
+        Err(e) => return Err(e),
     };
-    let mut urls: Vec<RelayUrl> = recs
-        .iter()
-        .map(|r| (r.target.as_str(), r.port))
-        .filter(|(host, _)| !host.is_empty())     // target "." arrives as "": not available
-        .filter_map(|(host, port)| canonical_tower_url(&format!("https://{host}:{port}")).ok())
-        .filter_map(|url| url.parse().ok())
-        .collect();
+    let mut urls: Vec<RelayUrl> = recs.iter().filter_map(tower_url).collect();
     urls.sort();
     urls.dedup();
-    if urls.is_empty() { return Err(LocateError::NoTower); }
     Ok(urls)
 }
 ```
 
-- Query `_numbers._tcp` (the first review used an older label). `RelayUrl` compares textually.
-  Canonicalise both SRV targets and explicit `--tower` URLs with `numbers::canonical_tower_url`.
-  The URL parser drops port 443 and lowercases DNS names. Numbers also removes a DNS trailing dot.
-  The pinned rustls name parser similarly strips a single trailing dot before SNI.
-- Priority and weight are ignored; SRV-located towers are always `https`, QAD on UDP 7842.
-- `system_with_fallback()` asks Cloudflare, Google and Quad9 when system DNS fails. Use the system
-  configuration alone so split-horizon queries stay on system DNS. On Apple it reads SCDynamicStore.
-- SRV only bootstraps: a running station applies tower-set changes with `insert_relay` /
-  `remove_relay`, and `TowerLookup` reads the same shared `RelayMap`.
+- Measured against a DNS server on 127.0.0.1 (the resolver listed only that server, and the whole
+  suite also passed in a namespace with only loopback): the answer is
+  `SrvRecordData { priority: 10, weight: 60, port, target: "a.example.test" }` per record, target
+  without the trailing dot. NXDOMAIN is `Err(Error::NxDomain { .. })` ("domain name does not exist
+  (NXDOMAIN)"); an empty answer is `Ok(vec![])`. A server that does not answer gives
+  `Err(Error::Timeout { .. })` ("request timed out") after 6.0 s and 6 queries. That is
+  `UDP_NAMESERVER_TIMEOUT`, the budget for one UDP nameserver query: a constant, not a Builder
+  setting. A lookup over several nameservers can take longer, so the caller needs its own
+  deadline. Positive answers are cached for their TTL (source reading; measured: the second lookup
+  sent no query, and after `clear_cache()` the next one did). Serve-stale is off unless
+  `Builder::serve_stale` is set, and negative answers are not cached (`negative_max_ttl` enables
+  it). The resolver logs each name and its records with `debug!`, so a binary that lets debug
+  through for `n0_dns_resolver` writes the domain and the tower names to its log.
+- Measured, the whole chain (SRV, tower URLs, an endpoint with `iroh_resolver` on the same server,
+  TLS towers whose certificates name the targets): bind to online in 227–284 ms, with the SRV
+  lookup done before the timed part; the endpoint sent only A and AAAA queries for the targets.
+- **Trailing dot.** `https://a.example.test.:<port>/` also works (TLS verified against a
+  certificate for `a.example.test`, online 225–270 ms), but it is a different `RelayUrl` from the
+  form without the dot: two keys for one tower. Canonical form: no trailing dot, for SRV, `--tower`
+  and tower sets alike; with the default `ndots = 1` a name with dots is tried as absolute first
+  (source reading; system configuration not tested).
+- Use `numbers::canonical_tower_url` and `TowerEntry::from_url` in production to apply the same
+  validation to explicit, SRV, remembered and peer-supplied URLs.
+- Priority and weight are ignored. SRV carries no QAD port, so SRV-located towers get QAD on UDP
+  7842; a tower that does not serve it costs every endpoint that runs QAD 3 s at each first report
+  (above). Relay-only endpoints and hosts with only loopback run no QAD and pay nothing.
+- SRV only bootstraps. Tower sets passed on by peers are exchanged and shown, never used
+  automatically (#73). Recovering a lost tower is the station watchdog of #74.
+
+**Several towers.** One home tower at a time, chosen by latency (HTTPS probe, QAD if configured).
+```rust
+use iroh::{RelayMap, RelayMode};
+let map = RelayMap::empty(); // shared state: the endpoint's insert_relay / remove_relay change it
+let builder = builder.relay_mode(RelayMode::Custom(map.clone())); // a lookup can read `map` too
+let previous = ep.insert_relay(tower_url.clone(), entry).await; // Some(old entry) if present
+let removed = ep.remove_relay(&tower_url).await;
+```
+
+- **`home_relay_status()` lists the home tower only** (one entry; in the source it is an
+  `Option<RelayStatus>`). A status for the other towers needs our own bookkeeping.
+- Measured: with two towers up, bind → online median 264–423 ms; with one up and one down at start,
+  420–495 ms. With both down and one up 3 s later, online 17.9–23.5 s after it was up; with
+  `remove_relay` + `insert_relay` of it, 415–818 ms (observed, not documented).
+- **Failover is slow.** After a successful report the next one plans no HTTPS probe:
+  `ProbePlan::with_last_report` returns an empty plan when the last report had latencies, and an
+  empty report keeps the old home (`handle_net_report_report`). Only the second report after the
+  failure probes over HTTPS again. QAD probes have a plan of their own and run in every report,
+  which is why towers with QAD moved sooner. Measured after the home tower stopped: connected to
+  the other tower after
+  41.0–48.7 s; with `network_change()` 1 s after the stop 41.9–49.1 s (no help); with
+  `remove_relay` + `insert_relay` of the dead tower 1 s after the stop 1.22–1.44 s; with TLS towers
+  and QAD (QAD probes run in every report) 22.0–27.5 s, and 44.9–46.5 s in a namespace where QAD
+  does not run. Meanwhile the status shows the dead tower, not connected, `last_error` "Failed to
+  connect to relay server". A station watches for this (decided in #74, built in #78): only after
+  it has seen no home tower, or a home tower that is not connected, for some seconds, it removes
+  and re-inserts the tower, at a growing, capped interval, and never while the home tower is
+  connected.
+- **Hysteresis.** A new home must measure under 2/3 of the old one's latency. After the stopped
+  tower came back, home moved back to it within 50 s in 6 of 25 runs; on loopback this is noise.
+- **An open relayed connection does not move.** When the tower carrying its selected path stopped,
+  the connection kept that path and ended at the 30 s idle timeout in 20 of 20 runs, also when
+  both sides were on the other tower 1.4 s later. A new dial after both had moved worked in
+  9–31 ms; before that it failed.
+- **Different home towers.** X with only A in its map and Y with only B connected in 41–225 ms when
+  both lookups listed A and B (via B). A dialer that cannot reach the callee's home tower does not
+  connect: towers do not forward to each other (approximated with a dead URL in place of B; a real
+  network split was not tested).
+- **Runtime changes** (observed, not documented). `insert_relay` returned in 0–4 ms and moved the
+  home to the new tower when it measured faster (about half the runs); open connections were not
+  disturbed. `remove_relay` of the home tower with another in the map: on the other in 220–244 ms.
+  `remove_relay` of the **only** tower takes it out of the shared map, but the home connection
+  and the status did not change: still connected, `online()` still resolves. `insert_relay` of a
+  URL that is already there replaces its configuration and returns `Some(previous)`; the home
+  connection and the status did not change either. A connection
+  whose path runs through a removed tower kept working, and a new dial to a peer reachable only
+  through that tower still connected (2–10 ms).
