@@ -270,6 +270,7 @@ async fn an_undecodable_request_gets_bad_request() {
             &br#"{"type":"call","request":{"type":"nope"}}"#[..],
             br#"{"type":"stream"}"#,
             b"not json",
+            br#"{"type":"call","request":{"type":"message","seq":"MARKER-SECRET"}}"#,
         ] {
             let mut stream = raw_connect(rig.path()).await;
             let hello = raw_hello(&mut stream, API_VERSION).await;
@@ -290,6 +291,12 @@ async fn an_undecodable_request_gets_bad_request() {
                 panic!("expected BadRequest, got {reply:?}");
             };
             assert!(!detail.is_empty());
+            // The detail never quotes the request (hard rule 9).
+            assert!(!detail.contains("MARKER"), "{detail}");
+            assert!(
+                !detail.contains("nope") && !detail.contains("stream"),
+                "{detail}"
+            );
             wait_closed(&mut stream).await;
         }
         // An undecodable request reached nobody.
@@ -307,12 +314,33 @@ async fn an_undecodable_request_gets_bad_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_another_version_gets_the_hello_reply_and_is_closed() {
     bounded(async {
-        let rig = rig().await;
+        // A frame timeout far beyond this test's bound: only the version check can close the
+        // connection in time.
+        let rig = rig_with(IpcConfig {
+            frame_timeout: Duration::from_secs(600),
+            ..IpcConfig::default()
+        })
+        .await;
         let mut stream = raw_connect(rig.path()).await;
         let hello = raw_hello(&mut stream, API_VERSION + 1).await;
         assert_eq!(hello.api, API_VERSION);
         assert_eq!(hello.station_id, "STATION-A");
-        wait_closed(&mut stream).await;
+        // A call after the mismatched hello is never answered: the stream ends.
+        let open = Open::Call {
+            request: Request::Status,
+        };
+        let _ = write_frame(&mut stream, &open, LOCAL_FRAME_MAX).await;
+        match raw_read::<Reply>(&mut stream).await {
+            Err(FrameError::Closed | FrameError::Io(_)) => {}
+            other => panic!("expected the end of the stream, got {other:?}"),
+        }
+        let status_calls = rig
+            .fake
+            .requests()
+            .iter()
+            .filter(|r| matches!(r, Request::Status))
+            .count();
+        assert_eq!(status_calls, 1, "only the server's own status call");
     })
     .await;
 }
@@ -563,7 +591,7 @@ async fn a_byte_from_a_subscriber_ends_its_subscription() {
 async fn the_server_survives_garbage_silence_and_oversize_frames() {
     bounded(async {
         let rig = rig_with(IpcConfig {
-            read_timeout: Duration::from_millis(200),
+            frame_timeout: Duration::from_millis(200),
             ..IpcConfig::default()
         })
         .await;
@@ -611,15 +639,45 @@ async fn the_server_survives_garbage_silence_and_oversize_frames() {
 async fn further_connections_wait_for_a_free_slot() {
     bounded(async {
         let rig = rig_with(IpcConfig {
-            read_timeout: Duration::from_millis(300),
+            frame_timeout: Duration::from_secs(2),
             max_connections: 1,
         })
         .await;
-        // A silent client holds the only slot until its read timeout.
+        // A silent client holds the only slot until its frame timeout.
         let mut silent = raw_connect(rig.path()).await;
-        let status = rig.client.status().await.unwrap();
-        assert_eq!(status, rig.fake.status());
+        let client = rig.client.clone();
+        let mut call = tokio::spawn(async move { client.status().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut call)
+                .await
+                .is_err(),
+            "a second connection was served while the only slot was taken"
+        );
+        assert_eq!(call.await.unwrap().unwrap(), rig.fake.status());
         wait_closed(&mut silent).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_subscription_holds_its_slot_until_it_is_dropped() {
+    bounded(async {
+        let rig = rig_with(IpcConfig {
+            frame_timeout: Duration::from_secs(600),
+            max_connections: 1,
+        })
+        .await;
+        let events = rig.client.subscribe().await.unwrap();
+        let client = rig.client.clone();
+        let mut call = tokio::spawn(async move { client.status().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut call)
+                .await
+                .is_err(),
+            "a call was served while a subscription held the only slot"
+        );
+        drop(events);
+        assert_eq!(call.await.unwrap().unwrap(), rig.fake.status());
     })
     .await;
 }
@@ -814,9 +872,18 @@ async fn a_dropped_server_stops_serving_and_its_socket_is_replaced_later() {
             rig.client.status().await.unwrap_err(),
             ApiError::NotRunning { .. }
         ));
-        let again = IpcServer::bind(rig.fake.clone(), &path, IpcConfig::default())
-            .await
-            .unwrap();
+        // The lock goes with the aborted task, which may still be on its way out: retry.
+        let mut attempts = 0;
+        let again = loop {
+            match IpcServer::bind(rig.fake.clone(), &path, IpcConfig::default()).await {
+                Ok(server) => break server,
+                Err(IpcError::InUse { .. }) if attempts < 500 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
         assert!(rig.client.status().await.is_ok());
         again.shutdown().await;
     })
@@ -904,3 +971,344 @@ async fn a_server_that_never_answers_times_out() {
     })
     .await;
 }
+
+// The socket lock (one server per socket).
+
+fn lock_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).unwrap();
+    (m.dev(), m.ino())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_server_on_the_same_socket_is_refused_and_takes_nothing() {
+    bounded(async {
+        let rig = rig().await;
+        let before = identity(rig.path());
+        let err = IpcServer::bind(fake("STATION-B"), rig.path(), IpcConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::InUse { path } if path == rig.path()),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("already serving") && text.contains("--data-dir"),
+            "{text}"
+        );
+        // The live socket is untouched and still served by the first server.
+        assert_eq!(identity(rig.path()), before);
+        assert_eq!(rig.client.status().await.unwrap().station_id, "STATION-A");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_shutdown_a_new_server_takes_the_socket_and_the_lock_file_stays() {
+    bounded(async {
+        let rig = rig().await;
+        let path = rig.path().to_path_buf();
+        rig.server.shutdown().await;
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert!(std::fs::symlink_metadata(lock_path(&path)).is_ok());
+        let second = fake("STATION-B");
+        let again = IpcServer::bind(second, &path, IpcConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(rig.client.status().await.unwrap().station_id, "STATION-B");
+        again.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lock_file_is_0600_and_a_symlink_there_is_refused() {
+    bounded(async {
+        let rig = rig().await;
+        let lock = lock_path(rig.path());
+        assert!(
+            std::fs::symlink_metadata(&lock)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(mode(&lock), 0o600);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("station.sock");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&target, lock_path(&path)).unwrap();
+        let err = IpcServer::bind(fake("STATION-A"), &path, IpcConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::Lock { path: p, .. } if *p == lock_path(&path)),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(&path).is_err());
+    })
+    .await;
+}
+
+// Deadlines on every frame of a call.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_does_not_read_its_reply_loses_its_slot() {
+    bounded(async {
+        let rig = rig_with(IpcConfig {
+            frame_timeout: Duration::from_millis(300),
+            max_connections: 1,
+        })
+        .await;
+        // A page of about 512 KiB: more than the socket buffers hold.
+        receive_n(&rig.fake, 40, &"x".repeat(BODY_MAX_BYTES));
+        let mut stuck = raw_connect(rig.path()).await;
+        raw_hello(&mut stuck, API_VERSION).await;
+        let open = Open::Call {
+            request: Request::Log {
+                peer: None,
+                before: None,
+                limit: 100,
+            },
+        };
+        write_frame(&mut stuck, &open, LOCAL_FRAME_MAX)
+            .await
+            .unwrap();
+        // The stuck client never reads; the server gives up on it and serves the next one.
+        let client = Client::new(SocketTransport::new(rig.path()).with_call_timeout(READ_BOUND));
+        assert_eq!(client.status().await.unwrap(), rig.fake.status());
+        wait_closed(&mut stuck).await;
+    })
+    .await;
+}
+
+// Rules 3 and 11 over the socket.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_resolves_only_after_the_station_registered_it() {
+    bounded(async {
+        let rig = rig().await;
+        rig.fake.hold_subscribes(true);
+        let client = rig.client.clone();
+        let mut subscribe = tokio::spawn(async move { client.subscribe().await });
+        rig.fake.wait_for_held_subscribes(1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut subscribe)
+                .await
+                .is_err(),
+            "subscribe resolved before the station registered the subscription"
+        );
+        assert_eq!(rig.fake.subscriber_count(), 0);
+        rig.fake.hold_subscribes(false);
+        let mut events = subscribe.await.unwrap().unwrap();
+        assert_eq!(rig.fake.subscriber_count(), 1);
+        let got = rig.fake.receive("bob", "x").unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            Event::Message { message: got }
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_station_delivers_the_queued_events_then_ends_the_subscription() {
+    bounded(async {
+        let rig = rig().await;
+        let mut events = rig.client.subscribe().await.unwrap();
+        let sent: Vec<Event> = (0..3)
+            .map(|_| Event::Message {
+                message: rig.fake.receive("bob", "x").unwrap(),
+            })
+            .collect();
+        rig.fake.stop();
+        for event in sent {
+            assert_eq!(next_event(&mut events).await, event);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                tokio::time::timeout(READ_BOUND, events.next())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    })
+    .await;
+}
+
+// The transport's own errors, against servers that misbehave on purpose.
+
+/// Accepts one connection, answers the hello with this build's version, reads the `Open` frame,
+/// and hands the stream to `then`.
+fn serve_once<F, Fut>(listener: UnixListener, then: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce(UnixStream, Open) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: Hello = raw_read(&mut stream).await.unwrap();
+        let reply = HelloReply {
+            api: API_VERSION,
+            station_id: "STATION-A".into(),
+            instance_id: "INSTANCE-1".into(),
+        };
+        write_frame(&mut stream, &reply, LOCAL_FRAME_MAX)
+            .await
+            .unwrap();
+        let open: Open = raw_read(&mut stream).await.unwrap();
+        then(stream, open).await;
+    })
+}
+
+fn raw_listener() -> (TempDir, PathBuf, UnixListener) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("station.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    (dir, path, listener)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_closes_in_the_middle_of_a_call_is_disconnected() {
+    bounded(async {
+        let (_dir, path, listener) = raw_listener();
+        let server = serve_once(listener, |stream, _| async move { drop(stream) });
+        let err = SocketTransport::new(&path)
+            .call(Request::Status)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Disconnected { .. }), "{err:?}");
+        server.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replies_that_do_not_fit_are_bad_replies_and_never_quoted() {
+    bounded(async {
+        // An undecodable reply holding a marker.
+        let (_dir, path, listener) = raw_listener();
+        let server = serve_once(listener, |mut stream, _| async move {
+            let body = br#"{"type":"ok","response":{"type":"message","message":"MARKER-SECRET"}}"#;
+            stream.write_all(&frame(body)).await.unwrap();
+        });
+        let err = SocketTransport::new(&path)
+            .call(Request::Status)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadReply { .. }), "{err:?}");
+        assert!(!format!("{err:?}").contains("MARKER"), "{err:?}");
+        assert!(!err.to_string().contains("MARKER"), "{err}");
+        server.await.unwrap();
+
+        // `Subscribed` to a call.
+        let (_dir, path, listener) = raw_listener();
+        let server = serve_once(listener, |mut stream, _| async move {
+            write_frame(&mut stream, &Reply::Subscribed, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+        });
+        let err = SocketTransport::new(&path)
+            .call(Request::Status)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadReply { .. }), "{err:?}");
+        server.await.unwrap();
+
+        // `Ok` to a subscribe: refused without printing the response.
+        let (_dir, path, listener) = raw_listener();
+        let server = serve_once(listener, |mut stream, open| async move {
+            assert_eq!(open, Open::Subscribe);
+            let reply = Reply::Ok {
+                response: Response::Peers {
+                    peers: vec![Peer {
+                        name: "MARKER".into(),
+                        stations: vec![],
+                    }],
+                },
+            };
+            write_frame(&mut stream, &reply, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+        });
+        let err = SocketTransport::new(&path).subscribe().await.unwrap_err();
+        let ApiError::BadReply { detail } = &err else {
+            panic!("expected BadReply, got {err:?}");
+        };
+        assert!(detail.contains("as if it were a call"), "{detail}");
+        assert!(!format!("{err:?}").contains("MARKER"), "{err:?}");
+        server.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_event_frame_ends_the_subscription() {
+    bounded(async {
+        let (_dir, path, listener) = raw_listener();
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        let server = serve_once(listener, |mut stream, _| async move {
+            write_frame(&mut stream, &Reply::Subscribed, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+            write_frame(&mut stream, &Event::Resync, LOCAL_FRAME_MAX)
+                .await
+                .unwrap();
+            stream
+                .write_all(&frame(b"{\"type\":\"nope\"}"))
+                .await
+                .unwrap();
+            // Keep the connection open: only the bad frame can end the subscription.
+            let _ = finished.await;
+        });
+        let mut events = SocketTransport::new(&path).subscribe().await.unwrap();
+        assert_eq!(next_event(&mut events).await, Event::Resync);
+        assert_eq!(
+            tokio::time::timeout(READ_BOUND, events.next())
+                .await
+                .unwrap(),
+            None
+        );
+        done.send(()).unwrap();
+        server.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_too_large_for_a_frame_is_refused_before_connecting() {
+    bounded(async {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing listens here: an attempt to connect would give NotRunning.
+        let t = SocketTransport::new(dir.path().join("station.sock"));
+        let body = "MARKER".repeat(LOCAL_FRAME_MAX / 6 + 1);
+        let err = t
+            .call(Request::Send {
+                peer: "bob".into(),
+                body,
+            })
+            .await
+            .unwrap_err();
+        let ApiError::BadRequest { detail } = &err else {
+            panic!("expected BadRequest, got {err:?}");
+        };
+        assert!(detail.contains("limit"), "{detail}");
+        assert!(!detail.contains("MARKER"), "{detail}");
+    })
+    .await;
+}
+
+// Not covered here: the uid checks on both ends (the server closing a connection from another
+// uid, the client refusing a socket served by another uid). Exercising them needs a second user
+// on the machine; they are not faked.

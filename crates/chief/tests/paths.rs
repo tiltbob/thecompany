@@ -182,3 +182,29 @@ fn the_constants_are_pinned() {
     assert_eq!(RUNTIME_SUBDIR, "thecompany");
     assert_eq!(SOCKET_FILE, "station.sock");
 }
+
+#[test]
+fn environments_that_differ_only_in_xdg_data_home_share_the_socket_path() {
+    // The documented path rule: each process's default data dir has the runtime socket. Two
+    // stations of one user with different XDG_DATA_HOME therefore name the same socket; the
+    // server's socket lock (`numbers_station::ipc`) is what keeps the second from taking it.
+    let one = PathEnv {
+        xdg_data_home: Some(p("/home/a/one")),
+        xdg_runtime_dir: Some(p("/run/user/1000")),
+        home: Some(p("/home/a")),
+    };
+    let two = PathEnv {
+        xdg_data_home: Some(p("/home/a/two")),
+        ..one.clone()
+    };
+    let (dir_one, dir_two) = (
+        one.default_data_dir().unwrap(),
+        two.default_data_dir().unwrap(),
+    );
+    assert_ne!(dir_one, dir_two);
+    assert_eq!(one.socket_path(&dir_one), two.socket_path(&dir_two));
+    assert_eq!(
+        one.socket_path(&dir_one),
+        p("/run/user/1000/thecompany/station.sock")
+    );
+}

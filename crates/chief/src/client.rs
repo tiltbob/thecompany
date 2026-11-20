@@ -36,7 +36,8 @@ pub trait Transport: Send + Sync + 'static {
     /// Makes one call. Answers with the [`Response`] variant the request names, or with an
     /// [`ApiError`]: the station's refusal, passed through unchanged, or the transport's own
     /// failure ([`ApiError::NotRunning`], [`ApiError::IncompatibleApi`],
-    /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`]).
+    /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`], and from the
+    /// socket transport [`ApiError::BadRequest`] for a request too large for one frame).
     fn call(&self, request: Request) -> impl Future<Output = Result<Response, ApiError>> + Send;
 
     /// Opens a subscription to live events from now on; earlier events are not replayed.

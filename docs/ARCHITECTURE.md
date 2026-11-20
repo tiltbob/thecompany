@@ -432,8 +432,9 @@ loopback. The remaining iroh examples are source references.
 - **Paths.** `conn.paths()`, `conn.paths_stream().wait_any(..)`, `conn.path_events()`; a path reports
   `is_relay()`, `is_ip()`, `is_selected()`.
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
-  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket path is limited to
-  108 bytes on Linux, 104 on Apple. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
+  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket address holds
+  108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107
+  or 103 bytes. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
   stream type and does not propagate cancellation, hence the pull-style `Subscription::next()`.
 - **SRV (M2).** `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
   `SrvRecordData {priority, weight, port, target}`. Query the FQDN with a trailing dot; targets come
