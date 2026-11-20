@@ -1,5 +1,6 @@
-"""Generates src/verbatim.rs from docs/notes/iroh-snippets.md: every rust block of sections 2-10,
-byte for byte, wrapped only in modules and functions that supply the free variables.
+"""Generates src/verbatim.rs from docs/notes/iroh-snippets.md: every line of every rust block of
+sections 2-10. It changes nothing but indentation: `use` lines move to module level, and the rest is
+wrapped in functions and scaffolding that supply what a block leaves out.
 Usage: python3 -I scripts/gen-verbatim.py <path to iroh-snippets.md> > src/verbatim.rs"""
 import re
 import sys

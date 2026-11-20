@@ -14,8 +14,10 @@ cd lab/iroh
 ```
 
 About 4.5 minutes. The last step reruns the suite inside a network namespace that has only
-loopback, which needs root for `unshare -n`. `src/verbatim.rs` is generated from the notes: every rust
-block of sections 2 to 10, byte for byte, wrapped only in functions that supply the free variables.
+loopback, which needs root for `unshare -n`. `src/verbatim.rs` is generated from the notes: every line
+of every rust block of sections 2 to 10. The generator changes nothing but indentation: it moves
+`use` lines to module level and wraps the rest in functions and scaffolding that supply what a block
+leaves out (free variables, our own types, and in section 7 the imports).
 Regenerate it after editing the notes and build it with the `verbatim` feature:
 
 ```bash
