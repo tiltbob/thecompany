@@ -873,9 +873,10 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
             // `started` is taken before the request opens its stream, and the receiver creates
             // its timer only after it accepts that stream. Tokio never fires a timer early, so
             // on a correct receiver this cannot be shorter than the deadline.
+            let elapsed = started.elapsed();
             assert!(
-                started.elapsed() >= SEND_DEADLINE,
-                "the receiver reset the chat before its send deadline"
+                elapsed >= SEND_DEADLINE,
+                "the receiver reset the chat before its send deadline: {elapsed:?}"
             );
             let held = held.expect("receive the complete chat before it times out");
             assert_delivery(&held, peer_id, "second", &chat);
@@ -1048,8 +1049,8 @@ async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeo
             // The dialer opens no hello stream, so the acceptor waits in `accept_bi` until
             // its hello timeout elapses. Opening a stream without writing to it would look
             // the same to the acceptor: QUIC sends nothing for it.
-            let silent = dial(&peer, &address).await;
             let dialed = Instant::now();
+            let silent = dial(&peer, &address).await;
             checked(
                 timeout(
                     CONNECT_TIMEOUT + Duration::from_secs(1),
@@ -1058,20 +1059,23 @@ async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeo
                 .await,
                 "the acceptor did not close a silent dialer by its hello timeout",
             );
-            // The dialer sees the connection before the acceptor does: the acceptor needs the
-            // dialer's Finished first, and only then starts its hello timer. Tokio never fires
-            // a timer early, so on a correct acceptor this cannot be shorter than the timeout.
+            // `dialed` is taken before the dial starts, and the acceptor starts its hello timer
+            // only after the handshake completes. Tokio never fires a timer early, so on a
+            // correct acceptor this cannot be shorter than the timeout. (Taking `dialed` after
+            // `dial` returns is not enough: on a loaded runtime the acceptor can start its timer
+            // before this task resumes.)
+            let elapsed = dialed.elapsed();
             assert!(
-                dialed.elapsed() >= CONNECT_TIMEOUT,
-                "the acceptor closed a silent dialer before its hello timeout"
+                elapsed >= CONNECT_TIMEOUT,
+                "the acceptor closed a silent dialer before its hello timeout: {elapsed:?}"
             );
             assert_eq!(handle.path(peer_id), LinkPath::Down);
             assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
 
             // This dialer sends its hello and reads the acceptor's answer, but never sends the
             // echo, so the acceptor waits in the read of the echo under the same timeout.
-            let stalled = dial(&peer, &address).await;
             let dialed = Instant::now();
+            let stalled = dial(&peer, &address).await;
             let (_held_hello, _) =
                 begin_hello(&stalled, &Hello::local(RAW_GENERATION, [1; 16])).await;
             checked(
@@ -1083,9 +1087,10 @@ async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeo
                 "the acceptor did not close a stalled hello by its hello timeout",
             );
             // As above, the acceptor's timer starts after `dialed`.
+            let elapsed = dialed.elapsed();
             assert!(
-                dialed.elapsed() >= CONNECT_TIMEOUT,
-                "the acceptor closed a stalled hello before its hello timeout"
+                elapsed >= CONNECT_TIMEOUT,
+                "the acceptor closed a stalled hello before its hello timeout: {elapsed:?}"
             );
             assert_eq!(handle.path(peer_id), LinkPath::Down);
             assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
