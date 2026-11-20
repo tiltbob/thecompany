@@ -22,13 +22,14 @@
 
 use crate::api::{API_VERSION, ApiError, Event, Request, Response};
 use crate::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription};
-use numbers_base::{FrameError, LOCAL_FRAME_MAX, read_frame, write_frame};
+use numbers_base::{FrameError, LOCAL_FRAME_MAX, encode_frame, read_frame, write_frame};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// The socket's own envelope around the station API: what the client and the server say before
@@ -112,8 +113,8 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// does not exist; [`ApiError::Disconnected`] when the connection breaks or the socket belongs to
 /// another user; [`ApiError::IncompatibleApi`]; [`ApiError::Timeout`] when a call or the opening of
 /// a subscription takes longer than the call timeout; [`ApiError::BadReply`] for a frame that is
-/// too large or does not decode. A request too large for one frame is refused before it is sent,
-/// with [`ApiError::BadRequest`].
+/// too large or does not decode. A request too large for one frame is refused with
+/// [`ApiError::BadRequest`] before the transport connects, so nothing is sent.
 ///
 /// Needs a tokio runtime with the time driver; [`Transport::subscribe`] spawns a task on it.
 #[derive(Debug, Clone)]
@@ -164,8 +165,9 @@ impl SocketTransport {
             })
     }
 
-    /// Connects, checks who serves the socket, and exchanges the hello. Then sends `open`.
-    async fn open(&self, open: &Open) -> Result<UnixStream, ApiError> {
+    /// Connects, checks who serves the socket, and exchanges the hello. Then sends `open`, a whole
+    /// frame made by [`encode_open`].
+    async fn open(&self, open: &[u8]) -> Result<UnixStream, ApiError> {
         let mut stream = UnixStream::connect(&self.path)
             .await
             .map_err(|e| self.connect_error(&e))?;
@@ -189,7 +191,12 @@ impl SocketTransport {
                 client: API_VERSION,
             });
         }
-        send(&mut stream, open).await?;
+        async {
+            stream.write_all(open).await?;
+            stream.flush().await
+        }
+        .await
+        .map_err(|e| disconnected(&format!("I/O error on the socket: {e}")))?;
         Ok(stream)
     }
 
@@ -203,7 +210,8 @@ impl SocketTransport {
     }
 
     async fn call_inner(&self, request: Request) -> Result<Response, ApiError> {
-        let mut stream = self.open(&Open::Call { request }).await?;
+        let open = encode_open(&Open::Call { request })?;
+        let mut stream = self.open(&open).await?;
         match receive(&mut stream).await? {
             Reply::Ok { response } => Ok(response),
             Reply::Err { error } => Err(error),
@@ -214,12 +222,13 @@ impl SocketTransport {
     }
 
     async fn subscribe_inner(&self) -> Result<UnixStream, ApiError> {
-        let mut stream = self.open(&Open::Subscribe).await?;
+        let open = encode_open(&Open::Subscribe)?;
+        let mut stream = self.open(&open).await?;
         match receive(&mut stream).await? {
             Reply::Subscribed => Ok(stream),
             Reply::Err { error } => Err(error),
-            Reply::Ok { response } => Err(ApiError::BadReply {
-                detail: format!("the station answered a subscription with {response:?}"),
+            Reply::Ok { .. } => Err(ApiError::BadReply {
+                detail: "the station answered a subscription as if it were a call".to_owned(),
             }),
         }
     }
@@ -274,11 +283,47 @@ async fn forward_events(mut stream: UnixStream, sink: EventSink) {
     }
 }
 
+/// Describes a JSON decoding error by its category and position only.
+///
+/// `serde_json`'s own message can quote a value from the input (`invalid type: string "..."`),
+/// and the input is a request or a reply of the station API; this text never holds any of it.
+/// Both ends of the socket use it for the detail of [`ApiError::BadRequest`] and
+/// [`ApiError::BadReply`].
+pub fn json_error_detail(error: &serde_json::Error) -> String {
+    let what = match error.classify() {
+        serde_json::error::Category::Io => "could not be read",
+        serde_json::error::Category::Syntax => "is not valid JSON",
+        serde_json::error::Category::Data => "does not have the expected fields or types",
+        serde_json::error::Category::Eof => "ends in the middle of a JSON value",
+    };
+    // An error inside an internally tagged enum has no position (serde reads it from a buffered
+    // value and reports line 0).
+    match error.line() {
+        0 => format!("the frame {what}"),
+        line => format!("the frame {what} (line {line}, column {})", error.column()),
+    }
+}
+
+/// Serializes `open` as a whole frame, before anything is sent: a request too large for one frame
+/// is refused with [`ApiError::BadRequest`] without connecting.
+fn encode_open(open: &Open) -> Result<Vec<u8>, ApiError> {
+    encode_frame(open, LOCAL_FRAME_MAX).map_err(|e| ApiError::BadRequest {
+        detail: match &e {
+            FrameError::Json(json) => json_error_detail(json),
+            // The sizes only: nothing of the request.
+            _ => e.to_string(),
+        },
+    })
+}
+
 async fn send<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<(), ApiError> {
     write_frame(stream, value, LOCAL_FRAME_MAX)
         .await
-        .map_err(|e| match e {
-            FrameError::TooLarge { .. } | FrameError::Json(_) => ApiError::BadRequest {
+        .map_err(|e| match &e {
+            FrameError::Json(j) => ApiError::BadRequest {
+                detail: json_error_detail(j),
+            },
+            FrameError::TooLarge { .. } => ApiError::BadRequest {
                 detail: e.to_string(),
             },
             FrameError::Closed | FrameError::Timeout | FrameError::Io(_) => {
@@ -290,8 +335,11 @@ async fn send<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result
 async fn receive<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> Result<T, ApiError> {
     read_frame(stream, LOCAL_FRAME_MAX, None)
         .await
-        .map_err(|e| match e {
-            FrameError::TooLarge { .. } | FrameError::Json(_) => ApiError::BadReply {
+        .map_err(|e| match &e {
+            FrameError::Json(j) => ApiError::BadReply {
+                detail: json_error_detail(j),
+            },
+            FrameError::TooLarge { .. } => ApiError::BadReply {
                 detail: e.to_string(),
             },
             FrameError::Closed => disconnected("the station closed the connection"),

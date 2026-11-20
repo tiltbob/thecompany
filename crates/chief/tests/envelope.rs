@@ -95,3 +95,20 @@ fn unknown_variants_and_missing_fields_are_refused() {
     assert!(serde_json::from_str::<Hello>(r#"{}"#).is_err());
     assert!(serde_json::from_str::<HelloReply>(r#"{"api":1}"#).is_err());
 }
+
+#[test]
+fn a_decode_error_detail_never_quotes_the_input() {
+    let json = r#"{"type":"ok","response":{"type":"message","message":"MARKER-SECRET"}}"#;
+    let error = serde_json::from_str::<Reply>(json).unwrap_err();
+    // serde's own text quotes the value: the reason for the helper.
+    assert!(error.to_string().contains("MARKER"), "{error}");
+    let detail = chief::socket::json_error_detail(&error);
+    assert!(!detail.contains("MARKER"), "{detail}");
+    assert!(detail.contains("expected fields or types"), "{detail}");
+    let syntax = serde_json::from_str::<Reply>("{not json").unwrap_err();
+    let detail = chief::socket::json_error_detail(&syntax);
+    assert!(detail.contains("not valid JSON"), "{detail}");
+    assert!(detail.contains("(line 1, column 2)"), "{detail}");
+    let eof = serde_json::from_str::<Reply>(r#"{"type":"#).unwrap_err();
+    assert!(chief::socket::json_error_detail(&eof).contains("ends in the middle"));
+}

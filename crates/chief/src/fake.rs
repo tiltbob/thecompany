@@ -2,9 +2,14 @@
 //!
 //! It follows the rules of [`crate::api`] closely enough to test transports, the socket server and
 //! frontends against it: a peer book, a log with `seq` and `rev`, paging, sends whose outcome the
-//! test scripts, incoming messages, subscriptions and stopping. It has no network, spawns nothing,
-//! and reads the clock only for [`Message::at_ms`]. It is the reference that frontend tests trust,
-//! so its own tests check it against the rules.
+//! test scripts, incoming messages, subscriptions, stopping and restarting. It has no network,
+//! spawns nothing, and reads the clock only for [`Message::at_ms`], and not even then after
+//! [`FakeStation::set_now_ms`]. It is the reference that frontend tests trust, so its own tests
+//! check it against the rules.
+//!
+//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of every call,
+//! [`FakeStation::fail_calls`] makes every call fail, and [`FakeStation::hold_subscribes`] keeps
+//! `subscribe` from returning until the test lets it.
 //!
 //! What it leaves out: links never change on their own (a test sets them with
 //! [`FakeStation::set_link`]), there is no send deadline (a held send stays `Sending` until
@@ -12,8 +17,8 @@
 
 use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
-    LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message, MessageStatus, Peer, PeerStation, Request,
-    Response, Status, TowerState, TowerStatus, check_peer_name,
+    LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message, MessageStatus, Peer, PeerStation,
+    RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus, check_peer_name,
 };
 use crate::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription};
 use std::collections::{BTreeMap, VecDeque};
@@ -59,6 +64,8 @@ struct Inner {
     hook: Mutex<Option<CallHook>>,
     /// Woken when a subscription is added or a closed one is dropped.
     subscribers_changed: Notify,
+    /// Woken when held subscribes may go on.
+    subscribe_gate: Notify,
 }
 
 struct State {
@@ -72,6 +79,17 @@ struct State {
     sinks: Vec<Arc<EventSink>>,
     requests: Vec<Request>,
     stopped: bool,
+    /// The newest [`RECEIPT_WINDOW`] accepted incoming messages, by peer and id, oldest first
+    /// (rule 8). Independent of the log's capacity.
+    receipts: VecDeque<(String, String)>,
+    /// The time new messages get, instead of the wall clock.
+    now_ms: Option<u64>,
+    /// The error every call answers while set.
+    fail_calls: Option<ApiError>,
+    /// Whether `subscribe` waits for [`FakeStation::hold_subscribes`]`(false)`.
+    hold_subscribes: bool,
+    /// How many `subscribe` calls are waiting.
+    held_subscribes: usize,
 }
 
 impl fmt::Debug for FakeStation {
@@ -109,12 +127,18 @@ impl FakeStation {
             sinks: Vec::new(),
             requests: Vec::new(),
             stopped: false,
+            receipts: VecDeque::new(),
+            now_ms: None,
+            fail_calls: None,
+            hold_subscribes: false,
+            held_subscribes: 0,
         };
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
                 hook: Mutex::new(None),
                 subscribers_changed: Notify::new(),
+                subscribe_gate: Notify::new(),
             }),
         }
     }
@@ -173,8 +197,8 @@ impl FakeStation {
         Ok(whole)
     }
 
-    /// Logs a message from `peer` with a new id (rule 8) and pushes its event. Control characters
-    /// are stripped from `body` (rule 9). Fails with [`ApiError::PeerNotFound`] for a peer not in
+    /// Logs a message from `peer` with a new id (rule 8) and pushes its event. Every control
+    /// character in `body` is replaced with a space (rule 9). Fails with [`ApiError::PeerNotFound`] for a peer not in
     /// the book, and with [`ApiError::Stopping`] after [`FakeStation::stop`].
     pub fn receive(&self, peer: &str, body: &str) -> Result<Message, ApiError> {
         let id = {
@@ -187,9 +211,11 @@ impl FakeStation {
             })
     }
 
-    /// Logs a message from `peer` with the chat id `id`, unless the log already holds a message
-    /// from that peer with that id: then it logs nothing, pushes nothing and returns `None` (rule
-    /// 8). Errors as [`FakeStation::receive`].
+    /// Logs a message from `peer` with the chat id `id`, unless the pair is among the newest
+    /// [`RECEIPT_WINDOW`] accepted ones, across all peers: then it logs nothing, pushes nothing,
+    /// leaves the window as it is and returns `None` (rule 8). After that many newer accepted
+    /// messages the pair is forgotten and the id is logged again as a new message. The window does
+    /// not depend on the log's capacity. Errors as [`FakeStation::receive`].
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -205,14 +231,18 @@ impl FakeStation {
                 name: peer.to_owned(),
             });
         }
-        let duplicate = state
-            .log
-            .iter()
-            .any(|m| m.direction == Direction::Incoming && m.peer == peer && m.id == id);
-        if duplicate {
+        // Rule 8: a duplicate inside the window is dropped and does not move the window.
+        if state.receipts.iter().any(|(p, i)| p == peer && i == id) {
             return Ok(None);
         }
-        let body: String = body.chars().filter(|c| !c.is_control()).collect();
+        state.receipts.push_back((peer.to_owned(), id.to_owned()));
+        while state.receipts.len() > RECEIPT_WINDOW {
+            state.receipts.pop_front();
+        }
+        let body: String = body
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         Ok(Some(state.append(
             peer,
             id.to_owned(),
@@ -243,6 +273,68 @@ impl FakeStation {
         state.stopped = true;
         state.sinks.clear();
         self.inner.subscribers_changed.notify_waiters();
+    }
+
+    /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
+    /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
+    /// link is down, and calls are answered again
+    /// after a [`FakeStation::stop`]. The peer book, the send outcome and the other test settings
+    /// stay, as a station's peer book survives a restart.
+    pub fn restart(&self, instance_id: impl Into<String>) {
+        let mut state = self.state();
+        state.status.instance_id = instance_id.into();
+        state.sinks.clear();
+        state.log.clear();
+        state.receipts.clear();
+        state.next_seq = 1;
+        state.stopped = false;
+        for stations in state.peers.values_mut() {
+            for station in stations {
+                station.link = Link::Down;
+            }
+        }
+        self.inner.subscribers_changed.notify_waiters();
+    }
+
+    /// From now on every message that enters the log gets `ms` as its [`Message::at_ms`], until
+    /// this is called again. Before the first call the wall clock is used.
+    pub fn set_now_ms(&self, ms: u64) {
+        self.state().now_ms = Some(ms);
+    }
+
+    /// While `Some`, every call answers with this error (after the [`FakeStation::on_call`] hook,
+    /// and recorded in [`FakeStation::requests`]); `None` answers normally again. `subscribe` and
+    /// open subscriptions are not affected.
+    pub fn fail_calls(&self, error: Option<ApiError>) {
+        self.state().fail_calls = error;
+    }
+
+    /// While `true`, `subscribe` does not register its subscription and does not return: it waits
+    /// until this is set to `false` again. A test uses it to see that a transport's `subscribe`
+    /// resolves only after the station registered the subscription (rule 3).
+    pub fn hold_subscribes(&self, hold: bool) {
+        self.state().hold_subscribes = hold;
+        if !hold {
+            self.inner.subscribe_gate.notify_waiters();
+        }
+    }
+
+    /// How many `subscribe` calls are waiting because of [`FakeStation::hold_subscribes`].
+    pub fn held_subscribes(&self) -> usize {
+        self.state().held_subscribes
+    }
+
+    /// Waits until exactly `n` `subscribe` calls are held. Bound it with a timeout.
+    pub async fn wait_for_held_subscribes(&self, n: usize) {
+        loop {
+            let notified = self.inner.subscribers_changed.notified();
+            let mut notified = pin!(notified);
+            notified.as_mut().enable();
+            if self.held_subscribes() == n {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// The number of subscriptions whose [`Subscription`] is still alive.
@@ -343,6 +435,9 @@ impl FakeStation {
         self.run_hook(&request);
         let mut state = self.state();
         state.requests.push(request.clone());
+        if let Some(error) = &state.fail_calls {
+            return Err(error.clone());
+        }
         if state.stopped {
             return Err(ApiError::Stopping);
         }
@@ -386,6 +481,20 @@ impl Transport for FakeStation {
     }
 
     async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        let mut held: Option<HeldSubscribe<'_>> = None;
+        loop {
+            let gate = self.inner.subscribe_gate.notified();
+            let mut gate = pin!(gate);
+            gate.as_mut().enable();
+            if !self.state().hold_subscribes {
+                break;
+            }
+            if held.is_none() {
+                held = Some(HeldSubscribe::new(self));
+            }
+            gate.await;
+        }
+        drop(held);
         let mut state = self.state();
         if state.stopped {
             return Err(ApiError::Stopping);
@@ -394,6 +503,25 @@ impl Transport for FakeStation {
         state.sinks.push(Arc::new(sink));
         self.inner.subscribers_changed.notify_waiters();
         Ok(events)
+    }
+}
+
+/// Counts one held `subscribe` while it lives, also when the call is dropped.
+struct HeldSubscribe<'a>(&'a FakeStation);
+
+impl<'a> HeldSubscribe<'a> {
+    fn new(fake: &'a FakeStation) -> Self {
+        fake.state().held_subscribes += 1;
+        fake.inner.subscribers_changed.notify_waiters();
+        Self(fake)
+    }
+}
+
+impl Drop for HeldSubscribe<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        state.held_subscribes = state.held_subscribes.saturating_sub(1);
+        self.0.inner.subscribers_changed.notify_waiters();
     }
 }
 
@@ -431,7 +559,7 @@ impl State {
             peer: peer.to_owned(),
             direction,
             body,
-            at_ms: now_ms(),
+            at_ms: self.now_ms.unwrap_or_else(now_ms),
             status,
         };
         self.next_seq += 1;

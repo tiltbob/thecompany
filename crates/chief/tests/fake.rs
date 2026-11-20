@@ -325,14 +325,19 @@ async fn a_held_send_waits_for_resolve_and_a_final_status_never_changes() {
 // Incoming messages (rules 8 and 9).
 
 #[tokio::test]
-async fn receive_logs_strips_and_drops_duplicates() {
+async fn receive_logs_replaces_control_characters_and_drops_duplicates() {
     let (fake, c) = with_peers().await;
     let mut events = c.subscribe().await.unwrap();
     let got = fake
-        .receive_with_id("bob", "ID-1", "where\u{1b}[31m are\u{7} you?")
+        .receive_with_id(
+            "bob",
+            "ID-1",
+            "where\u{1b}[31m are\u{7} you?\r\n\tok\u{7f}\u{85}!",
+        )
         .unwrap()
         .unwrap();
-    assert_eq!(got.body, "where[31m are you?");
+    // Replaced with a space, not removed (rule 9): C0, DEL and C1, newline and tab included.
+    assert_eq!(got.body, "where [31m are  you?   ok  !");
     assert_eq!(got.direction, Direction::Incoming);
     assert_eq!(got.status, MessageStatus::Received);
     assert_eq!((got.seq, got.rev), (1, 0));
@@ -584,4 +589,212 @@ async fn requests_are_recorded_and_the_hook_runs_first() {
     );
     assert_eq!(requests[3], Request::Status);
     assert_eq!(requests[4], Request::Peers);
+}
+
+// Check order (rules 7 and 10).
+
+#[tokio::test]
+async fn peer_add_checks_name_then_id_form_then_own_id_then_taken() {
+    let (_fake, c) = with_peers().await;
+    // Each request fails every later check too; the first one decides.
+    let err = c.peer_add("-bad", "").await.unwrap_err();
+    assert_eq!(invalid_field(err.clone()), "name");
+    let ApiError::Invalid { reason, .. } = c.peer_add("carol", "").await.unwrap_err() else {
+        panic!("expected Invalid");
+    };
+    assert_eq!(reason, "is not a station id");
+    let ApiError::Invalid { field, reason } = c.peer_add("carol", ME).await.unwrap_err() else {
+        panic!("expected Invalid");
+    };
+    assert_eq!(
+        (field.as_str(), reason.as_str()),
+        ("station_id", "is this station's own id")
+    );
+    assert!(matches!(
+        c.peer_add("-bad", "STATION-B").await.unwrap_err(),
+        ApiError::Invalid { field, .. } if field == "name"
+    ));
+    assert!(matches!(
+        c.peer_add("carol", "STATION-B").await.unwrap_err(),
+        ApiError::StationTaken { .. }
+    ));
+}
+
+#[tokio::test]
+async fn send_checks_the_peer_before_the_body() {
+    let (_fake, c) = with_peers().await;
+    assert_eq!(
+        c.send("carol", "").await.unwrap_err(),
+        ApiError::PeerNotFound {
+            name: "carol".into()
+        }
+    );
+    assert_eq!(invalid_field(c.send("bob", "").await.unwrap_err()), "body");
+}
+
+// Test hooks: restart, fixed clock, failing calls, held subscribes.
+
+#[tokio::test]
+async fn restart_is_a_new_instance_that_keeps_the_peer_book() {
+    let (fake, c) = with_peers().await;
+    fake.set_link("bob", "STATION-B", Link::Direct).unwrap();
+    fake.receive("bob", "x").unwrap();
+    let mut events = c.subscribe().await.unwrap();
+    fake.stop();
+    fake.restart("INSTANCE-2");
+    assert_eq!(events.next().await, None);
+    let status = c.status().await.unwrap();
+    assert_eq!(status.instance_id, "INSTANCE-2");
+    assert!(c.log(None, None, 10).await.unwrap().messages.is_empty());
+    assert_eq!(fake.receive("bob", "y").unwrap().seq, 1);
+    let peers = c.peers().await.unwrap();
+    assert_eq!(peers.len(), 2);
+    assert!(
+        peers
+            .iter()
+            .all(|p| p.stations.iter().all(|s| s.link == Link::Down))
+    );
+}
+
+#[tokio::test]
+async fn set_now_ms_fixes_the_time_of_new_messages() {
+    let (fake, c) = with_peers().await;
+    let before = fake.receive("bob", "x").unwrap();
+    assert!(before.at_ms > 1_700_000_000_000);
+    fake.set_now_ms(1_767_225_600_000);
+    assert_eq!(fake.receive("bob", "x").unwrap().at_ms, 1_767_225_600_000);
+    assert_eq!(c.send("bob", "x").await.unwrap().at_ms, 1_767_225_600_000);
+    // The outcome changes the message, not its time.
+    let delivered = c.message(3).await.unwrap();
+    assert_eq!((delivered.rev, delivered.at_ms), (1, 1_767_225_600_000));
+    fake.set_now_ms(5);
+    assert_eq!(fake.receive("bob", "x").unwrap().at_ms, 5);
+    // Earlier messages keep their time.
+    assert_eq!(c.message(1).await.unwrap().at_ms, before.at_ms);
+}
+
+#[tokio::test]
+async fn fail_calls_answers_every_call_with_the_error_but_not_subscriptions() {
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let error = ApiError::Disconnected {
+        detail: "test".into(),
+    };
+    fake.fail_calls(Some(error.clone()));
+    assert_eq!(c.status().await.unwrap_err(), error);
+    assert_eq!(c.log(None, None, 10).await.unwrap_err(), error);
+    assert_eq!(c.send("bob", "x").await.unwrap_err(), error);
+    // Recorded, and nothing happened.
+    assert_eq!(
+        fake.requests().last(),
+        Some(&Request::Send {
+            peer: "bob".into(),
+            body: "x".into()
+        })
+    );
+    assert!(fake.messages().is_empty());
+    // Subscriptions are not affected.
+    let mut second = c.subscribe().await.unwrap();
+    let got = fake.receive("bob", "x").unwrap();
+    assert_eq!(
+        events.next().await,
+        Some(Event::Message {
+            message: got.clone()
+        })
+    );
+    assert_eq!(second.next().await, Some(Event::Message { message: got }));
+    fake.fail_calls(None);
+    assert!(c.status().await.is_ok());
+}
+
+#[tokio::test]
+async fn hold_subscribes_keeps_subscribe_from_registering_until_released() {
+    let fake = station();
+    fake.hold_subscribes(true);
+    let c = client(&fake);
+    let mut subscribe = std::pin::pin!(c.subscribe());
+    assert!(poll_once(subscribe.as_mut()).is_none());
+    assert_eq!(fake.held_subscribes(), 1);
+    assert_eq!(fake.subscriber_count(), 0);
+    fake.wait_for_held_subscribes(1).await;
+    fake.hold_subscribes(false);
+    let events = subscribe.await.unwrap();
+    assert_eq!(fake.held_subscribes(), 0);
+    assert_eq!(fake.subscriber_count(), 1);
+    drop(events);
+    // A held subscribe that is dropped is no longer counted.
+    fake.hold_subscribes(true);
+    assert!(poll_once(c.subscribe()).is_none());
+    assert_eq!(fake.held_subscribes(), 0);
+}
+
+// The receipt window (rule 8).
+
+#[tokio::test]
+async fn a_duplicate_inside_the_receipt_window_is_dropped() {
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let first = fake
+        .receive_with_id("bob", "ID-A", "once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fake.receive_with_id("bob", "ID-A", "again").unwrap(), None);
+    assert_eq!(fake.messages(), vec![first.clone()]);
+    assert_eq!(queued(&mut events), vec![Event::Message { message: first }]);
+    // The same id from another peer is another message.
+    let other = fake
+        .receive_with_id("alice", "ID-A", "hi")
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.seq, 2);
+}
+
+#[tokio::test]
+async fn after_receipt_window_newer_messages_an_id_is_accepted_again() {
+    let (fake, _c) = with_peers().await;
+    // The window does not follow the log's capacity.
+    let fake = fake.with_log_capacity(5);
+    fake.receive_with_id("bob", "ID-A", "x").unwrap().unwrap();
+    for i in 0..RECEIPT_WINDOW - 1 {
+        fake.receive_with_id("alice", &format!("OTHER-{i}"), "x")
+            .unwrap()
+            .unwrap();
+    }
+    // Still inside the window, although it left the log long ago.
+    assert_eq!(fake.receive_with_id("bob", "ID-A", "x").unwrap(), None);
+    fake.receive_with_id("alice", "ONE-MORE", "x")
+        .unwrap()
+        .unwrap();
+    let again = fake.receive_with_id("bob", "ID-A", "x").unwrap().unwrap();
+    assert_eq!(again.seq, RECEIPT_WINDOW as u64 + 2);
+}
+
+#[tokio::test]
+async fn a_duplicate_does_not_extend_the_receipt_window() {
+    let (fake, _c) = with_peers().await;
+    fake.receive_with_id("bob", "ID-A", "x").unwrap().unwrap();
+    for i in 0..RECEIPT_WINDOW - 1 {
+        fake.receive_with_id("bob", &format!("OTHER-{i}"), "x")
+            .unwrap()
+            .unwrap();
+    }
+    // A duplicate in between: dropped, and A keeps its place as the oldest.
+    assert_eq!(fake.receive_with_id("bob", "ID-A", "x").unwrap(), None);
+    fake.receive_with_id("bob", "NEW", "x").unwrap().unwrap();
+    assert!(fake.receive_with_id("bob", "ID-A", "x").unwrap().is_some());
+    // The duplicate of an id still inside the window is still dropped.
+    assert_eq!(fake.receive_with_id("bob", "NEW", "x").unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_restart_forgets_the_receipt_window() {
+    let (fake, _c) = with_peers().await;
+    fake.receive_with_id("bob", "ID-A", "x").unwrap().unwrap();
+    fake.restart("INSTANCE-2");
+    assert!(fake.receive_with_id("bob", "ID-A", "x").unwrap().is_some());
+}
+
+#[test]
+fn the_receipt_window_is_pinned() {
+    assert_eq!(RECEIPT_WINDOW, 1000);
 }

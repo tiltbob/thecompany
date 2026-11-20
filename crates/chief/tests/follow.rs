@@ -182,11 +182,15 @@ async fn a_resync_reads_back_no_further_than_what_is_shown() {
     let logs: Vec<Request> = fake.requests()[before..].to_vec();
     assert_eq!(
         logs,
-        vec![Request::Log {
-            peer: None,
-            before: None,
-            limit: LOG_PAGE_MAX_MESSAGES
-        }]
+        vec![
+            Request::Status,
+            Request::Log {
+                peer: None,
+                before: None,
+                limit: LOG_PAGE_MAX_MESSAGES
+            },
+            Request::Status
+        ]
     );
 }
 
@@ -370,4 +374,231 @@ async fn a_failed_resync_returns_the_error_and_is_tried_again() {
     gated.fail_logs.store(1, Ordering::SeqCst);
     assert!(matches!(f.next().await, Err(ApiError::Disconnected { .. })));
     assert_eq!(ready(&mut f), added(1..=SUBSCRIPTION_CAPACITY as u64 + 1));
+}
+
+// The end of a follower (rules 1 and 11).
+
+#[tokio::test]
+async fn a_resync_then_a_stop_ends_the_follower() {
+    let fake = fake_with_peers();
+    let c = Client::new(fake.clone());
+    let mut f = c.follow_log(None, 10).await.unwrap();
+    receive_n(&fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+    fake.stop();
+    // At most one error first, then the end, for good.
+    let first = f.next().await;
+    if first.is_err() {
+        assert_eq!(f.next().await, Ok(None));
+    } else {
+        assert_eq!(first, Ok(None));
+    }
+    assert_eq!(f.next().await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_failed_reread_returns_the_error_once_and_ends_when_the_subscription_has() {
+    let fake = fake_with_peers();
+    let c = Client::new(fake.clone());
+    let mut f = c.follow_log(None, 10).await.unwrap();
+    receive_n(&fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+    let error = ApiError::Disconnected {
+        detail: "test".into(),
+    };
+    fake.fail_calls(Some(error.clone()));
+    assert_eq!(f.next().await, Err(error));
+    fake.stop();
+    assert_eq!(f.next().await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+/// Events from one fake, calls to another that a test can switch: a station that restarted while
+/// the subscription has not noticed yet.
+#[derive(Clone)]
+struct Switch {
+    events_from: FakeStation,
+    calls_to: Arc<std::sync::Mutex<FakeStation>>,
+}
+
+impl Switch {
+    fn switch_to(&self, fake: &FakeStation) {
+        *self.calls_to.lock().unwrap() = fake.clone();
+    }
+}
+
+impl Transport for Switch {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        let fake = self.calls_to.lock().unwrap().clone();
+        fake.call(request).await
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.events_from.subscribe().await
+    }
+}
+
+/// An old instance with 3 messages, and a new one with 40 that a `Switch` can move the calls to.
+fn old_and_new() -> (FakeStation, FakeStation, Switch) {
+    let old = fake_with_peers();
+    receive_n(&old, "bob", 3);
+    let new = FakeStation::new("STATION-A", "INSTANCE-2");
+    let c = Client::new(new.clone());
+    assert!(poll_once(c.peer_add("bob", "STATION-B")).unwrap().is_ok());
+    receive_n(&new, "bob", 40);
+    let switch = Switch {
+        events_from: old.clone(),
+        calls_to: Arc::new(std::sync::Mutex::new(old.clone())),
+    };
+    (old, new, switch)
+}
+
+#[tokio::test]
+async fn a_reread_that_finds_a_new_instance_first_yields_nothing_and_ends() {
+    let (old, new, switch) = old_and_new();
+    let c = Client::new(switch.clone());
+    let mut f = c.follow_log(None, 10).await.unwrap();
+    assert_eq!(ready(&mut f), added(1..=3));
+    receive_n(&old, "bob", SUBSCRIPTION_CAPACITY + 1);
+    switch.switch_to(&new);
+    assert_eq!(f.next().await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+    // It asked the new instance for its status and nothing else.
+    assert_eq!(new.requests().last(), Some(&Request::Status));
+    assert!(
+        !new.requests()
+            .iter()
+            .any(|r| matches!(r, Request::Log { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_reread_that_finds_a_new_instance_after_its_pages_applies_nothing_and_ends() {
+    let (old, new, switch) = old_and_new();
+    let c = Client::new(switch.clone());
+    let mut f = c.follow_log(None, 10).await.unwrap();
+    assert_eq!(ready(&mut f), added(1..=3));
+    receive_n(&old, "bob", SUBSCRIPTION_CAPACITY + 1);
+    // The station restarts while the re-read pages the old instance.
+    let to_new = switch.clone();
+    let new_one = new.clone();
+    old.on_call(move |_, request| {
+        if matches!(request, Request::Log { .. }) {
+            to_new.switch_to(&new_one);
+        }
+    });
+    assert_eq!(f.next().await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_restart_while_attaching_is_disconnected() {
+    for tail in [10, 0] {
+        let fake = fake_with_peers();
+        receive_n(&fake, "bob", 3);
+        fake.on_call(|fake, request| {
+            if matches!(request, Request::Log { .. }) {
+                fake.clear_on_call();
+                fake.restart("INSTANCE-2");
+            }
+        });
+        let c = Client::new(fake.clone());
+        assert!(
+            matches!(
+                c.follow_log(None, tail).await,
+                Err(ApiError::Disconnected { detail }) if detail.contains("restarted")
+            ),
+            "tail {tail}"
+        );
+    }
+}
+
+// A re-read that is cancelled after every call goes on where it stopped.
+
+/// Every call is pending once before it is made, so a future of `next()` that is polled twice and
+/// dropped has made exactly one call.
+#[derive(Clone)]
+struct Stepwise(FakeStation);
+
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+impl Transport for Stepwise {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        YieldOnce(false).await;
+        self.0.call(request).await
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.0.subscribe().await
+    }
+}
+
+/// A fake whose log of 300 messages of 16 KiB needs about ten pages to re-read.
+fn big_log_after_attach() -> FakeStation {
+    let fake = fake_with_peers();
+    fake.set_now_ms(1_767_225_600_000);
+    fake
+}
+
+fn overflow_with_big_messages(fake: &FakeStation) {
+    let body = "x".repeat(BODY_MAX_BYTES);
+    for _ in 0..300 {
+        fake.receive("bob", &body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_reread_cancelled_after_every_call_goes_on_where_it_stopped() {
+    // Uninterrupted.
+    let fake = big_log_after_attach();
+    let c = Client::new(Stepwise(fake.clone()));
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    overflow_with_big_messages(&fake);
+    let start = fake.requests().len();
+    let mut whole = Vec::new();
+    while whole.len() < 300 {
+        whole.push(f.next().await.unwrap().unwrap());
+    }
+    let whole_calls = fake.requests()[start..].to_vec();
+    let logs = whole_calls
+        .iter()
+        .filter(|r| matches!(r, Request::Log { .. }))
+        .count();
+    assert!(logs >= 5, "{logs}");
+    assert_eq!(whole_calls.len(), logs + 2);
+
+    // Cancelled after every call that completes.
+    let fake = big_log_after_attach();
+    let c = Client::new(Stepwise(fake.clone()));
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    overflow_with_big_messages(&fake);
+    let start = fake.requests().len();
+    let mut cancelled = Vec::new();
+    let mut futures = 0;
+    while cancelled.len() < 300 {
+        futures += 1;
+        assert!(futures < 2_000, "the re-read never finishes");
+        let mut next = std::pin::pin!(tokio::task::unconstrained(f.next()));
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..2 {
+            if let Poll::Ready(update) = next.as_mut().poll(&mut cx) {
+                cancelled.push(update.unwrap().unwrap());
+                break;
+            }
+        }
+    }
+    assert_eq!(fake.requests()[start..].to_vec(), whole_calls);
+    assert_eq!(cancelled, whole);
 }
