@@ -88,12 +88,13 @@
 //!    [`MessageStatus::Delivered`] (a station of the peer acknowledged it), or
 //!    [`MessageStatus::Failed`] with [`FailReason::NoAnswer`] (no answer before the send
 //!    deadline), [`FailReason::Refused`] (a station of the peer refused it) or
-//!    [`FailReason::PeerRemoved`] (the peer was removed first). The station always pushes that one
-//!    event, with the whole message at rev 1 and its final status, also when the message has left
-//!    the log meanwhile (rule 1; only when 1,000 newer messages entered the log first); the log then
-//!    no longer holds it, and [`Request::Message`] for its `seq` gives
-//!    [`ApiError::MessageNotFound`]. A final status never changes. A client accepts a final status
-//!    already in the answer to `Send`.
+//!    [`FailReason::PeerRemoved`] (the peer was removed first). While the station keeps running, it
+//!    always pushes that one event, with the whole message at rev 1 and its final status, also when
+//!    the message has left the log meanwhile (rule 1; only when 1,000 newer messages entered the log
+//!    first); the log then no longer holds it, and [`Request::Message`] for its `seq` gives
+//!    [`ApiError::MessageNotFound`]. If the station stops first, its subscriptions end (rule 11)
+//!    and no outcome is promised for a send that was still `Sending`. A final status never changes.
+//!    A client accepts a final status already in the answer to `Send`.
 //! 8. **Incoming messages.** The station logs a message from a peer as [`Direction::Incoming`] with
 //!    [`MessageStatus::Received`] and rev 0, with [`Message::at_ms`] set to the time it arrived, and
 //!    pushes its event. It refuses, and does not log, a message whose id does not have the form of
