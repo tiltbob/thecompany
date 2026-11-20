@@ -429,4 +429,59 @@ mod tests {
         let error = Args::try_parse_from(["tower", "serve"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
+
+    /// The systemd unit in `packaging/systemd/`, as shipped.
+    const UNIT: &str = include_str!("../../../packaging/systemd/numbers-tower.service");
+
+    /// The values of every `key=` line in the unit, with surrounding white space trimmed.
+    /// Comment lines start with `#` or `;`.
+    fn unit_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
+        unit.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.starts_with(';'))
+            .filter_map(|line| line.split_once('='))
+            .filter(|(name, _)| name.trim() == key)
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    /// The unit's `ExecStart` is a command line this binary accepts. The unit uses no quoting,
+    /// escapes or specifiers, so splitting on white space is what systemd does with it.
+    #[test]
+    fn the_systemd_units_exec_start_parses() {
+        let exec_start = unit_values(UNIT, "ExecStart");
+        assert_eq!(exec_start.len(), 1, "exactly one ExecStart line");
+        let argv: Vec<&str> = exec_start[0].split_whitespace().collect();
+        assert!(
+            argv.iter().all(|arg| !arg.contains(['"', '\'', '%', '\\'])),
+            "no quoting, escapes or specifiers: {argv:?}"
+        );
+        let program = Path::new(argv[0]);
+        assert!(program.is_absolute(), "{program:?}");
+        assert_eq!(program.file_name().unwrap(), "tower");
+        let args = Args::try_parse_from(&argv)
+            .unwrap_or_else(|error| panic!("the unit's ExecStart does not parse: {error}"));
+        let Some(Command::Serve { config }) = args.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(config, Path::new("/etc/numbers-tower/tower.toml"));
+    }
+
+    /// The directives the binary depends on are in the unit, once each.
+    #[test]
+    fn the_systemd_unit_has_what_the_binary_needs() {
+        let has = |key: &str, value: &str| {
+            assert_eq!(unit_values(UNIT, key), vec![value], "{key}={value}");
+        };
+        // The ACME cache lives under the state directory, and the tower refuses a cache that
+        // the group or others can access.
+        has("StateDirectory", "numbers-tower");
+        has("StateDirectoryMode", "0700");
+        // The binary exits with a failure when its relay stops by itself and with success on
+        // SIGTERM: the first is restarted, a stop is not.
+        has("Restart", "on-failure");
+        // The default listeners are on ports 80 and 443, and the dynamic user is not root.
+        has("AmbientCapabilities", "CAP_NET_BIND_SERVICE");
+        has("CapabilityBoundingSet", "CAP_NET_BIND_SERVICE");
+    }
 }
