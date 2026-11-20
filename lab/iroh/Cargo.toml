@@ -1,0 +1,30 @@
+[workspace]
+
+[package]
+name = "iroh-lab"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+# Exactly as docs/ARCHITECTURE.md prescribes. Never iroh/test-utils.
+iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
+# Lab only: the dev tower. `server` implies tls-ring and metrics.
+iroh-relay = { version = "1.5", default-features = false, features = ["server"] }
+n0-future = "0.3"
+n0-error = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+
+[features]
+# Compiles the snippets exactly as written in docs/notes/iroh-snippets.md (expected to fail).
+verbatim = []
