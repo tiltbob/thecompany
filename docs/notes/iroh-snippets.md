@@ -1,10 +1,9 @@
 # iroh snippets for M1 (and M2)
 
-> **Not compiled.** These snippets were read from the published sources of **iroh 1.5.0**,
-> **iroh-relay 1.5.0** and **n0-dns-resolver 0.1.1** by design reviewers, and each finding was checked
-> by a second reviewer; where it was corrected, the corrected version is written here. Nothing was
-> built or run, so expect small fixes (imports, argument types). The summary is the appendix of
-> [../ARCHITECTURE.md](../ARCHITECTURE.md); this file is the code behind it.
+These snippets are source references for **iroh 1.5.0**, **iroh-relay 1.5.0** and
+**n0-dns-resolver 0.1.1**. The corresponding M1 tower, endpoint and gate implementations under
+`crates/` are built and tested over loopback. See the appendix of
+[../ARCHITECTURE.md](../ARCHITECTURE.md) for the summary.
 
 ## 1. Cargo dependencies and features
 Libraries take iroh without default features (`portmapper`, `metrics`, and `fast-apple-datapath`,
@@ -15,6 +14,7 @@ not exist and `bind()` fails with `InvalidCryptoProvider`. Stack MSRV is 1.91.
 iroh       = { version = "1.5", default-features = false, features = ["tls-ring"] }
 iroh-relay = { version = "1.5", default-features = false, features = ["tls-ring"] } # review had none; `server` implies it
 n0-future  = "0.3"   # BoxStream for the AddressLookup
+url        = "2"     # explicit tower URL validation
 n0-error   = "1"     # e! macro for AcceptError
 n0-dns-resolver = { version = "0.1", default-features = false }   # M2 (SRV)
 
@@ -57,7 +57,7 @@ waits out the 3 s QAD probe timeout, so home-tower choice and `online()` take ~3
 `TowerSet` carries a QAD setting per tower instead:
 ```rust
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
-// RelayQuicConfig: used this way in iroh's src/test_utils.rs; import path not recorded.
+use iroh_relay::RelayQuicConfig;
 
 /// One entry per tower: canonical URL and QAD port. None = no QAD (every http:// tower);
 /// a bare https:// URL defaults to 7842 (RelayQuicConfig::default()).
@@ -76,67 +76,73 @@ random ports, or a tower with UDP 7842 blocked, needs the port per tower. Withou
 no public address, so the M1 dev tower gives direct paths only on one host or LAN. Tests must not
 touch the network, so switch off only the captive-portal check:
 ```rust
-// NetReportConfig: iroh-1.5.0 src/net_report.rs; the Builder method that takes it was not recorded.
+use iroh::endpoint::NetReportConfig;
 let mut net_report = NetReportConfig::default();
 net_report.captive_portal_check = false; // no GET http://<tower-host>/generate_204 on port 80
-// NOT NetReportConfig::minimal(): it also sets https_probes = false. With no QAD the HTTPS probe is
-// the only latency source, so no home tower is ever chosen and online() never resolves.
+let builder = builder.net_report_config(net_report);
 ```
+
+`NetReportConfig::minimal()` disables the latency probes as well. Without QAD, that
+prevents the endpoint from selecting a home tower and `online()` keeps waiting.
 
 ## 4. TowerLookup
 Answering every `EndpointId` with the tower URLs makes `ep.connect(id, ALPN)` work with no pkarr or
 DNS: it runs on each connect while no path is selected, and the QUIC Initial goes to every tower.
 Keep it even though our dials could pass an `EndpointAddr`: crates that dial by bare id need one.
 ```rust
-use std::sync::Arc;
-use iroh::{EndpointId, RelayUrl, TransportAddr};
+use iroh::{EndpointId, RelayMap, TransportAddr};
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use n0_future::{StreamExt, boxed::BoxStream, stream};
-#[derive(Debug, Clone)]
-pub struct TowerLookup {
-    relays: Arc<[RelayUrl]>, // the same canonical list the RelayMap is built from
+struct TowerLookup {
+    relays: RelayMap, // cloned from the map given to RelayMode::Custom
 }
 
+// TowerLookup's Debug implementation omits relay URLs.
 impl AddressLookup for TowerLookup {
     // publish(): default no-op; the tower routes by id.
     fn resolve(&self, id: EndpointId) -> Option<BoxStream<Result<Item, Error>>> {
-        if self.relays.is_empty() {
+        let urls: Vec<_> = self.relays.urls();
+        if urls.is_empty() {
             return None;
         }
-        let data = EndpointData::from_iter(self.relays.iter().cloned().map(TransportAddr::Relay));
+        let data: EndpointData = urls.into_iter().map(TransportAddr::Relay).collect();
         let item = Item::new(EndpointInfo::from_parts(id, data), "tower", None);
         Some(stream::once(Ok(item)).boxed())
     }
 }
 ```
 
-When the set changes at runtime (M2), hold a clone of the shared `RelayMap` instead (its state is
-behind an `Arc`, so `insert_relay` / `remove_relay` show up). The lookup always answers, so a dial to
-an offline peer fails by timeout, never `NoAddress`. With several towers all are tried in parallel
+The lookup holds a clone of the shared `RelayMap`, so when the set changes at runtime (M2),
+`insert_relay` and `remove_relay` also update it. With a tower configured, the lookup always
+answers and a dial to an offline peer fails by timeout. With several towers all are tried in parallel
 and the callee answers over its home relay (current behaviour, not a contract): every node needs the
 same set, SRV priority/weight are ignored, and each extra tower is one dead path per connection
 (budget 8). Keep two or three; canonicalise URLs once, since `RelayUrl` equality is textual.
 
 ## 5. Building the endpoint
-`presets::Minimal` adds no n0 relays or lookup, only the crypto provider. Pass no ALPNs when a
-`Router` is used (section 7). The key reaches the library as bytes, never as a path.
+`presets::Minimal` configures a per-endpoint crypto provider. Pass no ALPNs when a `Router`
+is used (section 7). The station passes key bytes to `numbers::Endpoint::bind`.
 ```rust
 use std::net::Ipv4Addr;
-use iroh::{Endpoint, RelayMap, RelayMode, endpoint::{PortmapperConfig, presets}};
-let mut builder = Endpoint::builder(presets::Minimal)
+use iroh::{Endpoint, RelayMap, RelayMode, endpoint::{PortmapperConfig, QuicTransportConfig, presets}};
+use numbers::IpTransport;
+let builder = Endpoint::builder(presets::Minimal)
     .secret_key(secret)                             // iroh SecretKey from the 32 key bytes
     .relay_mode(relay_mode(&towers))                // or RelayMode::Custom(RelayMap::empty())
-    .address_lookup(lookup.clone())                 // section 4
-    .hooks(Gate { auth: auth.clone() })             // section 6
-    .portmapper_config(PortmapperConfig::Disabled); // no UPnP/PCP/NAT-PMP; exported without the feature
-if cfg.loopback_only {
-    // tests: default binds 0.0.0.0 and [::] and advertises LAN addresses; "all on 127.0.0.1" also
-    // needs port mapping and the captive-portal check off (bind_addr's return type not recorded)
-    builder = builder.bind_addr((Ipv4Addr::LOCALHOST, 0));
-}
-if cfg.relay_only {
-    builder = builder.clear_ip_transports(); // no UDP sockets, no QAD, no direct; online() still works
-}
+    .address_lookup(lookup)                         // section 4
+    .hooks(Gate { authorizer: authorizer.clone() }) // section 6
+    .net_report_config(net_report)                 // section 3
+    .portmapper_config(PortmapperConfig::Disabled)  // no UPnP/PCP/NAT-PMP
+    .transport_config(QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(16u32.into())
+        .max_concurrent_uni_streams(0u32.into())
+        .build());
+let builder = match cfg.ip_transport {
+    IpTransport::Default => builder,
+    // Clear both default bind addresses first so no IPv6 wildcard socket remains.
+    IpTransport::LoopbackOnly => builder.clear_ip_transports().bind_addr((Ipv4Addr::LOCALHOST, 0))?,
+    IpTransport::RelayOnly => builder.clear_ip_transports(), // no IP paths or QAD
+};
 let ep = builder.bind().await?;
 ```
 
@@ -144,28 +150,27 @@ let ep = builder.bind().await?;
   RelayMap"); the endpoint comes online once `ep.insert_relay(..)` adds a tower (upstream test
   `test_endpoint_online_add_relay`, which contradicts the doc comment saying a relay is required);
   `ep.remove_relay(..)` drops one. This is how `Station::start` returns without the network.
-- Stream caps: noq defaults to 100 bidi + 100 uni; lower with `QuicTransportConfig::builder()
-  .max_concurrent_bidi_streams(..).max_concurrent_uni_streams(..)` (Builder hook not recorded). No 0-RTT.
+- noq defaults to 100 incoming bidirectional and 100 incoming unidirectional streams. M1 uses
+  the smaller caps above. Protocol handlers use fully handshaken connections.
 - The default DNS resolver falls back to Cloudflare, Google and Quad9; to avoid that:
   `.dns_resolver(DnsResolver::builder().with_system_defaults().disable_fallback().build())`.
 
 ## 6. The gate
-The pre-handshake filter is the only thing that limits what a stranger learns; the `after_handshake`
-hook is the one authorization point for every ALPN, both directions. Both consult the `Authorizer`.
+The pre-handshake filter limits what a stranger learns. The `after_handshake` hook authorizes
+every ALPN in both directions. Both consult the same `Authorizer`. Use
+`numbers::Endpoint::router_builder()` to install the incoming filter when building the router.
 ```rust
 use std::sync::Arc;
 use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, Incoming, IncomingAddr};
 use iroh::protocol::{IncomingFilterOutcome, Router};
 
-pub const LINK_ALPN: &[u8] = b"numbers/0";
-pub const CLOSE_NOT_ALLOWED: u32 = 403; // reviews used 1 and 403; define all close codes in `numbers`
+use numbers::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
+
 #[derive(Debug)]
-struct Gate { auth: Arc<Authorizer> } // our type; must NOT hold an Endpoint (reference cycle)
+struct Gate { authorizer: Arc<Authorizer> } // keep endpoint handles out of the hook
 impl EndpointHooks for Gate {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
-        // Gate member-only ALPNs; numbers/join/0 (M3) goes to its own invite check. Shape from upstream
-        // examples/auth-hook.rs (`conn.alpn() == ALPN || ..`); alpn()'s return type not recorded.
-        if conn.alpn() != LINK_ALPN || self.auth.contains(&conn.remote_id()) {
+        if self.authorizer.authorize(&conn.remote_id(), Protocol::Alpn(conn.alpn())).is_some() {
             AfterHandshakeOutcome::Accept
         } else {
             AfterHandshakeOutcome::Reject { error_code: CLOSE_NOT_ALLOWED.into(), reason: Vec::new() }
@@ -173,21 +178,22 @@ impl EndpointHooks for Gate {
     }
 }
 
-let auth_f = auth.clone();
+// The actual filter has access to the authorizer's private membership check.
 let router = Router::builder(ep)
     .incoming_filter(Arc::new(move |inc: &Incoming| match inc.remote_addr() {
-        IncomingAddr::Relay { endpoint_id, .. } if !auth_f.contains(&endpoint_id) => {
-            IncomingFilterOutcome::Ignore // no answer at all
+        IncomingAddr::Relay { endpoint_id, .. } if knows_peer(&endpoint_id) => {
+            IncomingFilterOutcome::Accept
         }
         IncomingAddr::Ip(_) if !inc.remote_addr_validated() => IncomingFilterOutcome::Retry,
-        _ => IncomingFilterOutcome::Accept,
+        IncomingAddr::Ip(_) => IncomingFilterOutcome::Accept,
+        _ => IncomingFilterOutcome::Ignore,
     }))
-    .accept(LINK_ALPN, link)
+    .accept(alpn, link)
     .spawn();
 ```
 
-- **ALPN-aware (correction):** the hook runs for dialed and accepted connections alike, so an M3
-  roster gate on every ALPN would refuse the invitee, and the inviter on the invitee's side.
+- The hook requires a configured ALPN and known peer on dialed and accepted connections.
+  M3's invite-only protocol will need its own authorization policy.
 - **Hook limits:** TLS accepts any client key, and iroh registers the connection (queues the
   station's LAN, public and port-mapped candidates, honours REACH_OUT probes) before the hook runs.
 - **Filter limits:** a relayed packet's source id is what the tower says, so a hostile tower (or SRV
