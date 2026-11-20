@@ -18,6 +18,18 @@
 //!    [`Event`] per frame until the subscription ends, and then closes. The client sends nothing
 //!    more on a subscription; it closes the connection to end it.
 //!
+//! # The client keeps its write half open
+//!
+//! After [`wire::Open`] the client sends nothing, and the server takes the end of the client's
+//! stream (as well as a read error or any further byte) as the client leaving, also while the
+//! station is still working on the call or on opening the subscription. It then stops waiting for
+//! the station, drops the call or subscription and closes without an answer. A client therefore
+//! keeps its write half open until it has read its [`wire::Reply`] (on a subscription, for as long
+//! as it wants events); one that shuts its write half down after `Open` may get no answer. A call
+//! whose answer never arrived may still have been carried out (rule 12 in [`crate::api`]).
+//! [`SocketTransport`] never shuts down its write half: it closes the whole connection, by
+//! dropping it, only when it is done with it.
+//!
 //! Unix only.
 
 use crate::api::{API_VERSION, ApiError, Event, Request, Response};
@@ -63,7 +75,9 @@ pub mod wire {
         pub instance_id: String,
     }
 
-    /// The second frame, from the client: what this connection is for.
+    /// The second frame, from the client: what this connection is for. It is the client's last
+    /// frame; the client keeps its write half open until it has its answer (see "The client keeps
+    /// its write half open" in [`crate::socket`]).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum Open {

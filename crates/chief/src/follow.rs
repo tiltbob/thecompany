@@ -1,11 +1,15 @@
 //! Following the message log: the attach order of rule 3 in [`crate::api`], written once for every
 //! frontend that shows the log live (the CLI's `chat`, later the GUI).
 //!
-//! [`Client::follow_log`] subscribes first, then pages the newest messages, then follows live
-//! events, and drops what it has already shown (rule 2). [`LogFollower::next`] yields each message
-//! once as [`LogUpdate::Added`], and again as [`LogUpdate::Changed`] only when it changed (a higher
-//! `rev`). On [`Event::Resync`] it re-reads the log as far back as it shows and yields what it
-//! missed.
+//! [`Client::follow_log`] reads the station's instance, subscribes, pages the newest messages and
+//! reads the instance again; then it follows live events, and drops what it has already shown
+//! (rule 2). [`LogFollower::next`] yields each message once as [`LogUpdate::Added`], and again as
+//! [`LogUpdate::Changed`] only when it changed (a higher `rev`).
+//!
+//! On [`Event::Resync`] the follower re-reads the log as far back as it shows and yields what it
+//! missed. It keeps reading the subscription while the re-read's calls are pending: an end of the
+//! subscription ends the follower at once, a new `Resync` starts the re-read again, and live
+//! messages wait behind the re-read, so that nothing it recovers is yielded after something newer.
 //!
 //! A follower belongs to one instance of the station (rule 1 in [`crate::api`]): it remembers the
 //! instance it attached to, and ends when the subscription ends or a re-read finds another
@@ -14,12 +18,13 @@
 use crate::api::{ApiError, Event, LOG_PAGE_MAX_MESSAGES, LogPage, Message};
 use crate::client::{Client, Subscription, Transport};
 use std::collections::{BTreeMap, VecDeque};
+use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::task::{Context, Poll, Waker};
+use std::task::Poll;
 
 /// How many messages a [`LogFollower`] remembers (by `seq` and `rev`). When it holds more, it
 /// forgets the oldest and never shows a message that old again. Well above the station's log of
-/// 1,000.
+/// 1,000. Also the most live messages it holds back while a re-read is pending.
 pub const FOLLOW_MEMORY: usize = 4096;
 
 /// One change to the log as a follower shows it.
@@ -42,6 +47,10 @@ impl LogUpdate {
 
 /// Follows the log of one station instance: the backlog, then live changes. Made by
 /// [`Client::follow_log`].
+///
+/// After an [`Event::Resync`] it re-reads the log while it keeps reading the subscription. Live
+/// messages that arrive meanwhile are held back, at most [`FOLLOW_MEMORY`] of them, and yielded
+/// after what the re-read recovers. See [`LogFollower::next`].
 #[derive(Debug)]
 pub struct LogFollower<'a, T> {
     client: &'a Client<T>,
@@ -57,6 +66,9 @@ pub struct LogFollower<'a, T> {
     queue: VecDeque<LogUpdate>,
     /// A re-read after [`Event::Resync`] that has not finished, with what it has read so far.
     reread: Option<Reread>,
+    /// Live messages in scope that arrived while `reread` is pending, in arrival order, at most
+    /// [`FOLLOW_MEMORY`]. Offered after the re-read's messages; empty when no re-read is pending.
+    held: VecDeque<Message>,
     /// The subscription ended, or the station is another instance now. Final.
     ended: bool,
 }
@@ -138,21 +150,28 @@ impl ReadBack {
 }
 
 impl<T: Transport> Client<T> {
-    /// Subscribes, then reads the newest `tail` messages (of `peer`, or of everyone), then follows
-    /// live changes: the attach order of rule 3 in [`crate::api`].
+    /// Reads the station's instance, subscribes, reads the newest `tail` messages (of `peer`, or
+    /// of everyone) and reads the instance again; then follows live changes. This is the attach
+    /// order of rule 3 in [`crate::api`], with the subscribe and the pages bracketed by two
+    /// [`Client::status`] calls.
     ///
     /// It pages with [`Client::log`] until it holds `tail` messages or the log is exhausted (a page
-    /// may be shorter than asked). With `tail` 0 it shows only messages that enter the log from
-    /// now on. It reads [`Client::status`] after subscribing and again after the pages; if the
-    /// station restarted in between, it fails with [`ApiError::Disconnected`]. Errors of the
+    /// may be shorter than asked). With `tail` 0 it reads one page of `limit: 0` to learn where
+    /// the log ends, and shows only messages that enter the log from then on.
+    ///
+    /// If the two instance ids differ, it fails with [`ApiError::Disconnected`]. Two equal ids are
+    /// enough to know that the subscription and every page come from that one instance: an
+    /// instance id names one start of the station and never comes back, and one socket (or one
+    /// in-process station) serves one instance at a time. So when the same instance answered
+    /// before and after, it answered everything in between, the subscribe included. Errors of the
     /// subscription and of the calls are passed through.
     pub async fn follow_log(
         &self,
         peer: Option<&str>,
         tail: u32,
     ) -> Result<LogFollower<'_, T>, ApiError> {
-        let events = self.subscribe().await?;
         let instance = self.status().await?.instance_id;
+        let events = self.subscribe().await?;
         let (backlog, floor) = if tail == 0 {
             // A page of `limit: 0` reports where the log ends (rule 6): everything from there on
             // is new. With no matching message, everything is.
@@ -185,6 +204,7 @@ impl<T: Transport> Client<T> {
             floor,
             queue: VecDeque::new(),
             reread: None,
+            held: VecDeque::new(),
             ended: false,
         };
         for message in backlog {
@@ -199,20 +219,37 @@ impl<T: Transport> LogFollower<'_, T> {
     /// updates. `Ok(None)` once the follower has ended, and on every later call.
     ///
     /// Events for other peers (with a `peer` filter), peer and status events, and messages already
-    /// shown at the same or a higher `rev` are skipped. After [`Event::Resync`] it re-reads the log
-    /// from the newest message back to the oldest one it shows and yields, oldest first, every
-    /// message that is new or changed.
+    /// shown at the same or a higher `rev` are skipped.
     ///
-    /// The follower ends when its subscription ends (rule 11), also while a re-read is pending:
-    /// before each step of a re-read it takes what the subscription has ready, and an ended
-    /// subscription drops the re-read. It also ends, applying nothing, when a re-read finds another
-    /// instance of the station before its first page or after its last (rule 1). An error of a
-    /// re-read's call is returned once; the next call looks at the subscription again and then
-    /// goes on with the re-read.
+    /// After [`Event::Resync`] it re-reads the log: it checks the instance, reads pages from the
+    /// newest message back to the oldest one it shows, and checks the instance again. Each of
+    /// these calls races the subscription, which is polled first every time:
     ///
-    /// Cancel-safe: updates not yet yielded stay queued in the follower, and a re-read keeps the
-    /// pages it has read, so after a cancelled call it goes on from the next page. Only a call
-    /// that was in flight when the future was dropped is made again.
+    /// - The subscription ends: the follower ends at once, and this returns `Ok(None)` even if the
+    ///   call never completes (rule 11). What the re-read read and what it held back are dropped.
+    /// - Another `Resync`: the re-read starts again from the beginning. The pages it read and the
+    ///   live messages it held back are dropped: pages read before this gap may miss changes made
+    ///   in it, and the new re-read covers what was held back.
+    /// - A live message (of the follower's peer, if it has one, and not older than what it shows):
+    ///   it is held back, and the call goes on; a stream of messages neither drops the call nor
+    ///   makes it again. If [`FOLLOW_MEMORY`] messages are held already, they and this one are
+    ///   dropped and the re-read starts again, which covers them.
+    /// - Peer and status events, and messages out of scope, are skipped, and the call goes on.
+    ///
+    /// Nothing the re-read read and nothing held back is yielded before its last check has passed.
+    /// Then it yields, oldest first, every recovered message that is new or changed, and after
+    /// them the held-back messages in arrival order, again only those new or changed. A `Resync`
+    /// or an end that is ready when the last call completes still wins, since the subscription is
+    /// polled first. If either check finds another instance of the station (rule 1), the follower
+    /// ends and applies nothing. An error of a re-read's call is returned once; the re-read keeps
+    /// what it has read and held back, and the next call races the subscription again and goes on
+    /// with the re-read. Updates queued before a gap was noticed are older than it, and are
+    /// yielded before the re-read goes on.
+    ///
+    /// Cancel-safe: updates not yet yielded stay queued in the follower, a message taken from the
+    /// subscription is held back or queued in the same poll, and a re-read keeps the pages it has
+    /// read, so after a cancelled call it goes on from the next page. Only the call that was in
+    /// flight when the future was dropped is made again.
     pub async fn next(&mut self) -> Result<Option<LogUpdate>, ApiError> {
         loop {
             if let Some(update) = self.queue.pop_front() {
@@ -222,11 +259,6 @@ impl<T: Transport> LogFollower<'_, T> {
                 return Ok(None);
             }
             if self.reread.is_some() {
-                // What the subscription has ready comes first: above all its end.
-                if let Poll::Ready(event) = self.ready_event() {
-                    self.apply(event);
-                    continue;
-                }
                 self.continue_reread().await?;
                 continue;
             }
@@ -241,74 +273,94 @@ impl<T: Transport> LogFollower<'_, T> {
         self.peer.as_deref()
     }
 
-    /// The next event if the subscription has one ready, without waiting. Dropping the unfinished
-    /// `next()` loses nothing: it is cancel-safe.
-    fn ready_event(&mut self) -> Poll<Option<Event>> {
-        let mut cx = Context::from_waker(Waker::noop());
-        pin!(self.events.next()).poll(&mut cx)
-    }
-
+    /// Applies an event read while no re-read is pending.
     fn apply(&mut self, event: Option<Event>) {
         match event {
             None => self.end(),
-            // A re-read in progress started before this gap, and pages it has read already may miss
-            // changes made in the gap: start over.
-            Some(Event::Resync) => {
-                self.reread = Some(Reread {
-                    checked: false,
-                    pages: ReadBack::new(FOLLOW_MEMORY, Some(self.floor)),
-                });
-            }
+            Some(Event::Resync) => self.start_reread(),
             Some(Event::Message { message }) => self.offer(message),
             Some(Event::Peer { .. } | Event::PeerRemoved { .. } | Event::Status { .. }) => {}
         }
+    }
+
+    /// Starts a re-read from the beginning, also over one in progress: pages that one has read
+    /// and messages it has held back may miss changes made in the latest gap.
+    fn start_reread(&mut self) {
+        self.reread = Some(Reread {
+            checked: false,
+            pages: ReadBack::new(FOLLOW_MEMORY, Some(self.floor)),
+        });
+        self.held.clear();
     }
 
     /// The follower is over: the subscription ended or the station is another instance now.
     fn end(&mut self) {
         self.ended = true;
         self.reread = None;
+        self.held = VecDeque::new();
     }
 
-    /// Goes on with the pending re-read: the instance check, the remaining pages, the instance
-    /// check again, and then queues what is new or changed. Progress is kept after every completed
-    /// call, and nothing is applied until the last check has passed.
+    /// Makes the next call of the pending re-read, racing the subscription: the instance check,
+    /// the next page, or the final instance check. Progress is kept after every completed call;
+    /// after the final check the re-read's messages are queued, then the held-back ones.
     async fn continue_reread(&mut self) -> Result<(), ApiError> {
+        let Some(reread) = self.reread.as_ref() else {
+            return Ok(());
+        };
         let client = self.client;
-        if self.reread.as_ref().is_some_and(|r| !r.checked) {
-            if client.status().await?.instance_id != self.instance {
-                self.end();
-                return Ok(());
+        let scope = Scope {
+            peer: self.peer.as_deref(),
+            floor: self.floor,
+        };
+        if reread.checked && !reread.pages.done {
+            let (before, limit) = (reread.pages.before, reread.pages.limit());
+            let call = client.log(self.peer.as_deref(), before, limit);
+            match race(&mut self.events, &mut self.held, scope, call).await {
+                Raced::Ended => self.end(),
+                Raced::Gap => self.start_reread(),
+                Raced::Done(page) => {
+                    let page = page?;
+                    if let Some(reread) = self.reread.as_mut() {
+                        reread.pages.take(page);
+                    }
+                }
             }
-            if let Some(reread) = self.reread.as_mut() {
-                reread.checked = true;
-            }
-        }
-        while let Some(pages) = self.reread.as_ref().map(|r| &r.pages)
-            && !pages.done
-        {
-            let (before, limit) = (pages.before, pages.limit());
-            let page = client.log(self.peer.as_deref(), before, limit).await?;
-            if let Some(reread) = self.reread.as_mut() {
-                reread.pages.take(page);
-            }
-        }
-        if client.status().await?.instance_id != self.instance {
-            self.end();
             return Ok(());
         }
+        let last = reread.checked;
+        match race(&mut self.events, &mut self.held, scope, client.status()).await {
+            Raced::Ended => self.end(),
+            Raced::Gap => self.start_reread(),
+            Raced::Done(status) => {
+                if status?.instance_id != self.instance {
+                    self.end();
+                } else if last {
+                    self.finish_reread();
+                } else if let Some(reread) = self.reread.as_mut() {
+                    reread.checked = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The re-read's last check passed: queues what it read, oldest first, then what was held
+    /// back, in arrival order.
+    fn finish_reread(&mut self) {
         if let Some(reread) = self.reread.take() {
             let (messages, _) = reread.pages.finish();
             for message in messages {
                 self.offer(message);
             }
         }
-        Ok(())
+        for message in std::mem::take(&mut self.held) {
+            self.offer(message);
+        }
     }
 
     /// Queues `message` if it is in scope and new, or a higher `rev` of one already shown.
     fn offer(&mut self, message: Message) {
-        if message.seq < self.floor || self.peer.as_deref().is_some_and(|p| p != message.peer) {
+        if !self.scope().contains(&message) {
             return;
         }
         let update = match self.seen.get(&message.seq) {
@@ -324,5 +376,85 @@ impl<T: Transport> LogFollower<'_, T> {
             }
         }
         self.queue.push_back(update);
+    }
+
+    fn scope(&self) -> Scope<'_> {
+        Scope {
+            peer: self.peer.as_deref(),
+            floor: self.floor,
+        }
+    }
+}
+
+/// Which messages a follower shows: those of its peer (if it has one) at or above its floor.
+#[derive(Debug, Clone, Copy)]
+struct Scope<'p> {
+    peer: Option<&'p str>,
+    floor: u64,
+}
+
+impl Scope<'_> {
+    fn contains(&self, message: &Message) -> bool {
+        message.seq >= self.floor && self.peer.is_none_or(|p| p == message.peer)
+    }
+}
+
+/// How a call of a re-read that raced the subscription ended.
+enum Raced<O> {
+    /// The call completed first.
+    Done(O),
+    /// The subscription ended.
+    Ended,
+    /// A new gap: an [`Event::Resync`], or more live messages than may be held back.
+    Gap,
+}
+
+/// What one poll of the race produced.
+enum Won<O> {
+    Event(Option<Event>),
+    Call(O),
+}
+
+/// Runs `call` while reading `events`, polling the subscription first every time. Live messages
+/// in `scope` are pushed to `held` in the poll that takes them, and the one `call` goes on. Returns
+/// when the call completes, the subscription ends, a `Resync` arrives, or a message arrives while
+/// `held` is full. Cancel-safe: a dropped race has taken from the subscription only what is in
+/// `held`.
+async fn race<F: Future>(
+    events: &mut Subscription,
+    held: &mut VecDeque<Message>,
+    scope: Scope<'_>,
+    call: F,
+) -> Raced<F::Output> {
+    let mut call = pin!(call);
+    loop {
+        let won = {
+            // Kept across polls until it resolves, so its wake-up is never lost; dropped only when
+            // it or the call is ready, or when the race is dropped (it is cancel-safe).
+            let mut event = pin!(events.next());
+            poll_fn(|cx| {
+                if let Poll::Ready(event) = event.as_mut().poll(cx) {
+                    return Poll::Ready(Won::Event(event));
+                }
+                call.as_mut().poll(cx).map(Won::Call)
+            })
+            .await
+        };
+        match won {
+            Won::Call(output) => return Raced::Done(output),
+            Won::Event(None) => return Raced::Ended,
+            Won::Event(Some(Event::Resync)) => return Raced::Gap,
+            Won::Event(Some(Event::Message { message })) => {
+                if scope.contains(&message) {
+                    if held.len() >= FOLLOW_MEMORY {
+                        return Raced::Gap;
+                    }
+                    held.push_back(message);
+                }
+            }
+            Won::Event(Some(
+                Event::Peer { .. } | Event::PeerRemoved { .. } | Event::Status { .. },
+            )) => {}
+        }
     }
 }

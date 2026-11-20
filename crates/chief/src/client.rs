@@ -38,6 +38,9 @@ pub trait Transport: Send + Sync + 'static {
     /// failure ([`ApiError::NotRunning`], [`ApiError::IncompatibleApi`],
     /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`], and from the
     /// socket transport [`ApiError::BadRequest`] for a request too large for one frame).
+    ///
+    /// Dropping the future does not take the request back: the station may still carry it out, as
+    /// after a lost answer (rule 12 in [`crate::api`]).
     fn call(&self, request: Request) -> impl Future<Output = Result<Response, ApiError>> + Send;
 
     /// Opens a subscription to live events from now on; earlier events are not replayed.
@@ -374,9 +377,10 @@ impl<T: Transport> Client<T> {
     /// a subscription that ends first. Other errors of the calls are passed through.
     ///
     /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
-    /// [`crate::api`]). In the one remaining corner, a [`Event::Resync`] that hides that event for a
-    /// message that has left the log, the re-read gives [`ApiError::MessageNotFound`], which is
-    /// returned.
+    /// [`crate::api`]), and an outcome that arrives as an event is returned. But every
+    /// [`Event::Resync`] makes it re-read the message, and once the message has left the log that
+    /// re-read gives [`ApiError::MessageNotFound`], which is returned: whether or not the gap hid
+    /// the outcome's event, and also when the outcome has not happened yet.
     ///
     /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
     /// call in a timeout.

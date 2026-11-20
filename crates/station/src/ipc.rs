@@ -26,6 +26,34 @@
 //! its own task: the transport's [`chief::client::EventSink::push`] never waits, so the station
 //! goes on, and the subscriber gets [`chief::api::Event::Resync`] once its queue overflowed.
 //!
+//! # A client that goes away
+//!
+//! After the `Open` frame the client sends nothing more. From then on the server watches the read
+//! half: the end of the client's stream, a read error or a stray byte all mean that the client has
+//! left, also while the station is still working on the call or on opening the subscription. The
+//! server then drops the pending `call` or `subscribe` future of the [`Transport`], closes the
+//! connection and frees its slot. It puts no deadline on the station: a client that stays waits as
+//! long as the station takes.
+//!
+//! Dropping the future means only that the server stops waiting for the answer. Whether the request
+//! was carried out is the transport's business: a station finishes a change it has already
+//! accepted, whether or not anyone still waits for its answer. The client never saw an answer and
+//! must treat the call as one that may have been carried out (rule 12 in [`chief::api`]). A
+//! subscription that was being opened
+//! leaves no registration behind: its [`Subscription`] is dropped with the future, or, if the
+//! station had already registered it, when writing `Reply::Subscribed` fails or as soon as the
+//! forwarding of its events sees the client gone.
+//!
+//! A client must therefore keep its write half open until it has read its answer (on a
+//! subscription, as long as it wants events). One that shuts its write half down after `Open` is
+//! treated as gone and may get no answer.
+//!
+//! # Going down
+//!
+//! See [`IpcServer`]: the server's own task stops accepting, waits until every connection has
+//! ended, removes the socket file and releases the socket lock last, whether the server was shut
+//! down or dropped.
+//!
 //! Unix only. Emits no logs.
 
 use chief::API_VERSION;
@@ -70,7 +98,8 @@ pub struct IpcConfig {
     /// an open subscription: a subscriber that does not read gets `Resync` instead. Default 5 s.
     pub frame_timeout: Duration,
     /// How many connections the server serves at a time (at least 1). Further clients wait in the
-    /// listen backlog until one ends. Every open subscription holds one. Default 64.
+    /// listen backlog until one ends. Every open subscription holds one, and so does every call
+    /// until the station answers it or its client goes away. Default 64.
     pub max_connections: usize,
 }
 
@@ -197,21 +226,39 @@ impl std::error::Error for IpcError {
     }
 }
 
-/// A running socket server. [`IpcServer::shutdown`] stops it and removes the socket file.
+/// A running socket server.
 ///
-/// Dropping it without `shutdown` also stops serving, but leaves the socket file behind; the next
-/// [`IpcServer::bind`] replaces it. The accept loop is aborted, which happens on the runtime soon
-/// after the drop rather than within it: the listener is closed first, then every connection is
-/// aborted, then the socket lock is released. Until then a new `bind` on the same path fails with
-/// [`IpcError::InUse`].
+/// # Going down
+///
+/// The server's own task takes it down, in this order: it stops accepting and closes the listener;
+/// it aborts every connection and waits until each connection task has finished; it removes the
+/// socket file if it is still the one this server bound (same device and inode); and it releases
+/// the socket lock last. So a client that sees its connection end can no longer reach this server,
+/// and a new server can take the socket only once no connection of this one is left.
+///
+/// - [`IpcServer::shutdown`] starts this and waits for it. When it returns, the socket is free:
+///   awaiting it is the way to know that.
+/// - Dropping the server starts the same teardown and does not wait for it; the task finishes on
+///   the runtime after the drop. Until it has, a [`IpcServer::bind`] on the same path fails with
+///   [`IpcError::InUse`], which is the right answer while this server is still going down.
+/// - If the runtime itself shuts down before the task has finished, the task is cancelled instead.
+///   Its resources then drop in order: the listener is closed, every connection task is aborted
+///   (nothing waits for them), and the socket lock is released. The socket file is left behind (the
+///   next `bind` replaces it), and if the process exits, the kernel releases the lock with the lock
+///   file's descriptor.
+///
+/// An aborted connection task ends at the await it is waiting on: for the station's answer, for a
+/// frame to be read or written, or for the next event. Every one of them can be cancelled, so the
+/// teardown does not wait for the station or for a client. Only a transport whose `call` or
+/// `subscribe` future blocks while it is dropped (or polled) holds the teardown up, for as long as
+/// it blocks.
 #[derive(Debug)]
 pub struct IpcServer {
     path: PathBuf,
-    /// The socket file's device and inode, so that shutdown removes only the file it bound.
-    identity: (u64, u64),
+    /// Tells the task to go down; dropping it does too.
     stop: Option<oneshot::Sender<()>>,
-    /// The accept loop; it hands back the socket lock when it ends on [`IpcServer::shutdown`].
-    task: Option<JoinHandle<Option<File>>>,
+    /// The task that accepts connections and, at the end, takes the server down.
+    task: Option<JoinHandle<()>>,
 }
 
 impl IpcServer {
@@ -309,10 +356,18 @@ impl IpcServer {
             },
             euid: rustix::process::geteuid().as_raw(),
         });
-        let task = tokio::spawn(accept_loop(listener, lock, shared, stopped));
+        let serving = Serving {
+            listener,
+            connections: JoinSet::new(),
+            lock,
+        };
+        let socket = SocketFile {
+            path: path.clone(),
+            identity,
+        };
+        let task = tokio::spawn(run(serving, socket, shared, stopped));
         Ok(IpcServer {
             path,
-            identity,
             stop: Some(stop),
             task: Some(task),
         })
@@ -323,34 +378,32 @@ impl IpcServer {
         &self.path
     }
 
-    /// Stops accepting, ends every connection (open subscriptions end as for a station that
-    /// stopped: rule 11), removes the socket file if it is still the one this server bound, and
-    /// then releases the socket lock.
+    /// Takes the server down (see "Going down" on [`IpcServer`]) and waits until it is down: it
+    /// stops accepting, ends every connection and waits for each (open subscriptions end as for a
+    /// station that stopped: rule 11), removes the socket file if it is still the one this server
+    /// bound, and then releases the socket lock. When this returns, a new server can bind the path.
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        // The accept loop ends its connections before it returns the lock; if it panicked, there
-        // is nothing left to stop, and the lock went with it.
-        let lock = match self.task.take() {
-            Some(task) => task.await.ok().flatten(),
-            None => None,
-        };
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
-            && metadata.file_type().is_socket()
-            && (metadata.dev(), metadata.ino()) == self.identity
-        {
-            let _ = std::fs::remove_file(&self.path);
+        // If the task panicked, its resources were dropped in order as it unwound: there is
+        // nothing left to wait for.
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
         }
-        drop(lock);
     }
 }
 
+/// Starts the same teardown as [`IpcServer::shutdown`] without waiting for it: the server's task
+/// finishes it on the runtime, and releases the socket lock only after every connection task has
+/// finished. The task is not aborted, so that order holds.
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
+        // Dropping the handle detaches the task; it goes on to the end of its teardown.
+        drop(self.task.take());
     }
 }
 
@@ -423,32 +476,50 @@ fn remove_leftover(path: &Path) -> Result<(), IpcError> {
     }
 }
 
-/// The accept loop's resources. Fields drop in declaration order, so when the loop is aborted
-/// (the [`IpcServer`] was dropped) the listener is closed before the connections are aborted, and
-/// the socket lock is released last: a client that sees its connection end can no longer reach
-/// this server, and a new server can lock the socket only once this one stopped listening.
+/// The server task's resources.
+///
+/// [`run`] takes them apart in order and waits for the connections. This struct's drop order is
+/// the fallback for a task that is cancelled instead (the runtime shuts down) or panics: fields
+/// drop in declaration order, so the listener is closed before the connection tasks are aborted
+/// (nothing waits for them then), and the socket lock is released last. A client that sees its
+/// connection end can no longer reach this server, and a new server can lock the socket only once
+/// this one stopped listening.
 struct Serving {
     listener: UnixListener,
     connections: JoinSet<()>,
     lock: File,
 }
 
-/// Accepts connections, at most `max_connections` at a time, until `stopped` fires (or the sender
-/// is dropped); then closes the listener, aborts every connection task and waits for them.
-/// Returns the socket lock, still held, so that [`IpcServer::shutdown`] releases it only after it
-/// removed the socket file.
-async fn accept_loop<T: Transport>(
-    listener: UnixListener,
-    lock: File,
+/// The socket file this server bound.
+struct SocketFile {
+    path: PathBuf,
+    /// The file's device and inode, so that only the file this server bound is removed.
+    identity: (u64, u64),
+}
+
+impl SocketFile {
+    /// Removes the socket file if it is still the one this server bound.
+    fn remove_if_ours(&self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && (metadata.dev(), metadata.ino()) == self.identity
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The server's task: accepts connections, at most `max_connections` at a time, until `stopped`
+/// fires or its sender is dropped. Then takes the server down, in this order: closes the listener,
+/// aborts every connection task and waits until each has finished, removes the socket file if it
+/// is still the one this server bound, and releases the socket lock.
+async fn run<T: Transport>(
+    mut serving: Serving,
+    socket: SocketFile,
     shared: Arc<Shared<T>>,
     mut stopped: oneshot::Receiver<()>,
-) -> Option<File> {
+) {
     let slots = Arc::new(Semaphore::new(shared.config.max_connections));
-    let mut serving = Serving {
-        listener,
-        connections: JoinSet::new(),
-        lock,
-    };
     loop {
         tokio::select! {
             biased;
@@ -473,19 +544,25 @@ async fn accept_loop<T: Transport>(
             }
         }
     }
-    let Serving {
-        listener,
-        mut connections,
-        lock,
-    } = serving;
-    drop(listener);
-    connections.shutdown().await;
-    Some(lock)
+    // Taken apart field by field: if the task is cancelled at the await, the fields still in
+    // `serving` drop in its declaration order, the lock last.
+    drop(serving.listener);
+    serving.connections.shutdown().await;
+    socket.remove_if_ours();
+    drop(serving.lock);
 }
 
 /// Serves one connection: the uid check, the hello, then one call or one subscription. Every
 /// failure ends this connection only. Every frame of a call, in either direction, must pass within
 /// the frame timeout; the events of a subscription have no deadline.
+///
+/// While the station works on the call or on opening the subscription, the client may leave
+/// ("A client that goes away" in the module docs): [`until_gone`] then drops the pending future,
+/// and this returns, which closes the connection and frees its slot. There is no deadline on the
+/// station itself. The window after `subscribe` returned is covered as well: if the client left,
+/// writing `Reply::Subscribed` fails or [`forward`] sees it at once, and the subscription is
+/// dropped either way. Before `Open` the frame timeout and the end of the stream bound every read
+/// and write.
 async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
     match stream.peer_cred() {
         Ok(cred) if cred.uid() == shared.euid => {}
@@ -512,14 +589,18 @@ async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
         read_frame(&mut stream, LOCAL_FRAME_MAX, Some(timeout)).await;
     match open {
         Ok(Open::Call { request }) => {
-            let reply = match shared.transport.call(request).await {
+            let Some(answer) = until_gone(&mut stream, shared.transport.call(request)).await else {
+                return;
+            };
+            let reply = match answer {
                 Ok(response) => Reply::Ok { response },
                 Err(error) => Reply::Err { error },
             };
             let _ = write_reply(&mut stream, &reply, timeout).await;
         }
-        Ok(Open::Subscribe) => match shared.transport.subscribe().await {
-            Ok(events) => {
+        Ok(Open::Subscribe) => match until_gone(&mut stream, shared.transport.subscribe()).await {
+            None => {}
+            Some(Ok(events)) => {
                 if write_reply(&mut stream, &Reply::Subscribed, timeout)
                     .await
                     .is_ok()
@@ -527,7 +608,7 @@ async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
                     forward(stream, events).await;
                 }
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 let _ = write_reply(&mut stream, &Reply::Err { error }, timeout).await;
             }
         },
@@ -538,6 +619,23 @@ async fn serve<T: Transport>(shared: &Shared<T>, mut stream: UnixStream) {
             let _ = write_reply(&mut stream, &Reply::Err { error }, timeout).await;
         }
         Err(_) => {}
+    }
+}
+
+/// Runs `work` (the station's `call` or `subscribe`) until it finishes or the client leaves, and
+/// gives `None` if the client left; `work` is then dropped unfinished.
+///
+/// The client sends nothing after `Open`, so the read half is watched as [`forward`] watches it:
+/// the end of the stream, a read error and a stray byte (a protocol violation) all mean that the
+/// client is gone. A client that shut down only its write half counts as gone too. If both happen
+/// at once, the answer wins, so a call the station has answered is still written. `read` into a
+/// buffer is cancel-safe, and no frame is ever read here.
+async fn until_gone<F: Future>(stream: &mut UnixStream, work: F) -> Option<F::Output> {
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        biased;
+        output = work => Some(output),
+        _ = stream.read(&mut probe) => None,
     }
 }
 
