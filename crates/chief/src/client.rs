@@ -373,6 +373,11 @@ impl<T: Transport> Client<T> {
     /// restarted and the `seq` names another message: that gives [`ApiError::Disconnected`], as does
     /// a subscription that ends first. Other errors of the calls are passed through.
     ///
+    /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
+    /// [`crate::api`]). In the one remaining corner, a [`Event::Resync`] that hides that event for a
+    /// message that has left the log, the re-read gives [`ApiError::MessageNotFound`], which is
+    /// returned.
+    ///
     /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
     /// call in a timeout.
     pub async fn send_and_wait(&self, peer: &str, body: &str) -> Result<Message, ApiError> {

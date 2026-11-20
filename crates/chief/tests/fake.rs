@@ -798,3 +798,81 @@ async fn a_restart_forgets_the_receipt_window() {
 fn the_receipt_window_is_pinned() {
     assert_eq!(RECEIPT_WINDOW, 1000);
 }
+
+// The outcome of a send that has left the log (rule 7).
+
+/// Every `Event::Message` for `seq` queued on `events` right now.
+fn events_for(events: &mut Subscription, seq: u64) -> Vec<Message> {
+    queued(events)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Message { message } if message.seq == seq => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_evicted_held_send_still_gets_its_one_final_event() {
+    let (fake, c) = with_peers().await;
+    let fake = fake.with_log_capacity(2);
+    fake.set_outcome(SendOutcome::Hold);
+    let held = c.send("bob", "held").await.unwrap();
+    for _ in 0..2 {
+        fake.receive("bob", "newer").unwrap();
+    }
+    assert!(fake.messages().iter().all(|m| m.seq != held.seq));
+    let mut events = c.subscribe().await.unwrap();
+    let done = fake.resolve(held.seq, MessageStatus::Delivered).unwrap();
+    let expected = Message {
+        rev: 1,
+        status: MessageStatus::Delivered,
+        ..held.clone()
+    };
+    assert_eq!(done, expected);
+    assert_eq!(events_for(&mut events, held.seq), vec![expected]);
+    assert_eq!(
+        c.message(held.seq).await.unwrap_err(),
+        ApiError::MessageNotFound { seq: held.seq }
+    );
+    assert!(fake.messages().iter().all(|m| m.seq != held.seq));
+    // Final now: resolving it again is refused, as for any seq that is not a held message.
+    assert_eq!(
+        fake.resolve(held.seq, MessageStatus::Delivered)
+            .unwrap_err(),
+        ApiError::MessageNotFound { seq: held.seq }
+    );
+}
+
+#[tokio::test]
+async fn removing_a_peer_fails_its_evicted_pending_send_with_one_event() {
+    let (fake, c) = with_peers().await;
+    let fake = fake.with_log_capacity(2);
+    fake.set_outcome(SendOutcome::Hold);
+    let held = c.send("bob", "held").await.unwrap();
+    for _ in 0..2 {
+        fake.receive("alice", "newer").unwrap();
+    }
+    assert!(fake.messages().iter().all(|m| m.seq != held.seq));
+    let mut events = c.subscribe().await.unwrap();
+    c.peer_remove("bob").await.unwrap();
+    let failed = Message {
+        rev: 1,
+        status: MessageStatus::Failed {
+            reason: FailReason::PeerRemoved,
+        },
+        ..held.clone()
+    };
+    assert_eq!(
+        queued(&mut events),
+        vec![
+            Event::Message { message: failed },
+            Event::PeerRemoved { name: "bob".into() }
+        ]
+    );
+    assert_eq!(
+        c.message(held.seq).await.unwrap_err(),
+        ApiError::MessageNotFound { seq: held.seq }
+    );
+    assert!(fake.messages().iter().all(|m| m.seq != held.seq));
+}

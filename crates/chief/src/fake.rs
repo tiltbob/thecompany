@@ -79,6 +79,9 @@ struct State {
     sinks: Vec<Arc<EventSink>>,
     requests: Vec<Request>,
     stopped: bool,
+    /// Every outgoing message that is still `Sending`, by `seq`, kept apart from the log so that
+    /// its outcome is pushed even after the log has evicted it (rule 7).
+    pending: BTreeMap<u64, Message>,
     /// The newest [`RECEIPT_WINDOW`] accepted incoming messages, by peer and id, oldest first
     /// (rule 8). Independent of the log's capacity.
     receipts: VecDeque<(String, String)>,
@@ -127,6 +130,7 @@ impl FakeStation {
             sinks: Vec::new(),
             requests: Vec::new(),
             stopped: false,
+            pending: BTreeMap::new(),
             receipts: VecDeque::new(),
             now_ms: None,
             fail_calls: None,
@@ -253,9 +257,11 @@ impl FakeStation {
     }
 
     /// Gives a held outgoing message its final status (`Delivered` or `Failed`): rev 1 and its
-    /// event (rule 7). Fails with [`ApiError::MessageNotFound`] when the `seq` is not in the log,
-    /// and with [`ApiError::Invalid`] when the message is not an outgoing one still `Sending`
-    /// (field `seq`) or `status` is not a final outgoing status (field `status`).
+    /// event (rule 7), also when the log has evicted the message meanwhile (the log then stays as
+    /// it is). Fails with [`ApiError::Invalid`] when `status` is not a final outgoing status (field
+    /// `status`), or when the `seq` is in the log but is not an outgoing message still `Sending`
+    /// (field `seq`); and with [`ApiError::MessageNotFound`] for any other `seq` that is not a
+    /// held message.
     pub fn resolve(&self, seq: u64, status: MessageStatus) -> Result<Message, ApiError> {
         if !matches!(
             status,
@@ -285,6 +291,7 @@ impl FakeStation {
         state.status.instance_id = instance_id.into();
         state.sinks.clear();
         state.log.clear();
+        state.pending.clear();
         state.receipts.clear();
         state.next_seq = 1;
         state.stopped = false;
@@ -571,23 +578,22 @@ impl State {
         message
     }
 
-    /// Moves an outgoing message that is still `Sending` to `status`, with the next rev and its
-    /// event.
+    /// Moves an outgoing message that is still `Sending` to `status`, with the next rev, and pushes
+    /// its event, whether or not the log still holds it (rule 7). The log's entry is updated only
+    /// if it is still there.
     fn finish(&mut self, seq: u64, status: MessageStatus) -> Result<Message, ApiError> {
-        let message = self
-            .log
-            .iter_mut()
-            .find(|m| m.seq == seq)
-            .ok_or(ApiError::MessageNotFound { seq })?;
-        if message.direction != Direction::Outgoing || message.status != MessageStatus::Sending {
-            return Err(invalid(
-                "seq",
-                "is not an outgoing message that is still sending",
-            ));
-        }
+        let Some(mut message) = self.pending.remove(&seq) else {
+            return Err(if self.log.iter().any(|m| m.seq == seq) {
+                invalid("seq", "is not an outgoing message that is still sending")
+            } else {
+                ApiError::MessageNotFound { seq }
+            });
+        };
         message.status = status;
         message.rev += 1;
-        let message = message.clone();
+        if let Some(entry) = self.log.iter_mut().find(|m| m.seq == seq) {
+            *entry = message.clone();
+        }
         self.emit(&Event::Message {
             message: message.clone(),
         });
@@ -637,14 +643,11 @@ impl State {
         if !self.peers.contains_key(&name) {
             return Err(ApiError::PeerNotFound { name });
         }
+        // In the log or evicted from it: every send to this peer that is still `Sending`.
         let pending: Vec<u64> = self
-            .log
-            .iter()
-            .filter(|m| {
-                m.peer == name
-                    && m.direction == Direction::Outgoing
-                    && m.status == MessageStatus::Sending
-            })
+            .pending
+            .values()
+            .filter(|m| m.peer == name)
             .map(|m| m.seq)
             .collect();
         for seq in pending {
@@ -675,17 +678,14 @@ impl State {
         }
         let id = self.new_id();
         let message = self.append(&peer, id, Direction::Outgoing, body, MessageStatus::Sending);
+        self.pending.insert(message.seq, message.clone());
         let outcome = match self.outcome {
             SendOutcome::Deliver => Some(MessageStatus::Delivered),
             SendOutcome::Fail(reason) => Some(MessageStatus::Failed { reason }),
             SendOutcome::Hold => None,
         };
         if let Some(status) = outcome {
-            // A capacity of 1 can evict the message before its outcome; then there is nothing to
-            // change, as for a real station.
-            if self.log.iter().any(|m| m.seq == message.seq) {
-                self.finish(message.seq, status)?;
-            }
+            self.finish(message.seq, status)?;
         }
         Ok(Response::Message { message })
     }
