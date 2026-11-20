@@ -1378,6 +1378,65 @@ async fn a_send_never_polled_when_the_chat_ends_counts_as_not_sent() {
     .await;
 }
 
+/// An input that hands over `last` (no newline), then one zero-length read for its end, and
+/// panics if it is read again: a terminal does not repeat its end of input, so the chat must
+/// remember it.
+struct EndsOnce {
+    last: Option<Vec<u8>>,
+    ended: bool,
+}
+
+impl EndsOnce {
+    fn new(last: &[u8]) -> Self {
+        Self {
+            last: Some(last.to_vec()).filter(|l| !l.is_empty()),
+            ended: false,
+        }
+    }
+}
+
+impl AsyncRead for EndsOnce {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(mut last) = self.last.take() {
+            let n = last.len().min(buf.remaining());
+            buf.put_slice(&last[..n]);
+            last.drain(..n);
+            self.last = Some(last).filter(|l| !l.is_empty());
+            return Poll::Ready(Ok(()));
+        }
+        assert!(!self.ended, "the chat read the input again after its end");
+        self.ended = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn the_end_of_the_input_is_read_once() {
+    bounded(async {
+        let long = "x".repeat(BODY_MAX_BYTES + 1);
+        let cases: [(&[u8], Exit, String, &[&str]); 4] = [
+            (b"last", Exit::Done, String::new(), &["last"]),
+            (long.as_bytes(), Exit::Failed, too_long(), &[]),
+            (b"not \xff utf-8", Exit::Failed, NOT_UTF8.to_owned(), &[]),
+            (b"", Exit::Done, String::new(), &[]),
+        ];
+        for (i, (last, exit, err, sent)) in cases.into_iter().enumerate() {
+            let fake = fake_with_peers().await;
+            let c = Client::new(fake.clone());
+            let command = parse(&["chat", "bob"]);
+            let (session, _out, e) = chat_on(&c, &command, EndsOnce::new(last));
+            assert_eq!(session.await, exit, "case {i}");
+            assert_eq!(e.text(), err, "case {i}");
+            assert_eq!(sends(&fake), sent, "case {i}");
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn one_carriage_return_at_the_end_of_a_line_is_dropped() {
     bounded(async {

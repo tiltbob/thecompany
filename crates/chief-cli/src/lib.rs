@@ -101,10 +101,11 @@
 //!
 //! End of input ends `chat` once the line being sent and the lines still waiting have been sent
 //! (each bounded by the transport's call timeout); what the station shows meanwhile is still
-//! printed. The exit is then 0 if the station accepted every line that was sent, and no line was
-//! too long or not UTF-8, and the input did not fail; otherwise 1. Blank lines (of at most 16384
-//! bytes) do not count. The outcome of the last message is not waited for (it is in `log`);
-//! `send` is the command that waits for the outcome.
+//! printed. The end of the input is read once, also when it ends a last line without a newline:
+//! the chat does not read the input again after it. The exit is then 0 if the station accepted
+//! every line that was sent, and no line was too long or not UTF-8, and the input did not fail;
+//! otherwise 1. Blank lines (of at most 16384 bytes) do not count. The outcome of the last
+//! message is not waited for (it is in `log`); `send` is the command that waits for the outcome.
 //!
 //! # Output (stable: scripts parse it)
 //!
@@ -263,10 +264,11 @@ pub enum Command {
     /// UTF-8, is not sent: one line on stderr, and the chat goes on; so does a line the station
     /// refuses.
     ///
-    /// End of input (Ctrl-D) ends the chat once the lines typed so far have been sent, without
-    /// waiting for their outcome; `chief send` is the command that waits for it. The exit is then
-    /// 0 if the station accepted every line sent and no line was too long or not UTF-8, and 1 if
-    /// the station refused a line, a line was not sent, or the input could not be read.
+    /// End of input (one Ctrl-D) ends the chat once the lines typed so far have been sent,
+    /// without waiting for their outcome; `chief send` is the command that waits for it. Nothing
+    /// typed after the end of input is read. The exit is then 0 if the station accepted every
+    /// line sent and no line was too long or not UTF-8, and 1 if the station refused a line, a
+    /// line was not sent, or the input could not be read.
     ///
     /// The chat ends with exit 3 when the station stops or restarts. Then stderr also says if the
     /// last line may have been sent (check `chief log <peer>`) and how many typed lines were not
@@ -922,7 +924,7 @@ enum Input {
     TooLong,
     /// A line that is not valid UTF-8.
     NotUtf8,
-    /// The end of the input.
+    /// The end of the input; every call after the first end gives it again without reading.
     End,
     /// The input failed. A line read only in part before is dropped.
     Failed(io::Error),
@@ -940,6 +942,9 @@ struct LineReader<R> {
     line: Vec<u8>,
     /// The line read so far is too long, and is being skipped.
     too_long: bool,
+    /// The input has ended: from now on `next` gives [`Input::End`] without reading it again. A
+    /// terminal does not repeat its end of input, and may take more input after it.
+    ended: bool,
 }
 
 impl<R: AsyncBufRead + Unpin> LineReader<R> {
@@ -948,6 +953,7 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
             input,
             line: Vec::new(),
             too_long: false,
+            ended: false,
         }
     }
 
@@ -960,8 +966,15 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
     /// from polling its other branches; when it comes, everything read so far is in `self`. So a
     /// dropped call loses nothing, and the part of a line read so far stays in `self` for the
     /// next call.
+    ///
+    /// The end of the input is read once. It is remembered in `self` as soon as `fill_buf`
+    /// reports it, before the line it finishes is returned (whether that line is good, too long
+    /// or not UTF-8); every later call returns [`Input::End`] without reading the input again.
     async fn next(&mut self) -> Input {
         loop {
+            if self.ended {
+                return Input::End;
+            }
             let (used, complete) = {
                 let buf = match self.input.fill_buf().await {
                     Ok(buf) => buf,
@@ -972,7 +985,9 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
                     }
                 };
                 if buf.is_empty() {
-                    // The end of the input; the last line may lack its newline.
+                    // The end of the input, remembered before anything else; the last line may
+                    // lack its newline.
+                    self.ended = true;
                     if self.too_long || !self.line.is_empty() {
                         return self.finish();
                     }
