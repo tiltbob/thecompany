@@ -57,9 +57,10 @@
 //! # Limits and errors
 //!
 //! The config file may be at most [`MAX_CONFIG_FILE_SIZE`] (64 KiB) and the allow file at most
-//! [`MAX_ALLOW_FILE_SIZE`] (1 MiB); both must be UTF-8. Every error is a [`ConfigError`]: a
-//! fixed category that names the key, the line where that helps, and which of the two files,
-//! but never a path, a host name, an id or any other value from a file.
+//! [`MAX_ALLOW_FILE_SIZE`] (1 MiB); both must be regular files (symbolic links are followed;
+//! a directory, a device or a FIFO is refused before it is opened) and UTF-8. Every error is a
+//! [`ConfigError`]: a fixed category that names the key, the line where that helps, and which
+//! of the two files, but never a path, a host name, an id or any other value from a file.
 
 use std::fmt;
 use std::fs::File;
@@ -115,6 +116,12 @@ pub enum ConfigError {
         file: ConfigFile,
         /// The kind of I/O error.
         kind: io::ErrorKind,
+    },
+    /// The path names something that is not a regular file, such as a directory, a device or a
+    /// FIFO. It is refused before it is opened: opening or reading such a path can block.
+    NotAFile {
+        /// Which file.
+        file: ConfigFile,
     },
     /// The file is larger than its limit.
     TooLarge {
@@ -184,6 +191,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreadable { file, kind } => write!(f, "cannot read the {file} ({kind})"),
+            Self::NotAFile { file } => write!(f, "the {file} is not a regular file"),
             Self::TooLarge { file } => {
                 let limit = match file {
                     ConfigFile::Config => "64 KiB",
@@ -263,7 +271,10 @@ struct RawRate {
 
 /// Reads the config file at `path`, and the allow file it names, into a [`TowerConfig`].
 ///
-/// Relative paths in the file are resolved against the directory that holds it.
+/// Relative paths in the file are resolved against the directory that holds it. Both paths
+/// must name regular files. This function blocks on file I/O: call it before the async runtime
+/// starts its work, or on its blocking pool (the `tower` binary uses
+/// `tokio::task::spawn_blocking`).
 pub fn load(path: &Path) -> Result<TowerConfig, ConfigError> {
     let text = read_text(path, ConfigFile::Config, MAX_CONFIG_FILE_SIZE)?;
     parse(&text, path.parent().unwrap_or(Path::new("")))
@@ -271,7 +282,8 @@ pub fn load(path: &Path) -> Result<TowerConfig, ConfigError> {
 
 /// Parses config text into a [`TowerConfig`], resolving relative paths against `base_dir`.
 ///
-/// It reads the allow file that the text names, if any; nothing else is read.
+/// It reads the allow file that the text names, if any; nothing else is read. Like [`load`], it
+/// blocks on that read.
 pub fn parse(text: &str, base_dir: &Path) -> Result<TowerConfig, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|error| toml_error(&error, text))?;
     let hostname = raw
@@ -360,20 +372,34 @@ pub fn parse_allow_file(text: &str) -> Result<Vec<String>, ConfigError> {
 }
 
 /// Reads a UTF-8 file of at most `limit` bytes.
+///
+/// The path must name a regular file (a symbolic link to one is followed): `std::fs::metadata`
+/// does not block on a FIFO, while opening one, or reading a terminal or a device, can. The
+/// file is read into a buffer of `limit + 1` bytes allocated up front; a file that fills it is
+/// too large.
 fn read_text(path: &Path, file: ConfigFile, limit: usize) -> Result<String, ConfigError> {
     let unreadable = |error: io::Error| ConfigError::Unreadable {
         file,
         kind: error.kind(),
     };
-    let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(unreadable)?
-        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    if bytes.len() > limit {
-        return Err(ConfigError::TooLarge { file });
+    if !std::fs::metadata(path).map_err(unreadable)?.is_file() {
+        return Err(ConfigError::NotAFile { file });
     }
+    let mut source = File::open(path).map_err(unreadable)?;
+    let mut bytes = vec![0; limit.saturating_add(1)];
+    let mut filled = 0;
+    loop {
+        let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) else {
+            return Err(ConfigError::TooLarge { file });
+        };
+        match source.read(rest) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(unreadable(error)),
+        }
+    }
+    bytes.truncate(filled);
     String::from_utf8(bytes).map_err(|_| ConfigError::NotUtf8 { file })
 }
 
@@ -690,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_unreadable_too_large_and_non_utf8_files_by_kind() {
+    fn reports_unreadable_non_file_too_large_and_non_utf8_files_by_kind() {
         let dir = tempfile::tempdir().unwrap();
         let path = |name: &str| dir.path().join(name);
         assert_eq!(
@@ -707,6 +733,28 @@ mod tests {
                 file: ConfigFile::Config
             }
         );
+        assert_eq!(
+            load(dir.path()).unwrap_err(),
+            ConfigError::NotAFile {
+                file: ConfigFile::Config
+            }
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                load(Path::new("/dev/null")).unwrap_err(),
+                ConfigError::NotAFile {
+                    file: ConfigFile::Config
+                }
+            );
+        }
+        std::fs::create_dir(path("allow.txt")).unwrap();
+        assert_eq!(
+            error(MINIMAL, dir.path()),
+            ConfigError::NotAFile {
+                file: ConfigFile::Allow
+            }
+        );
+        std::fs::remove_dir(path("allow.txt")).unwrap();
         std::fs::write(path("latin1.toml"), b"# caf\xe9\n").unwrap();
         assert_eq!(
             load(&path("latin1.toml")).unwrap_err(),
