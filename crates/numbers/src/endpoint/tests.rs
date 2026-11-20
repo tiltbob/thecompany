@@ -2,17 +2,19 @@ use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, TcpListener};
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
-use iroh::RelayUrl;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, IncomingFilterOutcome, ProtocolHandler};
+use iroh::{RelayUrl, Watcher};
+use iroh_relay::server::{Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig};
 use numbers_tower::{Tower, TowerConfig};
 use tokio::sync::Barrier;
 use tokio::sync::mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel};
 use tokio::task::coop::{consume_budget, has_budget_remaining};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use super::{
     DnsConfig, Endpoint, EndpointBindError, EndpointConfig, IpTransport, TlsRoots, TowerSnapshot,
@@ -150,6 +152,124 @@ async fn an_unchanged_set_keeps_its_config_and_sends_no_notification() {
 }
 
 #[tokio::test]
+async fn cancelling_a_nudge_does_not_make_an_unchanged_set_notify() {
+    let (_listeners, towers) = reserve_towers(1);
+    let endpoint = relay_only(towers.clone()).await;
+    let runtime = &endpoint.runtime;
+    {
+        let mut pending = runtime.tower_updates.lock().await;
+        assert!(
+            poll_without_budget(runtime.apply_tower_update(None, &mut pending))
+                .await
+                .is_pending()
+        );
+        assert!(runtime.relays == towers.relay_map());
+        assert_eq!(
+            poll_without_budget(runtime.apply_tower_update(Some(&towers), &mut pending)).await,
+            Poll::Ready(Ok(())),
+        );
+        assert!(pending.is_none());
+    }
+    endpoint.set_towers(&TowerSet::default()).await.unwrap();
+    {
+        let mut pending = runtime.tower_updates.lock().await;
+        assert_eq!(
+            poll_without_budget(runtime.apply_tower_update(None, &mut pending)).await,
+            Poll::Ready(Ok(())),
+            "an empty map has nothing to nudge",
+        );
+        assert!(pending.is_none());
+    }
+    endpoint.iroh().close().await;
+}
+
+#[derive(Debug)]
+struct RelayAdmits(AtomicBool);
+
+impl AccessControl for RelayAdmits {
+    async fn on_connect(&self, _request: &ClientRequest) -> Access {
+        if self.0.load(Ordering::Relaxed) {
+            Access::Allow
+        } else {
+            Access::Deny {
+                reason: Some("fixture denial".to_owned()),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_home_observer_clears_denial_without_a_status_request() {
+    let access = Arc::new(RelayAdmits(AtomicBool::new(false)));
+    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+    relay.access = access.clone();
+    let mut config = ServerConfig::default();
+    config.relay = Some(relay);
+    let server = Server::spawn(config)
+        .await
+        .expect("start the loopback relay");
+    let towers = TowerSet::from_url(&format!("http://{}", server.http_addr().unwrap())).unwrap();
+    let endpoint = relay_only(towers).await;
+    timeout(Duration::from_secs(45), async {
+        let mut home = endpoint.iroh().home_relay_status();
+        loop {
+            if endpoint.tower_states().unwrap()[0].status == TowerStatus::denied("fixture denial") {
+                break;
+            }
+            home.updated().await.expect("home watcher stays connected");
+        }
+    })
+    .await
+    .expect("observe the initial relay denial");
+
+    // Do not ask for a numbers status until the observer has cleared the remembered denial.
+    access.0.store(true, Ordering::Relaxed);
+    timeout(Duration::from_secs(10), endpoint.iroh().online())
+        .await
+        .expect("the relay admits the endpoint");
+    let cleared = timeout(Duration::from_secs(2), async {
+        while endpoint.runtime.tower_snapshot().home_failure.is_some() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    endpoint.iroh().close().await;
+    server.shutdown().await.expect("stop the loopback relay");
+    assert!(
+        cleared.is_ok(),
+        "a stable connection must clear the remembered denial without a status call"
+    );
+}
+
+#[tokio::test]
+async fn the_home_observer_stops_on_close_and_on_final_runtime_drop() {
+    for explicit_close in [true, false] {
+        let endpoint = relay_only(TowerSet::default()).await;
+        let raw = endpoint.iroh().clone();
+        let observer = endpoint.runtime._tower_observer.abort_handle();
+        let control = endpoint.tower_control();
+        let still_owned = if explicit_close {
+            raw.close().await;
+            Some(endpoint)
+        } else {
+            drop(endpoint);
+            assert!(!raw.is_closed(), "the separate raw clone remains open");
+            None
+        };
+        timeout(Duration::from_secs(2), async {
+            while !observer.is_finished() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the runtime-owned observer stops");
+        assert!(control.tower_states().is_err());
+        drop(still_owned);
+        raw.close().await;
+    }
+}
+
+#[tokio::test]
 async fn interrupted_notifications_are_retried_for_matching_nonempty_and_empty_maps() {
     let (_listeners, full) = reserve_towers(1);
     let empty = TowerSet::default();
@@ -179,8 +299,21 @@ async fn interrupted_notifications_are_retried_for_matching_nonempty_and_empty_m
                     .is_pending()
             );
             assert!(pending.as_ref() == Some(&url));
+            if wanted.is_empty() {
+                assert!(
+                    poll_without_budget(runtime.apply_tower_update(None, &mut pending))
+                        .await
+                        .is_pending(),
+                    "an empty map still replays an interrupted removal notification",
+                );
+                assert!(pending.as_ref() == Some(&url));
+            }
         }
-        endpoint.set_towers(wanted).await.unwrap();
+        if wanted.is_empty() {
+            endpoint.nudge_towers().await.unwrap();
+        } else {
+            endpoint.set_towers(wanted).await.unwrap();
+        }
         assert!(runtime.tower_updates.lock().await.is_none());
         assert!(runtime.relays == wanted.relay_map());
     }
@@ -215,6 +348,19 @@ async fn a_nudge_repairs_the_latest_interrupted_full_replacement() {
         let states = endpoint.tower_states().unwrap();
         assert!(states.iter().map(|state| state.url()).eq(wanted.urls()));
     }
+    endpoint.set_towers(&second).await.unwrap();
+    {
+        let mut pending = runtime.tower_updates.lock().await;
+        assert!(
+            poll_without_budget(runtime.apply_tower_update(Some(&first), &mut pending))
+                .await
+                .is_pending()
+        );
+        assert!(
+            runtime.relays != first.relay_map(),
+            "the nudge has map edits to repair"
+        );
+    }
     endpoint.nudge_towers().await.unwrap();
     assert!(runtime.relays == first.relay_map());
     assert!(runtime.tower_updates.lock().await.is_none());
@@ -233,6 +379,51 @@ async fn a_nudge_repairs_the_latest_interrupted_full_replacement() {
     }
     endpoint.nudge_towers().await.unwrap();
     assert!(runtime.relays == single.relay_map());
+    endpoint.iroh().close().await;
+}
+
+#[tokio::test]
+async fn a_tower_update_keeps_the_lock_while_its_notification_is_pending() {
+    let (_first, first) = reserve_towers(MAX_TOWERS);
+    let (_second, second) = reserve_towers(2);
+    let endpoint = relay_only(TowerSet::default()).await;
+    let runtime = &endpoint.runtime;
+    {
+        let mut pending = runtime.tower_updates.lock().await;
+        assert!(
+            poll_without_budget(runtime.apply_tower_update(Some(&first), &mut pending))
+                .await
+                .is_pending()
+        );
+    }
+
+    let mut nudge = pin!(endpoint.nudge_towers());
+    tokio::task::yield_now().await;
+    // Leave enough cooperative budget to acquire the lock and begin reconciling, but
+    // force the nudge to pause before delivering all its notifications.
+    for _ in 0..126 {
+        consume_budget().await;
+    }
+    assert!(
+        poll_fn(|cx| Poll::Ready(nudge.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        runtime.relays != first.relay_map(),
+        "the nudge still has edits to make"
+    );
+    tokio::task::yield_now().await;
+    let mut set = pin!(endpoint.set_towers(&second));
+    assert!(
+        poll_fn(|cx| Poll::Ready(set.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "the set waits for the nudge's suspended map edit",
+    );
+    nudge.as_mut().await.unwrap();
+    set.as_mut().await.unwrap();
+    assert!(runtime.relays == second.relay_map());
     endpoint.iroh().close().await;
 }
 
@@ -328,7 +519,9 @@ fn a_home_keeps_its_last_failure_only_until_a_new_observation_supersedes_it() {
         snapshot.observe(first, TowerStatus::Unknown),
         TowerStatus::Unknown
     );
-    snapshot.observe(first, denied);
+    snapshot.observe(first, denied.clone());
+    snapshot.configure(&wanted);
+    assert_eq!(snapshot.observe(first, TowerStatus::Unknown), denied);
     snapshot.configure(&TowerSet::default());
     snapshot.configure(&wanted);
     assert_eq!(

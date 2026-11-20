@@ -40,5 +40,6 @@ run "numbers features" cargo check -p numbers --locked
 run "dependency guards" bash scripts/check-deps.sh
 run "lint guards" bash scripts/check-lints.sh
 run docs env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+run "systemd units" bash scripts/check-units.sh
 
 echo "all checks passed"

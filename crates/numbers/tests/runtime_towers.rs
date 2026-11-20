@@ -218,7 +218,10 @@ async fn replacing_towers_moves_home_without_rebinding() {
                 .any(|relay| relay.url().as_str() == second_url && relay.is_connected())
         };
         assert!(still_connected(&raw_home.get()));
-        let changed = timeout(Duration::from_secs(1), async {
+        // A silent replacement needs time for its probes to finish. The empty map
+        // takes the no-report path.
+        let observation = Duration::from_secs(if set.is_empty() { 1 } else { 12 });
+        let changed = timeout(observation, async {
             while still_connected(&checked(raw_home.updated().await, "read raw home update")) {}
         })
         .await;

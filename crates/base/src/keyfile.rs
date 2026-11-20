@@ -267,7 +267,15 @@ pub fn check_private_dir(dir: &Path) -> Result<(), PrivatePathError> {
 pub fn create_key_file(path: &Path, key: &[u8]) -> Result<(), PrivatePathError> {
     let (dir_path, name) = split(path)?;
     let dir = open_private_dir(dir_path, Create::IfMissing)?;
-    create_in(&dir, Some(dir_path), path, name, key, write_all)
+    create_in(
+        &dir,
+        Some(dir_path),
+        path,
+        name,
+        key,
+        write_all,
+        File::sync_all,
+    )
 }
 
 /// Reads an `N`-byte key file. The directory that holds it must pass [`check_private_dir`] (it is
@@ -297,7 +305,7 @@ pub fn load_or_create_key<const N: usize>(
 ) -> Result<StoredKey<N>, PrivatePathError> {
     let (dir_path, name) = split(path)?;
     let dir = open_private_dir(dir_path, Create::IfMissing)?;
-    load_or_create_in(&dir, Some(dir_path), path, name, generate)
+    load_or_create_in(&dir, Some(dir_path), path, name, generate, File::sync_all)
 }
 
 /// Loads or creates a key inside an already opened directory. Use this when another operation,
@@ -312,7 +320,11 @@ pub fn load_or_create_key<const N: usize>(
 /// even if the path used to open it has since changed. Errors identify only a bare filename or the
 /// directory descriptor.
 ///
-/// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`].
+/// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`]. The two
+/// differ in when a missing key meets a directory that does not sync. This function syncs `dir`
+/// first: if that fails, it refuses before calling `generate`, and does so again at every call.
+/// [`load_or_create_key`] opens the directory itself and syncs it only after publication: if that
+/// sync fails, it reports the error, the key is already published, and the next call loads it.
 pub fn load_or_create_key_in<const N: usize>(
     dir: &File,
     name: &OsStr,
@@ -334,15 +346,19 @@ pub fn load_or_create_key_in<const N: usize>(
     }
 
     check_dir(dir, dir_label)?;
-    load_or_create_in(dir, None, path, name, generate)
+    load_or_create_in(dir, None, path, name, generate, File::sync_all)
 }
 
+/// The shared part of [`load_or_create_key`] and [`load_or_create_key_in`]. `sync` syncs the
+/// directory, both before generation (descriptor mode only) and after publication; it is a
+/// parameter so tests can make it fail.
 fn load_or_create_in<const N: usize>(
     dir: &File,
     dir_path: Option<&Path>,
     path: &Path,
     name: &OsStr,
     generate: impl FnOnce() -> [u8; N],
+    sync: impl Fn(&File) -> io::Result<()>,
 ) -> Result<StoredKey<N>, PrivatePathError> {
     let loaded = |key| StoredKey {
         key,
@@ -355,11 +371,10 @@ fn load_or_create_in<const N: usize>(
     }
     // A caller-supplied descriptor can allow relative opens yet fail to sync, for example O_PATH.
     if dir_path.is_none() {
-        dir.sync_all()
-            .map_err(|error| io_error(Path::new(DIRECTORY_DESCRIPTOR_LABEL), error))?;
+        sync(dir).map_err(|error| io_error(Path::new(DIRECTORY_DESCRIPTOR_LABEL), error))?;
     }
     let key = generate();
-    match create_in(dir, dir_path, path, name, &key, write_all) {
+    match create_in(dir, dir_path, path, name, &key, write_all, &sync) {
         Ok(()) => Ok(StoredKey {
             key,
             origin: KeyOrigin::Created,
@@ -533,7 +548,8 @@ fn check_dir(handle: &File, path: &Path) -> Result<(), PrivatePathError> {
 }
 
 /// Writes the key into a temporary file in the checked directory `dir` and links it to `name`.
-/// `write` puts the key into the file; it is a parameter so tests can make it fail.
+/// `write` puts the key into the file and `sync` syncs the directory after publication; they are
+/// parameters so tests can make them fail.
 fn create_in(
     dir: &File,
     dir_path: Option<&Path>,
@@ -541,6 +557,7 @@ fn create_in(
     name: &OsStr,
     key: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+    sync: impl Fn(&File) -> io::Result<()>,
 ) -> Result<(), PrivatePathError> {
     // Include the directory path in diagnostics when the caller supplied one.
     let dir_label = dir_path.unwrap_or(Path::new(DIRECTORY_DESCRIPTOR_LABEL));
@@ -599,7 +616,7 @@ fn create_in(
         .map_err(|e| io_error(&tmp_path, e.into()));
     published?;
     removed?;
-    dir.sync_all().map_err(|e| io_error(dir_label, e))
+    sync(dir).map_err(|e| io_error(dir_label, e))
 }
 
 /// Sets the mode of the fresh temporary file, checks it, writes the key and syncs the file.
@@ -779,6 +796,7 @@ fn check_owner_and_mode(want: Want, uid: u32, st_mode: u32, euid: u32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
@@ -1149,13 +1167,21 @@ mod tests {
         let path = link.join(name);
 
         let dir = open_private_dir(&link, Create::IfMissing).unwrap();
-        let err = create_in(&dir, Some(&link), &path, name, KEY, |file, key| {
-            file.write_all(&key[..5])?;
-            // Point the path somewhere else while the create is in progress.
-            fs::remove_file(&link)?;
-            symlink(&decoy, &link)?;
-            Err(io::Error::other("injected write failure"))
-        })
+        let err = create_in(
+            &dir,
+            Some(&link),
+            &path,
+            name,
+            KEY,
+            |file, key| {
+                file.write_all(&key[..5])?;
+                // Point the path somewhere else while the create is in progress.
+                fs::remove_file(&link)?;
+                symlink(&decoy, &link)?;
+                Err(io::Error::other("injected write failure"))
+            },
+            File::sync_all,
+        )
         .unwrap_err();
         assert!(matches!(err, PrivatePathError::Io { .. }), "{err:?}");
         assert!(entries(&real).is_empty(), "the checked dir is cleaned up");
@@ -1560,6 +1586,255 @@ mod tests {
         .unwrap();
         assert_eq!(existing.origin, KeyOrigin::Loaded);
         assert!(existing.key == *KEY);
+    }
+
+    /// A directory sync that succeeds for its first `ok` calls and fails after that.
+    fn sync_failing_after(ok: usize, calls: &Cell<usize>) -> impl Fn(&File) -> io::Result<()> + '_ {
+        move |dir| {
+            calls.set(calls.get() + 1);
+            if calls.get() > ok {
+                Err(io::Error::other("injected sync failure"))
+            } else {
+                dir.sync_all()
+            }
+        }
+    }
+
+    fn is_injected_sync_failure(source: &io::Error) -> bool {
+        source.to_string() == "injected sync failure"
+    }
+
+    /// How often a create syncs the directory when nothing fails: once in path mode, after
+    /// publication, and twice in descriptor mode, where the check before generation comes first.
+    /// The failing-sync tests below stop at their first failed call and could not see one more.
+    #[test]
+    fn a_successful_create_syncs_the_directory_once_per_step() {
+        let (_t, base) = tmp();
+        let name = OsStr::new("node.key");
+
+        let dir = File::open(&base).unwrap();
+        let calls = Cell::new(0);
+        let created = load_or_create_in(
+            &dir,
+            None,
+            Path::new(name),
+            name,
+            || *KEY,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(created.origin, KeyOrigin::Created);
+        assert_eq!(calls.get(), 2);
+
+        let other = base.join("other");
+        let other_dir = open_private_dir(&other, Create::IfMissing).unwrap();
+        let other_path = other.join(name);
+        let calls = Cell::new(0);
+        let created = load_or_create_in(
+            &other_dir,
+            Some(&other),
+            &other_path,
+            name,
+            || *KEY,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(created.origin, KeyOrigin::Created);
+        assert_eq!(calls.get(), 1);
+
+        let third = base.join("third");
+        let third_dir = open_private_dir(&third, Create::IfMissing).unwrap();
+        let calls = Cell::new(0);
+        create_in(
+            &third_dir,
+            Some(&third),
+            &third.join(name),
+            name,
+            KEY,
+            write_all,
+            sync_failing_after(usize::MAX, &calls),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_directory_sync_after_publication_leaves_the_key_published() {
+        let (_t, base) = tmp();
+        let name = OsStr::new("node.key");
+        let path = base.join(name);
+
+        // Descriptor mode syncs twice: the first call is the check before generation and must
+        // succeed so the key gets published; only the second, after publication, fails.
+        let dir = File::open(&base).unwrap();
+        let calls = Cell::new(0);
+        let err = load_or_create_in(
+            &dir,
+            None,
+            Path::new(name),
+            name,
+            || *KEY,
+            sync_failing_after(1, &calls),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL) && is_injected_sync_failure(source)),
+            "{err:?}"
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            entries(&base),
+            ["node.key"],
+            "the key stays, no staging file"
+        );
+        assert_eq!(&read32(&path).unwrap(), KEY);
+        let next =
+            load_or_create_key_in::<32>(&dir, name, || panic!("the key was published")).unwrap();
+        assert_eq!(next.origin, KeyOrigin::Loaded);
+        assert!(next.key == *KEY);
+
+        // Path mode has no check before generation: its only sync is the one after publication.
+        let other = base.join("other");
+        let other_dir = open_private_dir(&other, Create::IfMissing).unwrap();
+        let other_path = other.join(name);
+        let calls = Cell::new(0);
+        let err = load_or_create_in(
+            &other_dir,
+            Some(&other),
+            &other_path,
+            name,
+            || *KEY,
+            sync_failing_after(0, &calls),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if *path == other && is_injected_sync_failure(source)),
+            "{err:?}"
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            entries(&other),
+            ["node.key"],
+            "the key stays, no staging file"
+        );
+        let next =
+            load_or_create_key::<32>(&other_path, || panic!("the key was published")).unwrap();
+        assert_eq!(next.origin, KeyOrigin::Loaded);
+        assert!(next.key == *KEY);
+
+        // The same for `create_key_file`'s path, where a retry finds the key.
+        let third = base.join("third");
+        let third_dir = open_private_dir(&third, Create::IfMissing).unwrap();
+        let third_path = third.join(name);
+        let calls = Cell::new(0);
+        let err = create_in(
+            &third_dir,
+            Some(&third),
+            &third_path,
+            name,
+            KEY,
+            write_all,
+            sync_failing_after(0, &calls),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if *path == third && is_injected_sync_failure(source)),
+            "{err:?}"
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            entries(&third),
+            ["node.key"],
+            "the key stays, no staging file"
+        );
+        let err = create_key_file(&third_path, KEY).unwrap_err();
+        assert!(
+            matches!(err, PrivatePathError::AlreadyExists { .. }),
+            "{err:?}"
+        );
+        assert_eq!(&read32(&third_path).unwrap(), KEY);
+    }
+
+    /// The check before generation, on every unix target (the `O_PATH` test above runs on Linux
+    /// and Android only).
+    #[test]
+    fn directory_handle_that_cannot_sync_is_refused_before_generation_and_only_then() {
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        let name = OsStr::new("node.key");
+        let calls = Cell::new(0);
+        let err = load_or_create_in::<32>(
+            &dir,
+            None,
+            Path::new(name),
+            name,
+            || panic!("a directory that cannot sync must be refused before generation"),
+            sync_failing_after(0, &calls),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL) && is_injected_sync_failure(source)),
+            "{err:?}"
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(
+            entries(&base).is_empty(),
+            "no key or staging file was created"
+        );
+
+        // Loading an existing key does not sync at all.
+        create_key_file(&base.join(name), KEY).unwrap();
+        let existing = load_or_create_in::<32>(
+            &dir,
+            None,
+            Path::new(name),
+            name,
+            || panic!("a key exists"),
+            |_: &File| panic!("loading an existing key must not sync the directory"),
+        )
+        .unwrap();
+        assert_eq!(existing.origin, KeyOrigin::Loaded);
+        assert!(existing.key == *KEY);
+    }
+
+    #[test]
+    fn directory_handle_names_a_refused_staging_file_by_its_bare_name() {
+        // A key name that fits NAME_MAX (255 on Linux, macOS and the BSDs) whose staging name,
+        // at least 26 bytes longer, does not: the lookup finds nothing and the staging open fails.
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        let long = "k".repeat(250);
+        let name = OsStr::new(&long);
+        let staged = first_staging_name(&long);
+        // The expectation comes from the file system itself: what opening the staging name
+        // directly gives. A file system with a larger NAME_MAX fails here, loudly.
+        let probe = rustix::fs::openat(
+            &dir,
+            &staged,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        );
+        let Err(expected) = probe else {
+            panic!(
+                "this file system accepts a {}-byte name; the test needs one that refuses it",
+                staged.len()
+            );
+        };
+        let err = load_or_create_key_in(&dir, name, || *KEY).unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if *path == Path::new(&staged)
+                    && source.raw_os_error() == Some(expected.raw_os_error())),
+            "{err:?}"
+        );
+        assert!(
+            entries(&base).is_empty(),
+            "no key or staging file was created"
+        );
     }
 
     #[test]

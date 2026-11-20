@@ -1,17 +1,20 @@
 //! Endpoint binding and bare-id lookup via configured towers.
 
 use std::fmt;
+use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as SnapshotMutex, MutexGuard, PoisonError, Weak};
+use std::task::Poll;
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::dns::DnsResolver;
 use iroh::endpoint::{
     BindError, Incoming, InvalidSocketAddr, NetReportConfig, PortmapperConfig, QuicTransportConfig,
-    presets,
+    RelayStatus, presets,
 };
 use iroh::protocol::{DynProtocolHandler, Router, RouterBuilder as IrohRouterBuilder};
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher};
+use n0_future::task::AbortOnDropHandle;
 use n0_future::{StreamExt, boxed::BoxStream, stream};
 use tokio::sync::Mutex;
 
@@ -113,10 +116,11 @@ pub struct Endpoint {
 }
 
 struct EndpointRuntime {
+    _tower_observer: AbortOnDropHandle<()>,
     endpoint: iroh::Endpoint,
     gate: Gate,
     relays: RelayMap,
-    tower_snapshot: SnapshotMutex<TowerSnapshot>,
+    tower_snapshot: Arc<SnapshotMutex<TowerSnapshot>>,
     /// Serializes map edits and keeps the URL whose notification may have been interrupted.
     tower_updates: Mutex<Option<RelayUrl>>,
 }
@@ -128,6 +132,10 @@ struct TowerSnapshot {
 }
 
 impl TowerSnapshot {
+    fn lock(snapshot: &SnapshotMutex<Self>) -> MutexGuard<'_, Self> {
+        snapshot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn configure(&mut self, wanted: &TowerSet) {
         if let Some((url, _)) = &self.home_failure
             && !wanted.urls().any(|configured| configured == url)
@@ -157,6 +165,56 @@ impl TowerSnapshot {
         self.home_failure = None;
         status
     }
+
+    fn observe_relays<'a>(&mut self, home: &'a [RelayStatus]) -> (Option<&'a str>, TowerStatus) {
+        let observed = home
+            .iter()
+            .find(|relay| self.wanted.urls().any(|url| url == relay.url().as_str()));
+        let status = match observed {
+            Some(relay) if relay.is_connected() => TowerStatus::Connected,
+            Some(relay) => match relay.auth_denied_reason() {
+                Some(reason) => TowerStatus::denied(reason),
+                None if relay.last_error().is_some() => TowerStatus::Failing,
+                None => TowerStatus::Unknown,
+            },
+            None => TowerStatus::Unknown,
+        };
+        let url = observed.map(|relay| relay.url().as_str());
+        (url, self.observe(url, status))
+    }
+}
+
+fn watch_tower_home(
+    endpoint: &iroh::Endpoint,
+    snapshot: &Arc<SnapshotMutex<TowerSnapshot>>,
+) -> AbortOnDropHandle<()> {
+    let mut home = endpoint.home_relay_status();
+    TowerSnapshot::lock(snapshot).observe_relays(&home.get());
+    let snapshot = Arc::downgrade(snapshot);
+    let closed = endpoint.closed();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        let observe = async {
+            while poll_fn(|cx| {
+                let Some(snapshot) = snapshot.upgrade() else {
+                    return Poll::Ready(false);
+                };
+                // Sample and apply under the same lock used by tower_states. The task must
+                // not overwrite a newer synchronous observation with an earlier sample.
+                let mut snapshot = TowerSnapshot::lock(&snapshot);
+                match home.poll_updated(cx) {
+                    Poll::Ready(Ok(())) => {
+                        snapshot.observe_relays(home.peek());
+                        Poll::Ready(true)
+                    }
+                    Poll::Ready(Err(_)) => Poll::Ready(false),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await
+            {}
+        };
+        let _ = closed.run_until(observe).await;
+    }))
 }
 
 /// A station's handle for observing and updating its endpoint's towers.
@@ -291,15 +349,18 @@ impl Endpoint {
             IpTransport::RelayOnly => builder.clear_ip_transports(),
         };
         let endpoint = builder.bind().await.map_err(EndpointBindError::Bind)?;
+        let tower_snapshot = Arc::new(SnapshotMutex::new(TowerSnapshot {
+            wanted: config.towers,
+            home_failure: None,
+        }));
+        let tower_observer = watch_tower_home(&endpoint, &tower_snapshot);
         Ok(Self {
             runtime: Arc::new(EndpointRuntime {
+                _tower_observer: tower_observer,
                 endpoint,
                 gate,
                 relays,
-                tower_snapshot: SnapshotMutex::new(TowerSnapshot {
-                    wanted: config.towers,
-                    home_failure: None,
-                }),
+                tower_snapshot,
                 tower_updates: Mutex::new(None),
             }),
         })
@@ -337,9 +398,10 @@ impl Endpoint {
         self.runtime.tower_states()
     }
 
-    /// Requests a new net report when the home tower is missing or disconnected.
+    /// Reconciles the relay map and requests a full net report if the configured set is nonempty.
     ///
-    /// See [TowerControl::nudge_towers] for cancellation behavior.
+    /// Call this only when the home is missing or disconnected. A full report can move the home
+    /// off a working tower. See [TowerControl::nudge_towers] for cancellation behavior.
     pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
         self.runtime.nudge_towers().await
     }
@@ -391,6 +453,9 @@ impl TowerControl {
     /// home retains its last observed failure or denial while retrying. A connected observation
     /// or a change of observed home clears the old failure.
     ///
+    /// The runtime observes the home even between calls. Iroh's latest-value watcher can
+    /// coalesce brief transitions.
+    ///
     /// A home removed from the configured set is omitted even if it is still connected.
     /// To observe the actual home, use [`iroh::Endpoint::home_relay_status`].
     pub fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
@@ -399,10 +464,12 @@ impl TowerControl {
 
     /// Reconciles the relay map with the configured set and requests a full net report if the
     /// set is nonempty. Call this when the home tower is missing or disconnected. A full report
-    /// can change the home even when its connection works.
+    /// can change the home even when its connection works. While a report is running, a
+    /// periodic tick can replace a pending full-report request with an incremental one.
     ///
-    /// If interrupted, a later [Self::set_towers] or nudge reconciles the map and delivers any
-    /// interrupted notification.
+    /// If interrupted, a later [Self::set_towers] or nudge reconciles the map and delivers
+    /// any interrupted map-edit notification. A cancelled request for an unchanged map
+    /// takes another explicit nudge to request again.
     pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
         self.runtime()?.nudge_towers().await
     }
@@ -431,9 +498,7 @@ impl EndpointRuntime {
     }
 
     fn tower_snapshot(&self) -> MutexGuard<'_, TowerSnapshot> {
-        self.tower_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        TowerSnapshot::lock(&self.tower_snapshot)
     }
 
     /// Called with `tower_updates` held through all map edits and notifications. `None` nudges
@@ -485,8 +550,8 @@ impl EndpointRuntime {
             let relay = self.relays.get(&url);
             self.change_relay(url, relay, pending).await;
         } else if notify && let Some(relay) = self.relays.relays::<Vec<_>>().into_iter().next() {
-            self.change_relay(relay.url.clone(), Some(relay), pending)
-                .await;
+            // An explicit nudge of a matching map leaves no edit to replay.
+            self.endpoint.insert_relay(relay.url.clone(), relay).await;
         }
         self.ensure_open()
     }
@@ -512,23 +577,7 @@ impl EndpointRuntime {
         self.ensure_open()?;
         let mut snapshot = self.tower_snapshot();
         let home = self.endpoint.home_relay_status().get();
-        let observed = home.iter().find(|relay| {
-            snapshot
-                .wanted
-                .urls()
-                .any(|url| url == relay.url().as_str())
-        });
-        let status = match observed {
-            Some(relay) if relay.is_connected() => TowerStatus::Connected,
-            Some(relay) => match relay.auth_denied_reason() {
-                Some(reason) => TowerStatus::denied(reason),
-                None if relay.last_error().is_some() => TowerStatus::Failing,
-                None => TowerStatus::Unknown,
-            },
-            None => TowerStatus::Unknown,
-        };
-        let home_url = observed.map(|relay| relay.url().as_str());
-        let status = snapshot.observe(home_url, status);
+        let (home_url, status) = snapshot.observe_relays(&home);
         Ok(snapshot
             .wanted
             .urls()

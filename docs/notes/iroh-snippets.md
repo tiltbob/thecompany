@@ -637,10 +637,9 @@ let removed = ep.remove_relay(&tower_url).await;
   `remove_relay` + `insert_relay` of the dead tower 1 s after the stop 1.22–1.44 s; with TLS towers
   and QAD (QAD probes run in every report) 22.0–27.5 s, and 44.9–46.5 s in a namespace where QAD
   does not run. Meanwhile the status shows the dead tower, not connected, `last_error` "Failed to
-  connect to relay server". A station watches for this (decided in #74, built in #78): only after
-  it has seen no home tower, or a home tower that is not connected, for some seconds, it removes
-  and re-inserts the tower, at a growing, capped interval, and never while the home tower is
-  connected.
+  connect to relay server". The station watchdog (#74, implemented in #78) requests a full report
+  by inserting the tower again after the home has been missing or disconnected for some seconds.
+  It repeats at a growing, capped interval while the home remains missing or disconnected.
 - **Hysteresis.** A new home must measure under 2/3 of the old one's latency. After the stopped
   tower came back, home moved back to it within 50 s in 6 of 25 runs; on loopback this is noise.
 - **An open relayed connection does not move.** When the tower carrying its selected path stopped,
