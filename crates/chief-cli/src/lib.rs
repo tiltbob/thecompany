@@ -144,18 +144,20 @@
 //!   station's order. The state is `connecting`, `connected`, `standby` (a tower of the station's
 //!   set whose state is not observed), `failing` or `denied`. The source, in parentheses, says how
 //!   the station learned of the tower: `configured`, `remembered`, `srv` or `peer`; a station that
-//!   does not say has no parentheses. A failing tower's detail is its error; a denied tower's is
-//!   `this station is not on this tower's list`, followed by the tower's reason in parentheses.
-//!   An error or reason that is empty once cleaned and trimmed is left out, with its colon or
-//!   parentheses, so no line ends in a space or a colon. Then `peer <name> <station-id> <link>`
-//!   per peer station, with the link `down`, `relayed` or `direct`. `no towers` stands for an
-//!   empty list of towers, `no peers` for an empty peer book:
+//!   does not say has no parentheses. The detail, after a colon, is a failing tower's error or a
+//!   denied tower's reason, as the tower gave it (a tower of this project denies with `not on this
+//!   tower's list`). From an error, a reason and the domain, leading and trailing white space and
+//!   the characters of rule 9 are removed; one with nothing left after that is left out, with its
+//!   colon (or, for the domain, its line). The URL is always one field: every white-space
+//!   character left in it after rule 9 becomes `%20`, and an empty URL prints as `-`. Then
+//!   `peer <name> <station-id> <link>` per peer station, with the link `down`, `relayed` or
+//!   `direct`. `no towers` stands for an empty list of towers, `no peers` for an empty peer book:
 //!
 //!   ```text
 //!   domain team.example.invalid
 //!   tower https://tower-a.example.invalid/ connected (srv)
 //!   tower https://tower-c.example.invalid/ failing (configured): connection refused
-//!   tower https://tower-d.example.invalid/ denied (peer): this station is not on this tower's list (not allowed)
+//!   tower https://tower-d.example.invalid/ denied (peer): not on this tower's list
 //!   peer bob STATION-B relayed
 //!   ```
 //! - `peer ls` and `peer add`: `<name> <station-id> <link>` per peer station; `peer ls` says
@@ -257,12 +259,20 @@ pub enum Command {
     Id,
     /// Show the bootstrap domain, each tower's state and source, then each peer station's link
     ///
-    /// The first line is `domain <domain>` when the station knows the DNS domain it finds its
-    /// towers through. Then one line per tower: `tower <url> <state>`, the source in parentheses
-    /// when the station reports it (configured, remembered, srv or peer), and, after a colon, the
-    /// error of a failing tower, or "this station is not on this tower's list" for a denied one,
-    /// with the tower's reason in parentheses. Then one line per peer station:
-    /// `peer <name> <station-id> <link>`.
+    /// The first line is `domain <domain>` when the station finds its towers through a domain.
+    /// Then one line per tower: `tower <url> <state>[ (<source>)][: <detail>]`.
+    ///
+    /// States: connecting; connected; standby (in the station's set, state not observed); failing
+    /// (the last attempt failed, the station keeps trying; its error follows); denied (the tower
+    /// refused this station, and trying again does not help until the tower's operator changes
+    /// that; the tower's reason follows; a tower of this project says "not on this tower's list":
+    /// give its operator the id that `chief id` prints).
+    ///
+    /// Sources: configured (given when the station was started); remembered (stored by an
+    /// earlier run); srv (found through the domain's DNS record); peer (named by a peer and added
+    /// by the chief).
+    ///
+    /// Then one line per peer station: `peer <name> <station-id> <link>`.
     Status,
     /// Manage the peer book
     Peer {
@@ -607,15 +617,31 @@ fn source_label(source: TowerSource) -> &'static str {
     }
 }
 
-/// What `status` says about a tower that refused this station, before the tower's own reason.
-const DENIED_SENTENCE: &str = "this station is not on this tower's list";
-
 /// `text` with rule 9 applied ([`clean`]) and white space trimmed at both ends; `None` when
-/// nothing is left, so that a line never ends in a space, a colon or an empty parenthesis.
+/// nothing is left, so that the text is left out with its colon.
 fn shown_text(text: &str) -> Option<String> {
     let text = clean(text);
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// A URL as one field of a line: rule 9 applied ([`clean`]), then every white-space character
+/// left (the spaces `clean` made included) replaced with `%20`, one for one; `-` for an empty URL.
+/// A canonical URL is unchanged. A station holds canonical URLs only, but a broken one must not
+/// be able to put a false state in front of the real one (hard rule 8).
+fn url_token(url: &str) -> String {
+    let mut token = String::with_capacity(url.len());
+    for c in clean(url).chars() {
+        if c.is_whitespace() {
+            token.push_str("%20");
+        } else {
+            token.push(c);
+        }
+    }
+    if token.is_empty() {
+        token.push('-');
+    }
+    token
 }
 
 /// One tower as a line of `status`, before [`say`] cleans it:
@@ -626,15 +652,9 @@ fn tower_line(tower: &TowerStatus) -> String {
         TowerState::Connected => ("connected", None),
         TowerState::Standby => ("standby", None),
         TowerState::Failing { error } => ("failing", shown_text(error)),
-        TowerState::Denied { reason } => (
-            "denied",
-            Some(match shown_text(reason) {
-                Some(reason) => format!("{DENIED_SENTENCE} ({reason})"),
-                None => DENIED_SENTENCE.to_owned(),
-            }),
-        ),
+        TowerState::Denied { reason } => ("denied", shown_text(reason)),
     };
-    let mut line = format!("tower {} {state}", tower.url);
+    let mut line = format!("tower {} {state}", url_token(&tower.url));
     if let Some(source) = tower.source {
         line.push_str(" (");
         line.push_str(source_label(source));

@@ -336,7 +336,7 @@ async fn status_shows_each_tower_state_and_each_link() {
                 TowerState::Denied {
                     reason: "not on the list".to_owned(),
                 },
-                "denied: this station is not on this tower's list (not on the list)".to_owned(),
+                "denied: not on the list".to_owned(),
             ),
             (TowerState::Standby, "standby".to_owned()),
             (TowerState::Connecting, "connecting".to_owned()),
@@ -443,7 +443,15 @@ async fn status_shows_every_state_with_every_source() {
                     reason: "not allowed".to_owned(),
                 },
                 "denied",
-                ": this station is not on this tower's list (not allowed)",
+                ": not allowed",
+            ),
+            (
+                // The reason a tower of this project gives (crates/tower/src/lib.rs, DENY_REASON).
+                TowerState::Denied {
+                    reason: "not on this tower's list".to_owned(),
+                },
+                "denied",
+                ": not on this tower's list",
             ),
         ];
         // The source and its suffix after the state word.
@@ -500,8 +508,7 @@ async fn status_shows_the_domain_first_and_the_towers_in_their_order() {
                       tower https://tower-a.example.invalid/ connected (srv)\n\
                       tower https://tower-c.example.invalid/ failing (configured): connection \
                       refused\n\
-                      tower https://tower-b.example.invalid/ denied (peer): this station is not \
-                      on this tower's list (not allowed)\n\
+                      tower https://tower-b.example.invalid/ denied (peer): not allowed\n\
                       tower http://127.0.0.1:3340/ connecting\n";
         let peers = "peer alice STATION-AL down\npeer bob STATION-B down\n";
         // No domain line without a domain.
@@ -626,10 +633,8 @@ async fn status_leaves_out_an_error_or_reason_with_nothing_to_show() {
             ];
             let expected = "tower https://tower-a.example.invalid/ failing (srv)\n\
                             tower https://tower-b.example.invalid/ failing\n\
-                            tower https://tower-c.example.invalid/ denied (peer): this station \
-                            is not on this tower's list\n\
-                            tower https://tower-d.example.invalid/ denied: this station is not \
-                            on this tower's list\n\
+                            tower https://tower-c.example.invalid/ denied (peer)\n\
+                            tower https://tower-d.example.invalid/ denied\n\
                             no peers\n";
             // As the station sends it, and as the fake cleans it.
             let raw = raw_status(towers.clone(), Some(text));
@@ -685,17 +690,95 @@ async fn status_strips_tower_and_domain_text_itself() {
         assert_clean(&out);
         // One domain line, one line per tower, and the peers.
         assert_eq!(out.lines().count(), 5, "{out:?}");
+        // The URL is one token: what rule 9 made a space, and any other white space, is `%20`.
         assert_eq!(
             out,
             "domain team.example.invalid [2K tower https://forged.example.invalid/ connected z\n\
-             tower https://tower-a.example.invalid/ [2J tower https://forged.example.invalid/ \
-             connected x  connected (srv)\n\
+             tower https://tower-a.example.invalid/%20[2J%20tower%20https://forged.example.invalid/\
+             %20connected%20x%20 connected (srv)\n\
              tower https://tower-c.example.invalid/ failing (configured): refused [31m tower \
              https://forged.example.invalid/ connected x y\n\
-             tower https://tower-d.example.invalid/ denied: this station is not on this tower's \
-             list (no ]0;owned  tower https://forged.example.invalid/ connected x y)\n\
+             tower https://tower-d.example.invalid/ denied: no ]0;owned  tower \
+             https://forged.example.invalid/ connected x y\n\
              no peers\n"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_tower_url_is_one_token_and_cannot_put_a_state_before_the_real_one() {
+    bounded(async {
+        let c = raw_status(
+            vec![
+                tower(
+                    "https://a.example.invalid/ connected (srv)\u{2028}tower https://b.example.invalid/",
+                    TowerState::Denied {
+                        reason: "not on this tower's list".to_owned(),
+                    },
+                    Some(TowerSource::Peer),
+                ),
+                tower("", TowerState::Connected, None),
+                tower(" \t", TowerState::Standby, None),
+            ],
+            None,
+        );
+        let (exit, out, err) = exec(&c, &["status"]).await;
+        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+        assert_eq!(
+            out,
+            "tower https://a.example.invalid/%20connected%20(srv)%20tower%20https://b.example.invalid/ \
+             denied (peer): not on this tower's list\n\
+             tower - connected\n\
+             tower %20%20 standby\n\
+             no peers\n"
+        );
+        // Exactly one state word, after the one URL token.
+        let first = out.lines().next().unwrap();
+        assert_eq!(first.matches(" connected").count(), 0, "{first}");
+        assert_eq!(first.matches(" denied").count(), 1, "{first}");
+        assert_eq!(first.split(' ').nth(2), Some("denied"), "{first}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn status_trims_an_error_a_reason_and_a_domain_that_have_text_left() {
+    bounded(async {
+        let towers = vec![
+            tower(
+                TOWER_A,
+                TowerState::Failing {
+                    error: "\t connection refused \u{1b}\n".to_owned(),
+                },
+                Some(TowerSource::Srv),
+            ),
+            tower(
+                TOWER_B,
+                TowerState::Denied {
+                    reason: " not allowed\r\n".to_owned(),
+                },
+                Some(TowerSource::Peer),
+            ),
+        ];
+        let domain = " team.example.invalid\n";
+        let expected = "domain team.example.invalid\n\
+                        tower https://tower-a.example.invalid/ failing (srv): connection refused\n\
+                        tower https://tower-b.example.invalid/ denied (peer): not allowed\n\
+                        no peers\n";
+        // As the station sends it, and as the fake stores it.
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1");
+        fake.set_towers(towers.clone());
+        fake.set_bootstrap_domain(Some(domain.to_owned()));
+        for (exit, out, err) in [
+            exec(&raw_status(towers, Some(domain)), &["status"]).await,
+            exec(&Client::new(fake), &["status"]).await,
+        ] {
+            assert_eq!(
+                (exit, out.as_str(), err.as_str()),
+                (Exit::Done, expected, "")
+            );
+        }
     })
     .await;
 }
@@ -706,9 +789,16 @@ fn status_help_describes_its_lines() {
     for text in [
         "Show the bootstrap domain, each tower's state and source, then each peer station's link",
         "domain <domain>",
-        "tower <url> <state>",
-        "(configured, remembered, srv or peer)",
-        "\"this station is not on this tower's list\"",
+        "tower <url> <state>[ (<source>)][: <detail>]",
+        "standby (in the station's set, state not observed)",
+        "failing (the last attempt failed, the station keeps trying; its error follows)",
+        "denied (the tower refused this station, and trying again does not help until the \
+         tower's operator changes that; the tower's reason follows; a tower of this project says \
+         \"not on this tower's list\": give its operator the id that `chief id` prints)",
+        "configured (given when the station was started)",
+        "remembered (stored by an earlier run)",
+        "srv (found through the domain's DNS record)",
+        "peer (named by a peer and added by the chief)",
         "peer <name> <station-id> <link>",
     ] {
         assert!(help.contains(text), "{text:?} not in {help}");

@@ -340,8 +340,9 @@ async fn status_shows_every_tower_state_and_source_through_the_socket() {
             ),
             tower(
                 "https://tower-d.example.invalid/",
+                // The reason a tower of this project gives (crates/tower/src/lib.rs, DENY_REASON).
                 TowerState::Denied {
-                    reason: "not allowed".to_owned(),
+                    reason: "not on this tower's list".to_owned(),
                 },
                 Some(TowerSource::Peer),
             ),
@@ -357,8 +358,7 @@ async fn status_shows_every_tower_state_and_source_through_the_socket() {
                  tower https://tower-a.example.invalid/ connected (srv)\n\
                  tower https://tower-b.example.invalid/ standby (remembered)\n\
                  tower https://tower-c.example.invalid/ failing (configured): connection refused\n\
-                 tower https://tower-d.example.invalid/ denied (peer): this station is not on \
-                 this tower's list (not allowed)\n\
+                 tower https://tower-d.example.invalid/ denied (peer): not on this tower's list\n\
                  tower http://127.0.0.1:3340/ connecting\n\
                  peer bob STATION-B down\n"
                     .to_owned(),
