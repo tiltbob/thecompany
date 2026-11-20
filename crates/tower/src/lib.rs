@@ -24,7 +24,9 @@ mod certs;
 mod tls;
 
 pub use certs::TlsFileProblem;
-pub use tls::{DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, TlsTower};
+pub use tls::{
+    DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, MAX_RELOAD_INTERVAL, TlsTower,
+};
 
 /// The default dev tower bind address.
 pub const DEFAULT_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3340));
@@ -214,8 +216,9 @@ pub enum TowerError {
         /// What is wrong with the file.
         problem: TlsFileProblem,
     },
-    /// [`TlsTower::reload_interval`] is zero.
-    #[error("the TLS tower's certificate reload interval must be longer than zero")]
+    /// [`TlsTower::reload_interval`] is zero or too long to schedule (over
+    /// [`MAX_RELOAD_INTERVAL`]).
+    #[error("the TLS tower's certificate reload interval is zero or too long to schedule")]
     InvalidReloadInterval,
     /// An entry of [`TowerConfig::allow`] is not a valid endpoint id.
     ///

@@ -542,7 +542,7 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
   requires a literal loopback address.
 - **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself and checks the
-  pair before it serves it: the chain holds a certificate, the first one parses, the key file holds
+  pair before it serves it: the chain holds a certificate, every one parses, the key file holds
   exactly one key that ring can use, and the key belongs to the certificate. It hands the pair to
   rustls through its own certificate resolver, in
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed

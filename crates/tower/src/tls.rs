@@ -24,6 +24,12 @@ pub const DEFAULT_HTTPS_BIND: SocketAddr = all_ipv4(DEFAULT_HTTPS_PORT);
 /// The default QUIC address discovery bind address: all IPv4 interfaces, UDP port 7842.
 pub const DEFAULT_QAD_BIND: SocketAddr = all_ipv4(DEFAULT_RELAY_QUIC_PORT);
 
+/// The longest accepted [`TlsTower::reload_interval`]: 365 days.
+///
+/// A longer interval is refused at spawn. The bound keeps every reload deadline far from the
+/// limits of the clock, so that scheduling it can never overflow.
+pub const MAX_RELOAD_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 const fn all_ipv4(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
 }
@@ -56,15 +62,19 @@ pub struct TlsTower {
     /// The certificate chain, a PEM file that starts with the tower's own certificate.
     ///
     /// The tower reads it at spawn and at every reload. It must hold at least one certificate,
-    /// and the first must parse and belong to the private key.
+    /// every certificate in it must parse as X.509, and the first must belong to the private
+    /// key. Trust, expiry and names are not checked. The file may be at most 64 KiB.
     pub cert_path: PathBuf,
     /// The private key of the certificate, a PEM file with exactly one unencrypted key (PKCS#8,
     /// PKCS#1 or SEC1; RSA, ECDSA P-256 or P-384, or Ed25519).
     ///
-    /// The tower reads it at spawn and at every reload, in a buffer that is zeroed afterwards,
-    /// and hands it to rustls, which keeps it only inside its signing key. The tower never logs
-    /// it, never puts any byte of it into an error, and keeps no other live copy. Freed memory
-    /// may still hold scratch copies made by the PEM decoder, which the tower cannot zero.
+    /// The tower reads it at spawn and at every reload, into one fixed buffer that is zeroed
+    /// afterwards, and hands it to rustls, which keeps it only inside its signing key. The
+    /// tower never logs it, never puts any byte of it into an error, and keeps no other live
+    /// copy. Freed memory may still hold copies made by two dependencies, which the tower cannot
+    /// zero: the PEM decoder's scratch buffers (rustls-pki-types), and, for a SEC1 key, the
+    /// PKCS#8 wrapping rustls's ring provider builds before ring loads it. The file may be at
+    /// most 64 KiB.
     pub key_path: PathBuf,
     /// How often the tower reads both files again.
     ///
@@ -72,7 +82,7 @@ pub struct TlsTower {
     /// certificate is served without a restart. A pair that fails them is ignored, with one
     /// warning that names the file and the kind of problem, and the pair in use stays. The
     /// default is iroh-relay's `DEFAULT_CERT_RELOAD_INTERVAL`, one day. [`Tower::spawn`]
-    /// refuses zero.
+    /// refuses zero and anything longer than [`MAX_RELOAD_INTERVAL`] (365 days).
     ///
     /// [`Tower::spawn`]: crate::Tower::spawn
     pub reload_interval: Duration,
@@ -182,9 +192,11 @@ pub(crate) fn tower_url(hostname: &str, port: u16) -> Result<String, TowerError>
 /// rustls gets the ring provider explicitly; nothing is installed process-wide. The pair is
 /// loaded and checked here, before anything is bound.
 pub(crate) fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Reloader), TowerError> {
-    if tls.reload_interval.is_zero() {
-        return Err(TowerError::InvalidReloadInterval);
-    }
+    let every = tls.reload_interval;
+    let first_reload = (!every.is_zero() && every <= MAX_RELOAD_INTERVAL)
+        .then(|| tokio::time::Instant::now().checked_add(every))
+        .flatten()
+        .ok_or(TowerError::InvalidReloadInterval)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let pair = load_pair(&provider, &tls.cert_path, &tls.key_path)
         .map_err(|failure| failure.into_error())?;
@@ -199,7 +211,8 @@ pub(crate) fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Reloader), Towe
         provider,
         tls.cert_path.clone(),
         tls.key_path.clone(),
-        tls.reload_interval,
+        first_reload,
+        every,
     );
     Ok((CertConfig::Manual { server_config }, reloader))
 }

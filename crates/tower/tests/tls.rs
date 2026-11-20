@@ -18,7 +18,9 @@ use common::{
 use iroh::tls::CaTlsConfig;
 use iroh::{RelayConfig, RelayUrl, SecretKey, Watcher};
 use iroh_relay::RelayQuicConfig;
-use numbers_tower::{TlsFileProblem, TlsTower, Tower, TowerConfig, TowerError};
+use numbers_tower::{
+    MAX_RELOAD_INTERVAL, TlsFileProblem, TlsTower, Tower, TowerConfig, TowerError,
+};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -395,6 +397,11 @@ fn malformed_pem() -> [(&'static str, String); 2] {
 /// DER that is valid (a SEQUENCE holding INTEGER 0) but neither a certificate nor a key.
 const NOT_A_CERTIFICATE_DER: &str = "MAMCAQA=";
 
+/// A CERTIFICATE section whose DER is not a certificate.
+fn unparsable_certificate_section() -> String {
+    format!("-----BEGIN CERTIFICATE-----\n{NOT_A_CERTIFICATE_DER}\n-----END CERTIFICATE-----\n")
+}
+
 #[tokio::test]
 async fn unusable_certificate_files_fail_spawn_before_binding() {
     bounded(async {
@@ -420,6 +427,11 @@ async fn unusable_certificate_files_fail_spawn_before_binding() {
                 "-----BEGIN PRIVATE KEY-----\n{NOT_A_CERTIFICATE_DER}\n-----END PRIVATE KEY-----\n"
             ),
         );
+        // A good leaf that matches the key, followed by a second certificate that does not parse.
+        let bad_second = write(
+            "bad-second.pem",
+            &format!("{}{}", cert.cert_pem, unparsable_certificate_section()),
+        );
         let two_keys = write(
             "two-keys.pem",
             &format!("{}{}", cert.key_pem, other.key_pem),
@@ -432,6 +444,7 @@ async fn unusable_certificate_files_fail_spawn_before_binding() {
             ),
             (&not_pem, TlsFileProblem::NoCertificate),
             (&invalid_der, TlsFileProblem::UnparsableCertificate),
+            (&bad_second, TlsFileProblem::UnparsableCertificate),
             // Paths swapped by mistake: the key file holds no certificate.
             (&cert.key, TlsFileProblem::NoCertificate),
         ] {
@@ -634,13 +647,16 @@ async fn a_reload_serves_a_renewed_pair_and_keeps_the_last_good_one() {
         );
         assert!(https(addr, &[&first.der], "/healthz").await.is_err());
 
-        // Broken pairs: a certificate with another key, then malformed PEM in both files. Each
-        // stays on disk for several intervals, and the renewed pair stays in use throughout.
+        // Broken pairs: a certificate with another key; malformed PEM in both files; a new leaf
+        // with its own key but a second certificate that does not parse. Each stays on disk for
+        // several intervals, and the renewed pair stays in use throughout.
         let third = cert_in(&first.dir, "third");
         let [(_, malformed_header), (_, malformed_end)] = malformed_pem();
+        let bad_chain = format!("{}{}", third.cert_pem, unparsable_certificate_section());
         for (cert_pem, key_pem) in [
             (third.cert_pem.as_str(), second.key_pem.as_str()),
             (malformed_header.as_str(), malformed_end.as_str()),
+            (bad_chain.as_str(), third.key_pem.as_str()),
         ] {
             replace(&first.cert, cert_pem);
             replace(&first.key, key_pem);
@@ -653,6 +669,76 @@ async fn a_reload_serves_a_renewed_pair_and_keeps_the_last_good_one() {
             assert!(https(addr, &[&third.der], "/healthz").await.is_err());
         }
 
+        assert!(tower.shutdown().await.is_ok());
+    })
+    .await;
+}
+
+/// A leaf for 127.0.0.1 signed by a CA, as `leaf, CA` PEM, with the leaf's key and the CA's
+/// certificate.
+fn chain_in(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "numbers test CA");
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    let (cert, key) = (dir.join("chain.pem"), dir.join("chain-key.pem"));
+    std::fs::write(&cert, format!("{}{}", leaf.pem(), ca.pem())).unwrap();
+    std::fs::write(&key, leaf_key.serialize_pem()).unwrap();
+    (cert, key, ca.der().clone())
+}
+
+/// webpki parses an intermediate or CA certificate like a leaf, so a real chain passes the
+/// check of every certificate; a client that trusts only the CA proves the CA is sent.
+#[tokio::test]
+async fn a_two_certificate_chain_is_accepted_and_served() {
+    bounded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key, ca) = chain_in(dir.path());
+        let (tower, url) = spawn(config(tls_tower(&cert, &key))).await;
+        let addr = https_addr(&url);
+        assert_eq!(
+            https(addr, &[&ca], "/healthz").await.as_deref(),
+            Ok("HTTP/1.1 200 OK")
+        );
+        assert!(tower.shutdown().await.is_ok());
+    })
+    .await;
+}
+
+/// A reload interval that the clock cannot schedule fails spawn before anything is bound.
+#[tokio::test]
+async fn an_unschedulable_reload_interval_fails_spawn_before_binding() {
+    bounded(async {
+        let cert = cert();
+        let year = MAX_RELOAD_INTERVAL;
+        for every in [Duration::MAX, year + Duration::from_nanos(1)] {
+            let (http, https) = (free_tcp_port(), free_tcp_port());
+            let tls = TlsTower::new("127.0.0.1", &cert.cert, &cert.key)
+                .https_bind((Ipv4Addr::LOCALHOST, https).into())
+                .qad_bind(None)
+                .reload_interval(every);
+            let config = TowerConfig::tls(tls).bind((Ipv4Addr::LOCALHOST, http).into());
+            let result = Tower::spawn(config).await;
+            assert!(
+                matches!(result, Err(TowerError::InvalidReloadInterval)),
+                "{every:?} was accepted"
+            );
+            for port in [http, https] {
+                assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+            }
+        }
+        // The longest accepted interval starts a tower.
+        let tls = tls_tower(&cert.cert, &cert.key).reload_interval(year);
+        let (tower, _url) = spawn(config(tls)).await;
         assert!(tower.shutdown().await.is_ok());
     })
     .await;
