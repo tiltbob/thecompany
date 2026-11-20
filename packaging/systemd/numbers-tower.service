@@ -67,6 +67,11 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 # The execution domain of personality(2) cannot be changed.
 LockPersonality=yes
+# A private, read-only /dev with only the pseudo devices (null, zero, full, random, urandom,
+# the TTY subsystem). No device node can be made, no other device can be opened except for
+# reading a real-time clock (ProtectClock= above allows that), and the raw I/O port calls are
+# refused. The tower needs no other device.
+PrivateDevices=yes
 
 [Install]
 WantedBy=multi-user.target
