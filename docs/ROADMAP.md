@@ -165,6 +165,8 @@ rename and directory sync. If the rename succeeds but directory sync fails, the 
 the visible book and reports that the change may not survive a crash. While that running station
 has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
 and syncs the directory before giving its usual answer. These retries emit no additional events.
+On startup, the station requires a directory sync under its lock before it can read the book or
+accept commands.
 The saved file contains no network path state or message history. While the actor writes and syncs
 the peer book, command replies and event processing can pause. An incoming chat can receive
 `Unavailable` if its bounded mailbox fills during that time.

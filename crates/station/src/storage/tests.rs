@@ -1,11 +1,16 @@
 use super::*;
 
 use std::fs::{self, Permissions};
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use chief::client::Client;
 use numbers::node_id;
 use tempfile::TempDir;
+
+use crate::{IpTransport, StartError, Station, StationConfig};
 
 fn scratch() -> (TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("create scratch directory");
@@ -67,6 +72,33 @@ fn lock_excludes_another_start_and_the_same_inode_is_reused() {
     assert_eq!(fs::metadata(lock_path).expect("lock metadata").ino(), inode);
     let same_key = reopened.load_node_key().expect("read existing node key");
     assert!(key == same_key, "existing key was preserved");
+}
+
+#[test]
+fn failed_startup_sync_holds_the_checked_lock_and_releases_it_on_error() {
+    let (_temp, path) = scratch();
+    let result = Storage::lock_with_sync(&path, |dir| {
+        let checked = dir.metadata().expect("stat the directory being synced");
+        let expected = fs::metadata(&path).expect("stat the station directory");
+        assert_eq!(
+            (checked.dev(), checked.ino()),
+            (expected.dev(), expected.ino())
+        );
+        assert!(matches!(
+            Storage::lock(&path),
+            Err(StorageError::AlreadyRunning)
+        ));
+        Err(io::Error::other("injected directory sync failure"))
+    });
+    let Err(error @ StorageError::SyncDataDir) = result else {
+        panic!("startup must fail when the checked directory cannot be synced");
+    };
+    assert!(matches!(
+        StartError::from(error),
+        StartError::Storage { detail } if detail == "could not sync the station data directory"
+    ));
+    assert!(!path.join(KEY_FILE).exists());
+    let _storage = Storage::lock(&path).expect("retry after the failed sync released the lock");
 }
 
 #[test]
@@ -423,4 +455,54 @@ fn validation_failure_preserves_old_book_and_directory_sync_failure_commits() {
     assert_eq!(outcome, SaveOutcome::DurabilityUncertain);
     assert!(storage.load_peers(own).expect("load committed replacement") == next);
     assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 2);
+}
+
+#[tokio::test]
+async fn a_restart_confirms_a_visible_book_before_a_duplicate_add() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock first station");
+    let own = node_id(&storage.load_node_key().expect("load first station key"));
+    let remote = new_id();
+    let book = single_peer("alice", remote);
+    storage.fail_next_peer_sync();
+    assert_eq!(
+        storage.save_peers(&book, own).expect("publish peer book"),
+        SaveOutcome::DurabilityUncertain
+    );
+    let book_path = path.join(PEER_FILE);
+    let published = File::open(&book_path).expect("hold published peer book open");
+    let published_inode = published
+        .metadata()
+        .expect("stat published peer book")
+        .ino();
+    drop(storage);
+
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback port");
+    let address = reservation.local_addr().expect("read loopback port");
+    let mut config = StationConfig::new(path, format!("http://{address}/"));
+    config.ip_transport = IpTransport::RelayOnly;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let station = Station::start(config).await.expect("restart station");
+        let chief = Client::new(station.handle());
+        let remote_id = remote.to_string();
+        let peer = chief
+            .peer_add("alice", &remote_id)
+            .await
+            .unwrap_or_else(|_| panic!("already present peer add must succeed"));
+        assert_eq!(peer.name, "alice");
+        assert!(peer.stations.len() == 1 && peer.stations[0].station_id == remote_id);
+        assert_eq!(
+            fs::metadata(&book_path)
+                .expect("stat confirmed peer book")
+                .ino(),
+            published_inode,
+            "the duplicate must not replace the confirmed book"
+        );
+        station
+            .shutdown()
+            .await
+            .expect("shut down restarted station");
+    })
+    .await
+    .expect("station restarted and handled the duplicate add");
 }

@@ -81,6 +81,8 @@ pub(super) enum StorageError {
     AlreadyRunning,
     #[error("could not take the station data-directory lock")]
     TakeLock,
+    #[error("could not sync the station data directory")]
+    SyncDataDir,
     #[error("could not load or create node.key; check its owner, permissions and validity")]
     NodeKey,
     #[error(
@@ -113,8 +115,15 @@ pub(crate) struct Storage {
 }
 
 impl Storage {
-    /// Acquires the lock without creating or reading the node key.
+    /// Acquires the lock and syncs the checked directory before loading station records.
     pub(crate) fn lock(data_dir: &Path) -> Result<Self, StorageError> {
+        Self::lock_with_sync(data_dir, File::sync_all)
+    }
+
+    fn lock_with_sync(
+        data_dir: &Path,
+        sync_dir: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<Self, StorageError> {
         let path = if data_dir.as_os_str().is_empty() {
             Path::new(".")
         } else {
@@ -137,12 +146,16 @@ impl Storage {
 
         let lock = open_lock(&dir)?;
         match lock.try_lock() {
-            Ok(()) => Ok(Self {
-                dir,
-                _lock: lock,
-                #[cfg(test)]
-                fail_peer_sync: Cell::default(),
-            }),
+            Ok(()) => {
+                // A previous process may have renamed a record without syncing the directory.
+                sync_dir(&dir).map_err(|_| StorageError::SyncDataDir)?;
+                Ok(Self {
+                    dir,
+                    _lock: lock,
+                    #[cfg(test)]
+                    fail_peer_sync: Cell::default(),
+                })
+            }
             Err(TryLockError::WouldBlock) => Err(StorageError::AlreadyRunning),
             Err(TryLockError::Error(_)) => Err(StorageError::TakeLock),
         }
