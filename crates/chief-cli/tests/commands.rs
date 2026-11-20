@@ -338,6 +338,7 @@ async fn status_shows_each_tower_state_and_each_link() {
                 },
                 "denied: not on the list".to_owned(),
             ),
+            (TowerState::Standby, "standby".to_owned()),
             (TowerState::Connecting, "connecting".to_owned()),
         ] {
             fake.set_tower_state(state);
@@ -2481,11 +2482,12 @@ async fn transport_errors_exit_3() {
     bounded(async {
         let cases = [
             (
+                // This chief speaks API version 2; a newer station.
                 ApiError::IncompatibleApi {
-                    station: 2,
-                    client: 1,
+                    station: 3,
+                    client: 2,
                 },
-                "the station speaks API version 2 and this chief speaks version 1; use the same \
+                "the station speaks API version 3 and this chief speaks version 2; use the same \
                  release of both\n",
             ),
             (

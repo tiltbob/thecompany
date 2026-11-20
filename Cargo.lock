@@ -2110,11 +2110,14 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-relay",
+ "rcgen",
  "rustls",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

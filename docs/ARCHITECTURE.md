@@ -169,6 +169,9 @@ again. So a station watches its home tower (below).
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
   only when the set changes or at a long interval. The station limits its own attempts; it does not
   control iroh's own retries (decided in #74, built in #78).
+  Station API version 2 represents an unobserved tower as `Standby`, including when there is no
+  home tower observation. An explicit refusal remains `Denied`. Status can also carry the source
+  of each tower and the SRV bootstrap domain.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
@@ -541,13 +544,20 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
   DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
   requires a literal loopback address.
-- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
-  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
+- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself (regular files
+  only; a directory, device or FIFO could block) and checks the pair before it serves it: the
+  chain holds a certificate, every one is an X.509 version 3 certificate that webpki parses (no
+  version 1 root), the key file holds exactly one key that ring can use, and the key belongs to
+  the certificate. It hands the pair to
+  rustls through its own certificate resolver, in
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
-  explicitly and no process-wide default was installed or needed. The resolver fails at once on a
-  missing, unreadable or non-PEM key file, but accepts a certificate file that holds no PEM
-  certificate (an empty chain; `Server::spawn` succeeds), so a tower checks that file itself (found
-  while building the tower, #70). A test endpoint trusts the
+  explicitly and no process-wide default was installed or needed. It reads both files again once a
+  day and replaces the pair only when the new one passes the same checks. iroh-relay's own
+  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` is not used: it fails at
+  once on a missing, unreadable or non-PEM key file, but accepts a certificate file that holds no
+  PEM certificate (an empty chain; `Server::spawn` succeeds), never checks that the key belongs to
+  the certificate (source reading), and its errors can quote the file (found while building the
+  tower, #70). A test endpoint trusts the
   certificate with `iroh::tls::CaTlsConfig::custom_roots` (an empty list fails `bind()`) and came
   online in 223–325 ms. An endpoint that does not trust it never chooses a home tower: empty
   status, no error, `online()` pending. QAD ran when the relay map carried the tower's QAD port

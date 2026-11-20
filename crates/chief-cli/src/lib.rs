@@ -139,9 +139,10 @@
 //! - A change of an outgoing message (`chat` only): `<seq> -> <peer> now (<status>)`, without the
 //!   body. Its second field is an arrow, where a message line has a time.
 //! - `status`: `tower <url> <state>` per tower, with the state `connecting`, `connected`,
-//!   `failing: <error>` or `denied: <reason>`; then `peer <name> <station-id> <link>` per peer
-//!   station, with the link `down`, `relayed` or `direct`. `no towers` stands for an empty list of
-//!   towers, `no peers` for an empty peer book.
+//!   `standby` (a tower of the station's set whose state is not observed), `failing: <error>` or
+//!   `denied: <reason>`; then `peer <name> <station-id> <link>` per peer station, with the link
+//!   `down`, `relayed` or `direct`. `no towers` stands for an empty list of towers, `no peers` for
+//!   an empty peer book.
 //! - `peer ls` and `peer add`: `<name> <station-id> <link>` per peer station; `peer ls` says
 //!   `no peers` when the book is empty.
 //! - `peer rm`: `removed <name>`. `send`: `delivered to <peer>`. An empty `log`: `no messages`.
@@ -579,6 +580,7 @@ fn tower_label(state: &TowerState) -> String {
     match state {
         TowerState::Connecting => "connecting".to_owned(),
         TowerState::Connected => "connected".to_owned(),
+        TowerState::Standby => "standby".to_owned(),
         TowerState::Failing { error } => format!("failing: {error}"),
         TowerState::Denied { reason } => format!("denied: {reason}"),
     }

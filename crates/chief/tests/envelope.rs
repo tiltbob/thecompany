@@ -3,7 +3,7 @@
 //! The local socket's envelope (`chief::socket::wire`): the exact JSON of every variant, round
 //! trips, and what decoding accepts and refuses. Ids are placeholders (AGENTS.md, hard rule 9).
 
-use chief::api::{ApiError, Request, Response};
+use chief::api::{API_VERSION, ApiError, Request, Response};
 use chief::socket::wire::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,18 +17,21 @@ fn golden<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T, json: 
 
 #[test]
 fn hello_has_this_json() {
-    golden(&Hello { api: 1 }, r#"{"api":1}"#);
+    golden(
+        &Hello { api: API_VERSION },
+        &format!(r#"{{"api":{API_VERSION}}}"#),
+    );
 }
 
 #[test]
 fn hello_reply_has_this_json() {
     golden(
         &HelloReply {
-            api: 1,
+            api: API_VERSION,
             station_id: "STATION-A".into(),
             instance_id: "INSTANCE-1".into(),
         },
-        r#"{"api":1,"station_id":"STATION-A","instance_id":"INSTANCE-1"}"#,
+        &format!(r#"{{"api":{API_VERSION},"station_id":"STATION-A","instance_id":"INSTANCE-1"}}"#),
     );
 }
 
@@ -73,8 +76,9 @@ fn reply_has_this_json() {
 #[test]
 fn unknown_fields_are_ignored() {
     assert_eq!(
-        serde_json::from_str::<Hello>(r#"{"api":2,"features":["x"]}"#).unwrap(),
-        Hello { api: 2 }
+        serde_json::from_str::<Hello>(&format!(r#"{{"api":{API_VERSION},"features":["x"]}}"#))
+            .unwrap(),
+        Hello { api: API_VERSION }
     );
     assert_eq!(
         serde_json::from_str::<Open>(r#"{"type":"subscribe","from":3}"#).unwrap(),
@@ -93,7 +97,7 @@ fn unknown_variants_and_missing_fields_are_refused() {
     assert!(serde_json::from_str::<Open>(r#"{"type":"call","request":{"type":"nope"}}"#).is_err());
     assert!(serde_json::from_str::<Reply>(r#"{"type":"ok"}"#).is_err());
     assert!(serde_json::from_str::<Hello>(r#"{}"#).is_err());
-    assert!(serde_json::from_str::<HelloReply>(r#"{"api":1}"#).is_err());
+    assert!(serde_json::from_str::<HelloReply>(&format!(r#"{{"api":{API_VERSION}}}"#)).is_err());
 }
 
 #[test]
