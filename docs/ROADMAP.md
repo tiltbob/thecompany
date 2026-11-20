@@ -299,8 +299,7 @@ reload of the tower's config or allowlist on a signal (#69, #71), an allowlist f
 and signed tower-set statements (M3), automatic use of a peer's candidates (#73), a TXT record
 (the alternative behind `Locator`, #38), DNS or SRV in the shell walkthrough (the library tests
 cover them; #84), distro packages (#82), iOS builds, push and the app (M14), `chief network` (M3),
-the tower's own endpoint (M3). Router port mapping stays off; whether stations use it is open
-(decision 15, #42).
+the tower's own endpoint (M3). Router port mapping stays off (decision 15, #42).
 
 **Waiting for the owner:**
 
@@ -450,8 +449,14 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     enroll one under a chief-signed, expiring grant or every admission needs the chief (and the HSM);
     nspawn or QEMU; one safehouse per chief or per job; what the handler host itself must never
     expose to a safehouse.
-15. **Smaller ones.** GTK4 / libadwaita / relm4 / VTE assumed for the GUI (M13); whether stations use
-    router port mapping (off in M1).
+15. **Smaller ones.** GTK4 / libadwaita / relm4 / VTE assumed for the GUI (M13). Router port
+    mapping: decided by both agents on #42: off. A station never asks a router to forward a port; a
+    link that cannot go direct runs through a tower. Turning it on would have the station change
+    the chief's router without being asked, would open a port on that router to anybody, leading
+    to the node that holds the chief's key, and would bring a UPnP, NAT-PMP and PCP client into
+    that node. The endpoint keeps `PortmapperConfig::Disabled` and `scripts/check-deps.sh` keeps
+    iroh's `portmapper` feature out of the libraries. If real deployments show links that stay
+    relayed and hurt, it comes back as an explicit opt-in of the station.
 16. **Tower sets passed on by peers (M2).** Decided by both agents on #73: exchange and show only.
     A station sends its own working set to peers in its peer book and shows what it gets as
     candidates with the peer's name; it never connects to one, adds one to its relay map or passes
