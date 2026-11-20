@@ -122,8 +122,9 @@ station run --tower http://127.0.0.1:3340     # the chief's node; keeps running
 chief id                                      # this station's id, to hand to the other chief
 chief peer add bob <station-id> | peer ls | peer rm bob
 chief chat bob                                # last 50 lines, then live; shows other peers too
-chief send bob "on my way"                    # waits for the outcome (at most 120 s): exit 0
-                                              # delivered, 1 refused or failed, 3 outcome unknown
+chief send bob "on my way"                    # waits up to 120 s for the outcome once the station
+                                              # accepted it: exit 0 delivered, 1 refused or failed,
+                                              # 3 outcome unknown
 chief log [bob]                               # print the message log and exit
 chief status                                  # tower state, peers, relayed or direct
 ```

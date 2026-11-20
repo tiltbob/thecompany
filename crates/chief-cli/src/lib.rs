@@ -15,7 +15,8 @@
 //!   peer add <name> <station-id>   adds a station to a peer; prints the peer as stored
 //!   peer ls                        one line per peer station
 //!   peer rm <name>                 removes a peer
-//!   send <peer> <text>             sends a message and waits for the outcome, at most 120 s
+//!   send <peer> <text>             sends a message; once the station accepted it, waits at most
+//!                                  120 s for its outcome
 //!   log [peer]                     the whole message log, oldest first
 //!   chat <peer>                    the last 50 messages of all peers, then live; each line read
 //!                                  from stdin is sent to <peer>; end of input ends the chat
@@ -46,8 +47,9 @@
 //!
 //! # send
 //!
-//! `send` reads the status, subscribes, sends the message and waits for its outcome, at most
-//! [`SEND_OUTCOME_WAIT`] (120 s). It tells three cases apart:
+//! `send` reads the status, subscribes, sends the message and waits for its outcome. The calls
+//! are bounded by the transport's own timeouts; the wait for the outcome, once the station has
+//! accepted the message, by [`SEND_OUTCOME_WAIT`] (120 s). It tells three cases apart:
 //!
 //! - Delivered: `delivered to <peer>` on stdout, exit 0, also when stdout no longer takes the
 //!   line.
@@ -64,9 +66,12 @@
 //!   but its outcome is unknown; check `chief log <peer>` before sending it again``.
 //!
 //! Any other exit 3 (no station is running, it speaks another API version, it is shutting down,
-//! it restarted before the send) means that nothing was sent; its error may take more than one
-//! line. Once the station has accepted the message, `send` never exits 1 unless the station
-//! reported it failed.
+//! or it restarted and the restart was noticed before the send was attempted, by the subscribe)
+//! means that nothing was sent; its error may take more than one line. A restart noticed by the
+//! send call itself ends with the may-have-been-sent sentence although nothing was written: the
+//! bound call refuses the new instance with the same error as a lost connection, and the CLI
+//! cannot tell the two apart. Once the station has accepted the message, `send` never exits 1
+//! unless the station reported it failed.
 //!
 //! # chat
 //!
@@ -244,11 +249,13 @@ pub enum Command {
     },
     /// Send a message and wait for the outcome
     ///
-    /// Waits at most 120 s for the outcome. Exit 0: delivered. Exit 1: the station refused the
-    /// message, so it was not sent, or reported that it failed.
+    /// Once the station has accepted the message, waits at most 120 s for its outcome (the calls
+    /// before that have the transport's own timeouts). Exit 0: delivered. Exit 1: the station
+    /// refused the message, so it was not sent, or reported that it failed.
     ///
     /// Exit 3: the outcome is unknown only if stderr ends with "the message may still have been
-    /// sent; ..." (the send got no answer) or "the station accepted the message, but its outcome
+    /// sent; ..." (the send got no answer, or a restart of the station refused it: then nothing
+    /// was written, but the two look alike) or "the station accepted the message, but its outcome
     /// is unknown; ..." (the station accepted it, then stopped, restarted, lost it from its log,
     /// or did not report the outcome within 120 s); check `chief log <peer>` before sending it
     /// again. Any other exit 3 means that no station could be talked to and nothing was sent.

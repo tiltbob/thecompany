@@ -1723,6 +1723,29 @@ async fn status_with_a_restart_between_its_two_calls_prints_nothing_and_exits_3(
 }
 
 #[tokio::test]
+async fn send_with_a_restart_noticed_by_its_subscribe_says_nothing_was_sent() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.hold_subscribes(true);
+        let c = Client::new(fake.clone());
+        let (result, ()) = tokio::join!(exec(&c, &["send", "bob", "hello"]), async {
+            fake.wait_for_held_subscribes(1).await;
+            fake.restart("INSTANCE-2");
+        });
+        let (exit, out, err) = result;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        // The bound subscribe refused the new instance; the send was never attempted: one line,
+        // and no outcome sentence.
+        assert_eq!(
+            err,
+            "lost the connection to the station: the station restarted: another instance runs now\n"
+        );
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn send_with_a_restart_before_its_send_never_sends() {
     bounded(async {
         let fake = fake_with_peers().await;
