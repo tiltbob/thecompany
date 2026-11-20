@@ -989,6 +989,45 @@ async fn chats_reset_at_the_receiver_deadline_release_every_stream_slot() {
 }
 
 #[tokio::test]
+async fn acceptor_closes_a_silent_dialer_with_400_at_its_connect_timeout() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let handle = link.handle();
+
+            // The dialer opens no hello stream, so the acceptor waits in `accept_bi` until
+            // its hello timeout elapses. Opening a stream without writing to it would look
+            // the same to the acceptor: QUIC sends nothing for it.
+            let silent = dial(&peer, &address).await;
+            let dialed = Instant::now();
+            checked(
+                timeout(
+                    CONNECT_TIMEOUT + Duration::from_secs(1),
+                    expect_close(&silent, 400),
+                )
+                .await,
+                "the acceptor did not close a silent dialer by its hello timeout",
+            );
+            // The acceptor starts its timer after the dialer's handshake completes.
+            assert!(
+                dialed.elapsed() >= CONNECT_TIMEOUT - Duration::from_millis(250),
+                "the acceptor closed a silent dialer before its hello timeout"
+            );
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+            assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+            checked(link.shutdown().await, "stop link after a silent dialer");
+            peer.iroh().close().await;
+        })
+        .await,
+        "silent dialer test timed out",
+    );
+}
+
+#[tokio::test]
 async fn outgoing_hello_rejects_missing_and_wrong_server_echoes() {
     checked(
         timeout(CASE_TIMEOUT, async {
