@@ -233,6 +233,15 @@ the lower node ID in lexicographic order of the 32 public key bytes. A fresh con
 one from the same initiator. There is at most one pending incoming hello per peer. A second incoming
 connection while that hello is pending is refused immediately with code `0`. A sender whose
 outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
+If the fallback also loses and no open link, incoming hello or shared dial remains, the send
+returns `Disconnected` even if the deadline has time left.
+
+If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
+lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
+peer can refuse both dials from the higher-ID peer with code `409`. The higher-ID peer can
+reconnect once the lower-ID peer detects the old connection's closure or retires it. M1 relies
+on QUIC and the send progress check for that detection. When looking for a connection after a
+lost election, it makes at most one fallback dial.
 
 Link application close codes are `400` for a bad hello, `403` for authorization refusal, `409`
 for replacement, and `0` for ordinary closure. Either end of an admitted link can open a
@@ -251,7 +260,9 @@ is a new message or a retry.
 `connect_timeout` bounds each dial and hello together. `send_deadline` bounds the send, including
 any shared dials, retries and waits for a reply. On the first attempt over an already established
 connection, the sender checks for transport progress a full `connect_timeout` after queuing the
-request, if the send budget allows. If the connection is still current and has received no
+request, if this interval is positive and shorter than the remaining send budget. A
+`connect_timeout` equal to or longer than `send_deadline` leaves the overall deadline in force
+and skips that early check. If the connection is still current and has received no
 authenticated QUIC frames since before the request was written, the sender closes it. If a chat
 stream disconnects before its connection reports a close reason, the sender waits for that
 connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left

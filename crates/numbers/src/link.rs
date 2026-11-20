@@ -40,6 +40,11 @@ const MAILBOX_CAPACITY: usize = 32;
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
+    ///
+    /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
+    /// The early progress check on an established connection needs a positive interval
+    /// shorter than the remaining send budget. Choose a positive value below the send
+    /// deadline to allow time for that check and a retry.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
