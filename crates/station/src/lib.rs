@@ -1,8 +1,8 @@
 //! The station core, usable in-process through the same API as a local-socket client.
 //!
 //! One actor owns the network runtime and persistent state. Releasing its data-dir lock is the
-//! last step of shutdown, after the endpoint has closed. Frontend handles only submit API
-//! requests and subscribe to events.
+//! last step of shutdown, after the endpoint has closed. Frontend handles submit API requests,
+//! subscribe to events, and can observe when the station stops accepting requests.
 //!
 //! - [`ipc`] (Unix): the local-socket server, generic over any `chief` transport.
 
@@ -232,6 +232,16 @@ impl Drop for Station {
 #[derive(Clone, Debug)]
 pub struct StationHandle {
     commands: mpsc::Sender<Command>,
+}
+
+impl StationHandle {
+    /// Waits until the actor closes or drops its request receiver. This is cancel-safe.
+    ///
+    /// The receiver closes before orderly teardown finishes. Use [`Station::shutdown`] to
+    /// wait for the actor to finish and the data-dir lock to be released.
+    pub async fn closed(&self) {
+        self.commands.closed().await;
+    }
 }
 
 impl Transport for StationHandle {

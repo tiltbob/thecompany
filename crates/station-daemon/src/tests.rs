@@ -3,14 +3,17 @@ use chief::api::{ApiError, Direction, Event, MessageStatus, TowerState};
 use chief::client::{Client, SocketTransport, Transport};
 use chief::paths::PathEnv;
 use clap::Parser;
-use numbers_station::ipc::IpcError;
-use numbers_station::{IpTransport, StartError, StationConfig};
+use numbers_station::ipc::{IpcConfig, IpcError, IpcServer};
+use numbers_station::{IpTransport, StartError, Station, StationConfig};
 use numbers_tower::{Tower, TowerConfig};
+use std::future::{pending, ready};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+use tokio::runtime::Builder;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 const TOWER: &str = "http://127.0.0.1:3340";
@@ -47,10 +50,15 @@ fn assert_private_values_omitted(text: &str) {
 
 #[test]
 fn argument_errors_give_static_guidance_without_echoing_input() {
-    let (status, stdout, stderr) = argument_exit(&["run"]);
+    let data_dir = format!("/{PRIVATE_MARKER}/{PRIVATE_HOST}");
+    let (status, stdout, stderr) = argument_exit(&["run", "--data-dir", &data_dir]);
     assert_eq!(status, ExitCode::from(2));
     assert!(stdout.is_empty());
-    assert!(stderr.contains("--tower URL"));
+    assert!(
+        stderr == "station: pass --tower URL to station run; see station run --help\n",
+        "missing --tower guidance changed"
+    );
+    assert_private_values_omitted(&stderr);
 
     let url = format!("https://{PRIVATE_HOST}/{PRIVATE_MARKER}");
     for args in [
@@ -186,6 +194,23 @@ fn startup_errors_omit_storage_details_and_socket_paths_and_sources() {
     }
 }
 
+#[tokio::test]
+async fn invalid_tower_diagnostic_omits_the_url() {
+    let scratch = tempfile::tempdir().expect("create test directory");
+    let data_dir = scratch.path().join("station");
+    let socket = data_dir.join("station.sock");
+    let url = format!("https://{PRIVATE_MARKER}@{PRIVATE_HOST}/");
+    let Err(error @ RunError::Station(StartError::InvalidTower(_))) =
+        RunningStation::start(loopback_config(&data_dir, &url), &socket).await
+    else {
+        panic!("expected a tower URL with credentials to be rejected");
+    };
+    let message = error.to_string();
+    assert_private_values_omitted(&message);
+    assert!(message.starts_with("invalid --tower URL"));
+    assert!(!data_dir.exists());
+}
+
 fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
     // API and network failures can include identities. Print only the operation on failure.
     result.unwrap_or_else(|_| panic!("{operation}"))
@@ -249,7 +274,7 @@ async fn two_daemons_serve_separate_sockets_and_log_without_an_attached_client()
         let first_client = Client::new(SocketTransport::new(&first_socket));
         let first_status = checked(first_client.status().await, "call first station over its socket");
         assert!(matches!(
-            RunningStation::start(first_config, &first_socket).await,
+            RunningStation::start(first_config.clone(), &first_socket).await,
             Err(RunError::Station(StartError::AlreadyRunning))
         ));
         assert_eq!(socket_identity(&first_socket), first_inode);
@@ -286,9 +311,18 @@ async fn two_daemons_serve_separate_sockets_and_log_without_an_attached_client()
             message.direction == Direction::Incoming && message.peer == "first" && message.body == "message while detached"
         ));
 
-        checked(first.shutdown().await, "shut down first station");
+        checked(first.run_until_stopped(ready(())).await, "shut down first station");
         assert!(!first_socket.exists());
         assert!(matches!(first_client.status().await, Err(ApiError::NotRunning { .. })));
+        let restarted = checked(
+            RunningStation::start(first_config, &first_socket).await,
+            "restart first station after shutdown",
+        );
+        let restarted_status = checked(first_client.status().await, "call restarted station");
+        assert!(restarted_status.station_id == first_status.station_id, "restart changed identity");
+        assert!(restarted_status.instance_id != first_status.instance_id, "restart kept the instance");
+        checked(restarted.shutdown().await, "shut down restarted station");
+        assert!(!first_socket.exists());
         checked(second_client.status().await, "second socket survives first shutdown");
         checked(second.shutdown().await, "shut down second station");
         assert!(!second_socket.exists());
@@ -296,6 +330,60 @@ async fn two_daemons_serve_separate_sockets_and_log_without_an_attached_client()
     })
     .await
     .expect("station daemon test timed out");
+}
+
+#[tokio::test]
+async fn an_unexpected_core_stop_removes_the_socket_and_returns_an_error() {
+    timeout(Duration::from_secs(15), async {
+        let scratch = tempfile::tempdir().expect("create test directory");
+        let data_dir = scratch.path().join("station");
+        let socket = data_dir.join("station.sock");
+        let config = loopback_config(&data_dir, TOWER);
+        let core_config = config.clone();
+        let (started, station) = oneshot::channel();
+        let (stop_runtime, stopped) = oneshot::channel();
+        // Run the core on a separate runtime so its task can be cancelled while IPC stays live.
+        let runtime = tokio::task::spawn_blocking(move || {
+            let runtime = checked(
+                Builder::new_current_thread().enable_all().build(),
+                "create core runtime",
+            );
+            runtime.block_on(async {
+                let station = checked(Station::start(core_config).await, "start station core");
+                checked(started.send(station), "send station core");
+                let _ = stopped.await;
+            });
+        });
+        let station = checked(station.await, "receive station core");
+        let ipc = checked(
+            IpcServer::bind(station.handle(), &socket, IpcConfig::default()).await,
+            "bind the station socket",
+        );
+        let running = RunningStation { station, ipc };
+        let client = Client::new(SocketTransport::new(&socket));
+        checked(client.status().await, "call station before the core stops");
+
+        checked(stop_runtime.send(()), "stop core runtime without a signal");
+        let result = running.run_until_stopped(pending()).await;
+        let Err(error @ RunError::CoreStopped) = result else {
+            panic!("expected an unexpected core stop to fail the daemon");
+        };
+        assert!(error.to_string() == "the station core stopped unexpectedly");
+        assert!(!socket.exists());
+        assert!(matches!(
+            client.status().await,
+            Err(ApiError::NotRunning { .. })
+        ));
+        checked(runtime.await, "join core runtime");
+
+        let restarted = checked(
+            RunningStation::start(config, &socket).await,
+            "restart station after the core stops",
+        );
+        checked(restarted.shutdown().await, "shut down restarted station");
+    })
+    .await
+    .expect("station daemon did not finish after its core stopped");
 }
 
 #[tokio::test]

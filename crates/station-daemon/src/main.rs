@@ -1,7 +1,7 @@
 //! The `station` binary runs a chief's station in the foreground.
 
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -51,6 +51,7 @@ async fn main() -> ExitCode {
     // Network dependency events can contain node IDs or tower URLs.
     let log = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
         .with_filter(filter_fn(|metadata| metadata.target() == LOG_TARGET));
     if tracing_subscriber::registry().with(log).try_init().is_err() {
         eprintln!("station: could not initialize logging");
@@ -96,8 +97,7 @@ async fn run(args: Args) -> Result<(), RunError> {
     let stop = shutdown_signal().map_err(|_| RunError::Signals)?;
     let running = RunningStation::start(config, &socket).await?;
     tracing::info!(target: LOG_TARGET, "station listening");
-    stop.await;
-    running.shutdown().await.map_err(|_| RunError::Shutdown)
+    running.run_until_stopped(stop).await
 }
 
 fn resolve(args: Args, env: &PathEnv) -> Result<(StationConfig, PathBuf), RunError> {
@@ -137,6 +137,8 @@ enum RunError {
     Station(#[from] StartError),
     #[error("{}", socket_start_diagnostic(.0))]
     Socket(#[from] IpcError),
+    #[error("the station core stopped unexpectedly")]
+    CoreStopped,
     #[error("a station worker failed during shutdown")]
     Shutdown,
 }
@@ -197,6 +199,20 @@ impl RunningStation {
                 Err(error.into())
             }
         }
+    }
+
+    async fn run_until_stopped(self, stop: impl Future<Output = ()>) -> Result<(), RunError> {
+        let handle = self.station.handle();
+        let core_stopped = tokio::select! {
+            biased;
+            _ = handle.closed() => true,
+            _ = stop => false,
+        };
+        let shutdown = self.shutdown().await;
+        if core_stopped {
+            return Err(RunError::CoreStopped);
+        }
+        shutdown.map_err(|_| RunError::Shutdown)
     }
 
     async fn shutdown(self) -> Result<(), ShutdownError> {
