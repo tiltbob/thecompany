@@ -271,10 +271,14 @@ impl Storage {
 
 fn startup_sync(dir: &File) -> io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_STARTUP_SYNC.replace(false) {
-        return Err(io::ErrorKind::Other.into());
-    }
-    dir.sync_all()?;
+    let result = if FAIL_NEXT_STARTUP_SYNC.replace(false) {
+        Err(io::ErrorKind::Other.into())
+    } else {
+        dir.sync_all()
+    };
+    #[cfg(not(test))]
+    let result = dir.sync_all();
+    result?;
     #[cfg(test)]
     STARTUP_SYNCS.set(STARTUP_SYNCS.get() + 1);
     Ok(())

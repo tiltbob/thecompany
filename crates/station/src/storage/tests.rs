@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use chief::api::{ApiError, Event};
 use chief::client::{Client, Subscription};
-use numbers::node_id;
+use numbers::proto::CHAT_PROTOCOL;
+use numbers::{Protocol, node_id};
 use tempfile::TempDir;
 
 use crate::{IpTransport, StartError, Station, StationConfig};
@@ -203,6 +204,71 @@ fn private_file_validation_checks_the_owner_and_sets_mode_by_descriptor() {
 }
 
 #[test]
+fn a_different_owner_is_refused_at_the_entry_and_descriptor() {
+    use rustix::process::{Uid, geteuid};
+
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let own = new_id();
+    let old = single_peer("alice", new_id());
+    storage.save_peers(&old, own).expect("save old peer book");
+    let peer_path = path.join(PEER_FILE);
+    let original_bytes = fs::read(&peer_path).expect("read the original peer book");
+    let mut file = File::open(&peer_path).expect("open peer book before changing owner");
+    let other_owner = if geteuid().is_root() {
+        Uid::from_raw(1)
+    } else {
+        Uid::ROOT
+    };
+    match rustix::fs::fchown(&file, Some(other_owner), None) {
+        Ok(()) => {}
+        // A user namespace can make the alternate UID unavailable even to its root user.
+        Err(error @ (Errno::PERM | Errno::ACCESS | Errno::INVAL)) => {
+            writeln!(
+                io::stderr().lock(),
+                "skipped storage ownership checks: could not change fixture owner ({error})"
+            )
+            .expect("report skipped ownership checks");
+            return;
+        }
+        Err(error) => panic!("could not change fixture owner: {error}"),
+    }
+
+    let original = file.metadata().expect("stat the foreign-owned fixture");
+    assert_eq!(original.uid(), other_owner.as_raw());
+    assert_eq!(file_mode(&peer_path), 0o600);
+    assert_eq!(
+        check_private_file(&file)
+            .expect_err("an open descriptor with the wrong owner must be refused")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(matches!(
+        storage.load_peers(own),
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
+    ));
+
+    let next = single_peer("bob", new_id());
+    assert!(
+        matches!(
+            storage.save_peers(&next, own),
+            Err(StorageError::PrivateRecord(RecordFile::Peers))
+        ),
+        "a directory entry with the wrong owner must be refused before replacement"
+    );
+    let retained = fs::metadata(peer_path).expect("stat unchanged peer book");
+    assert_eq!(retained.ino(), original.ino());
+    assert_eq!(retained.uid(), original.uid());
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read retained fixture");
+    assert!(
+        bytes == original_bytes,
+        "the foreign-owned record was modified"
+    );
+    assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 2);
+}
+
+#[test]
 fn damaged_or_symlinked_key_is_never_replaced() {
     let (_temp, path) = scratch();
     let storage = Storage::lock(&path).expect("lock fixture");
@@ -337,6 +403,104 @@ fn peer_book_round_trips_in_canonical_order_and_replaces_atomically() {
 }
 
 #[test]
+fn oversized_peer_book_is_refused_without_replacing_the_committed_file() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let own = new_id();
+    let old = single_peer("alice", new_id());
+    storage.save_peers(&old, own).expect("save old peer book");
+    let peer_path = path.join(PEER_FILE);
+    let committed = File::open(&peer_path).expect("hold committed peer book");
+    let committed_inode = committed.metadata().expect("read committed inode").ino();
+    let committed_bytes = fs::read(&peer_path).expect("read original peer book");
+
+    let limit = 256 * 1024;
+    let station_bytes = new_id().to_string().len() + 3; // JSON quotes and a comma.
+    let stations = (0..=limit / station_bytes).map(|_| new_id()).collect();
+    let next = PeerBook::from([("bob".to_owned(), stations)]);
+    let bytes = serde_json::to_vec(&DiskBook::from_book(&next)).expect("encode oversized book");
+    assert!((limit + 1..=limit + 128).contains(&bytes.len()));
+
+    assert!(matches!(
+        storage.save_peers(&next, own),
+        Err(StorageError::RecordTooLarge(RecordFile::Peers))
+    ));
+    assert_eq!(
+        fs::metadata(&peer_path)
+            .expect("read unchanged inode")
+            .ino(),
+        committed_inode
+    );
+    assert!(
+        fs::read(peer_path).expect("read retained peer book") == committed_bytes,
+        "the refused save must leave the original bytes unchanged"
+    );
+    assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 2);
+}
+
+#[test]
+fn peer_storage_errors_have_fixed_diagnostics() {
+    let peers = RecordFile::Peers;
+    for (error, expected) in [
+        (
+            StorageError::DataDir,
+            "could not use the station data directory; it must be private and owned by this user",
+        ),
+        (
+            StorageError::LockFile,
+            "could not open the station lock; it must be a regular file owned by this user with mode 0600",
+        ),
+        (
+            StorageError::AlreadyRunning,
+            "another station is already running with this data directory",
+        ),
+        (
+            StorageError::TakeLock,
+            "could not take the station data-directory lock",
+        ),
+        (
+            StorageError::SyncDataDir,
+            "could not sync the station data directory",
+        ),
+        (
+            StorageError::NodeKey,
+            "could not load or create node.key; check its owner, permissions and validity",
+        ),
+        (
+            StorageError::PrivateRecord(peers),
+            "could not use peers.json; it must be a regular file owned by this user with mode 0600",
+        ),
+        (StorageError::ReadRecord(peers), "could not read peers.json"),
+        (
+            StorageError::InvalidPeers("unsupported version"),
+            "invalid peers.json: unsupported version",
+        ),
+        (
+            StorageError::RecordTooLarge(peers),
+            "peer book exceeds the 256 KiB limit",
+        ),
+        (
+            StorageError::StageRecord(peers),
+            "could not create a private staging file for peers.json",
+        ),
+        (
+            StorageError::StagingNamesTaken(peers),
+            "all staging names for peers.json are taken",
+        ),
+        (
+            StorageError::WriteRecord(peers),
+            "could not write or sync the staged peer book",
+        ),
+        (
+            StorageError::ReplaceRecord(peers),
+            "could not replace peers.json",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
     let (_temp, path) = scratch();
     let storage = Storage::lock(&path).expect("lock fixture");
@@ -433,9 +597,9 @@ fn a_colliding_name_is_preserved_and_the_next_draw_commits() {
     let own = new_id();
     let book = single_peer("alice", new_id());
     let bytes = serde_json::to_vec(&DiskBook::from_book(&book)).expect("encode fixture book");
-    let collision = path.join(staging_name(RecordFile::Peers, 1));
+    let collision = path.join(".peers.json.00112233445566778899aabbccddeeff.tmp");
     write_file(&collision, b"keep", 0o644);
-    let mut suffixes = [1, 2].into_iter();
+    let mut suffixes = [0x0011_2233_4455_6677_8899_aabb_ccdd_eeff, 2].into_iter();
 
     assert_eq!(
         storage
@@ -666,6 +830,14 @@ async fn the_first_duplicate_add_after_restart_requires_a_durable_rewrite() {
         let station = Station::start(config).await.expect("restart station");
         assert_eq!(STARTUP_SYNCS.get(), 1);
         assert_eq!(peer_file_inode(&book_path), published_inode);
+        assert!(
+            station
+                .authorizer
+                .authorize(&remote, Protocol::Stream(CHAT_PROTOCOL))
+                .as_deref()
+                == Some("alice"),
+            "a peer loaded at startup must be authorized for chat"
+        );
         let chief = Client::new(station.handle());
         let mut events = chief.subscribe().await.expect("subscribe to peer events");
         let remote_id = remote.to_string();

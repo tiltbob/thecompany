@@ -128,6 +128,8 @@ pub struct Station {
     handle: StationHandle,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), ShutdownError>>,
+    #[cfg(test)]
+    authorizer: Arc<Authorizer>,
 }
 
 impl fmt::Debug for Station {
@@ -186,6 +188,8 @@ impl Station {
                 send_deadline: config.send_deadline,
             },
         );
+        #[cfg(test)]
+        let test_authorizer = Arc::clone(&authorizer);
         let actor = Actor::new(
             storage,
             own_id,
@@ -202,6 +206,8 @@ impl Station {
             handle: StationHandle { commands },
             stop: Some(stop),
             task,
+            #[cfg(test)]
+            authorizer: test_authorizer,
         })
     }
 
