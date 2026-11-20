@@ -50,6 +50,7 @@ async fn start_tower() -> (Tower, EndpointConfig) {
     let config = EndpointConfig {
         towers: TowerSet::from_url(tower.url()).unwrap_or_else(|_| panic!("parse tower URL")),
         ip_transport: IpTransport::RelayOnly,
+        ..EndpointConfig::default()
     };
     (tower, config)
 }
@@ -59,6 +60,7 @@ async fn bind_direct(authorizer: &Arc<Authorizer>) -> Endpoint {
         EndpointConfig {
             towers: TowerSet::default(),
             ip_transport: IpTransport::LoopbackOnly,
+            ..EndpointConfig::default()
         },
         authorizer,
     )
