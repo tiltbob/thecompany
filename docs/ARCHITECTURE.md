@@ -247,9 +247,10 @@ If the higher-ID peer closes a link initiated by the lower-ID peer and the close
 lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
 peer can refuse both dials from the higher-ID peer with code `409`. The higher-ID peer can
 reconnect once the lower-ID peer detects the old connection's closure or retires it. M1 relies
-on QUIC and the send progress check for that detection. QUIC alone takes up to about 5 s on a
-link with one path, and from a few seconds to 30 s and more on a link that moved from the tower
-to a direct path (appendix, "A lost close on a connection with several paths").
+on QUIC and the send progress check for that detection. In the loopback measurements of the
+appendix ("A lost close on a connection with several paths"), QUIC alone took up to about 5 s on
+a link with one path, and from a few seconds to 30 s and more on a link that had moved from the
+tower to a direct path.
 [#124](https://github.com/tiltbob/thecompany/issues/124) When looking for a connection after a
 lost election, it makes at most one fallback dial.
 
