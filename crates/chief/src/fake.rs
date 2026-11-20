@@ -11,6 +11,9 @@
 //! [`FakeStation::fail_calls`] makes every call fail, and [`FakeStation::hold_subscribes`] keeps
 //! `subscribe` from returning until the test lets it.
 //!
+//! A handle can be bound to one instance ([`BindInstance`]): see "A bound handle" on
+//! [`FakeStation`].
+//!
 //! What it leaves out: links never change on their own (a test sets them with
 //! [`FakeStation::set_link`]), there is no send deadline (a held send stays `Sending` until
 //! [`FakeStation::resolve`]), and nothing is persisted.
@@ -21,7 +24,9 @@ use crate::api::{
     PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
     check_peer_name,
 };
-use crate::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription};
+use crate::client::{
+    BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -64,9 +69,24 @@ struct HookSlot {
 /// The outcome of a send is applied within the call, after the answer was made: the answer holds
 /// the `Sending` message (rev 0), and the event of the outcome (rev 1) is pushed before the call
 /// returns. So the outcome's event is queued before the caller sees the answer (rule 4).
+///
+/// # A bound handle
+///
+/// [`BindInstance::bound_to`] gives a handle of the same station that is bound to one instance;
+/// a clone of it is bound too, and the station and its other handles are not. A bound handle
+/// compares the station's current instance id with its own under the same lock that then handles
+/// the call or registers the subscription, and for a call after the [`FakeStation::on_call`]
+/// hook has run, so a hook that restarts the station "between" a client's steps is caught. When
+/// they differ, the call or subscribe fails with [`ApiError::Disconnected`] and the request never
+/// reached the station: it is not recorded in [`FakeStation::requests`], not handled, logs
+/// nothing and pushes no event, and no subscription is registered. The binding concerns the
+/// [`Transport`] methods only; the test controls ([`FakeStation::receive`],
+/// [`FakeStation::restart`] and the others) act on the shared station from any handle.
 #[derive(Clone)]
 pub struct FakeStation {
     inner: Arc<Inner>,
+    /// The instance this handle is bound to, if any.
+    bound: Option<Arc<str>>,
 }
 
 struct Inner {
@@ -119,6 +139,7 @@ impl fmt::Debug for FakeStation {
             .field("messages", &state.log.len())
             .field("subscribers", &state.sinks.len())
             .field("stopped", &state.stopped)
+            .field("bound", &self.bound)
             .finish_non_exhaustive()
     }
 }
@@ -161,6 +182,7 @@ impl FakeStation {
                 subscribers_changed: Notify::new(),
                 subscribe_gate: Notify::new(),
             }),
+            bound: None,
         }
     }
 
@@ -238,8 +260,10 @@ impl FakeStation {
     /// It follows the limits a station applies to what arrives, and a refused message changes
     /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
     /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
-    /// peer not in the book; [`ApiError::Invalid`] with field `body` for an empty body or one over
-    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). Only a message that
+    /// peer not in the book; [`ApiError::Invalid`] with field `body` for a body over
+    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). An empty body is
+    /// accepted: only [`Request::Send`] has a lower bound (rule 7), and a peer may send an empty
+    /// body. Only a message that
     /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
     /// with [`ApiError::Internal`] in the one case where that new id is already in the receipt
     /// window, which happens only when a test passed an id of the fake's own form to
@@ -263,8 +287,8 @@ impl FakeStation {
     /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
     /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
     /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
-    /// `body` for an empty body or one over [`BODY_MAX_BYTES`] (counted before control characters
-    /// are replaced); and only then the duplicate check of rule 8.
+    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before control characters are replaced;
+    /// an empty body is accepted); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -398,7 +422,8 @@ impl FakeStation {
         }
     }
 
-    /// Every request the fake received, in order, also those it refused.
+    /// Every request the fake received, in order, also those it refused. A request that a bound
+    /// handle turned away because another instance runs never reached the station and is not here.
     pub fn requests(&self) -> Vec<Request> {
         self.state().requests.clone()
     }
@@ -463,9 +488,23 @@ impl FakeStation {
         }
     }
 
+    /// [`ApiError::Disconnected`] if this handle is bound to an instance other than the one in
+    /// `state`. The caller holds the lock it then handles the request under.
+    fn other_instance(&self, state: &State) -> Option<ApiError> {
+        let bound = self.bound.as_deref()?;
+        (state.status.instance_id != bound).then(|| ApiError::Disconnected {
+            detail: "the station restarted: another instance runs now".to_owned(),
+        })
+    }
+
     fn handle(&self, request: Request) -> Result<Response, ApiError> {
         self.run_hook(&request);
         let mut state = self.state();
+        // After the hook, under the lock that handles the request: a restart made by the hook is
+        // caught, and nothing else can come in between.
+        if let Some(error) = self.other_instance(&state) {
+            return Err(error);
+        }
         state.requests.push(request.clone());
         if let Some(error) = &state.fail_calls {
             return Err(error.clone());
@@ -507,6 +546,17 @@ impl FakeStation {
     }
 }
 
+impl BindInstance for FakeStation {
+    /// A handle of the same station bound to `instance_id` (see "A bound handle" on
+    /// [`FakeStation`]).
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            bound: Some(Arc::from(instance_id)),
+        }
+    }
+}
+
 impl Transport for FakeStation {
     async fn call(&self, request: Request) -> Result<Response, ApiError> {
         self.handle(request)
@@ -517,6 +567,9 @@ impl Transport for FakeStation {
         // or restarted, also while it waits at the hold.
         let generation = {
             let state = self.state();
+            if let Some(error) = self.other_instance(&state) {
+                return Err(error);
+            }
             if state.stopped {
                 return Err(ApiError::Stopping);
             }
@@ -530,7 +583,10 @@ impl Transport for FakeStation {
             gate.as_mut().enable();
             let registered = {
                 let mut state = self.state();
-                if state.stopped || state.generation != generation {
+                // A bound handle reports another instance as such, also after a wait at the hold.
+                if let Some(error) = self.other_instance(&state) {
+                    Some(Err(error))
+                } else if state.stopped || state.generation != generation {
                     Some(Err(ApiError::Stopping))
                 } else if state.hold_subscribes {
                     None
@@ -596,9 +652,8 @@ impl State {
                 &format!("must be 1 to {MESSAGE_ID_MAX_BYTES} ASCII letters, digits, '_' or '-'"),
             ));
         }
-        if body.is_empty() {
-            return Err(invalid("body", "must not be empty"));
-        }
+        // An empty body is accepted: rule 7's lower bound is for `Send`, and the chat protocol
+        // lets a peer send an empty one.
         if body.len() > BODY_MAX_BYTES {
             return Err(invalid(
                 "body",
