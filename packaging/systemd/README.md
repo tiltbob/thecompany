@@ -23,14 +23,18 @@ The service runs as a user that systemd allocates when it starts (`DynamicUser=y
 the file system read-only, except its state directory and a private `/tmp`, and no home
 directories. `StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
 `/var/lib/private/numbers-tower`, which only root can reach from outside the service. At every
-start systemd makes that directory and everything in it the service user's own, and sets the
-directory's mode to 0700 (`StateDirectoryMode=0700`).
+start systemd gives that directory to the service's user with mode 0700
+(`StateDirectoryMode=0700`). It changes the owner of what is inside only when the directory
+itself had another owner, and it never changes the modes inside.
 
 The ACME cache holds the tower's TLS key and its ACME account key. The tower creates it with
 mode 0700, and refuses to start with a cache that the group or others can access, that another
-user owns, or that it cannot write. Under this unit, with `cache_dir` in the state directory,
-systemd's ownership and mode keep those checks passing; they matter if `cache_dir` points
-elsewhere.
+user owns, or that it cannot write. Under this unit, with the config below, the tower creates
+the cache itself, so those checks pass. They matter when someone else made the directory: a
+cache directory created by hand as root inside the state directory is refused until it belongs
+to the service's user and has mode 0700. A `cache_dir` outside the state directory does not work
+under this unit: the service sees the rest of the file system read-only, and its private `/tmp`
+is emptied when it stops.
 
 ## Install
 
