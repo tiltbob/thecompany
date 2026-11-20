@@ -660,3 +660,87 @@ let removed = ep.remove_relay(&tower_url).await;
   connection and the status did not change either. A connection
   whose path runs through a removed tower kept working, and a new dial to a peer reachable only
   through that tower still connected (2–10 ms).
+
+## 12. Tower forwarding (#164)
+
+Two stock iroh-relay 1.5.0 plain HTTP servers used the dev tower settings inside a private network
+namespace with only loopback. Three fresh trials per row used relay-only endpoints, with no bound
+IP sockets and one configured home each. Both homes were connected before the dial and verified
+again afterwards. Dial time covers raw iroh `connect(id, ALPN)`. Echo time covers one stream echo
+after the selected relay path was observed. Station defaults are a 5 s connection-attempt timeout
+and a 15 s send deadline.
+
+| Caller / callee home | Caller's lookup candidates | Dial | Echo | Relay counter changes per trial |
+| --- | --- | --- | --- | --- |
+| A / A | A | 22.061–25.431 ms | 19.756–31.759 ms | A relayed 18–19 of 18–19 frames, B idle |
+| A / B | A | Pending at 2 s, QUIC timed out at 30.004858–30.010616 s | — | A dropped all 15 frames (18,000 bytes), B idle |
+| A / B | A and operator-configured B | 39.552–49.206 ms | 24.672–54.430 ms | B accepted one new relay client and relayed 16 of 16 frames, A dropped one frame |
+
+The disjoint dial used only A even though B was up in the namespace. Neither server accepted a
+new relay client during that dial, and the callee received no connection. The successful
+non-home dial selected B while the caller stayed homed on A. The iroh client can start a new
+relay connection on demand to a URL outside its configured relay map. It reuses an open
+connection to that URL or one that has already seen traffic from the peer.
+[Non-home relay actor source][iroh-non-home]
+
+### Embedded server
+
+- The private `Clients::send_packet` method uses the active local client. If the destination
+  is absent, it increments `send_packets_dropped` and returns `Ok(())` internally with no reply
+  to the sender. `AccessControl` sees client admission and disconnect. Stock iroh-relay provides
+  no packet callback or inter-relay connection mode.
+  [Routing source][relay-routing] · [Access control source][relay-access]
+- `Server::relay_service()` returns a handle to the service used by the actual listener.
+  `service.clients().register(config, server.metrics().server.clone())` registers a live byte
+  stream as a client. The public constructors are `OnDisconnectGuard::empty(id)`,
+  `RelayedStream::new(stream, KeyCache::new(capacity))` and
+  `server::client::Config::new(guard, stream, ProtocolVersion::V2)`. The guard requires only the
+  endpoint's public id. Registration at this boundary skips the HTTP authentication and receive
+  rate limiter, so the embedder supplies those controls. A duplicate registration makes the
+  latest one active. The relay message types are public and the raw byte codecs are private.
+  [Server handle source][relay-handle] · [Listener source][relay-listener] ·
+  [Registry source][relay-registry] · [Stream source][relay-stream] · [Message source][relay-message]
+
+In five separate loopback trials, a downstream crate used each member's public id to register it
+on the opposite tower. A fixed in-memory link bridged relay frames one hop each way, preserving
+the datagram body. The ordinary iroh dial took 23.836–149.874 ms and the stream echo completed
+50.690–185.012 ms after dial start. Both TLS peer ids and unchanged singleton homes were verified.
+In each trial a duplicate virtual registration displaced a real client. Disconnect by its exact
+connection id promoted the real client again. Network carrier authentication, registration
+lifetimes, rate limiting and route moves remain open.
+
+### Custom paths
+
+- `Builder::add_custom_transport` and `endpoint::transports` need the feature
+  `unstable-custom-transports`. The API is public and outside the SemVer guarantee.
+  Upstream's in-memory example also uses `test-utils`. The transport API itself does not
+  require it. [Feature source][custom-feature] · [Custom transport source][custom-transport]
+- Supply a `TransportAddr::Custom` with an explicit `EndpointAddr` or the lookup result for
+  the dialed id. The normal QUIC handshake still verifies the member key associated with that id.
+  A custom path can start the connection, and ordinary relay and IP can also be enabled.
+  `Endpoint::addr()` and stock publication omit custom addresses. iroh opens relay alternatives
+  after a non-relay initial path and does IP hole punching. It does not automatically open a
+  custom backup after another path wins. [Dial source][custom-dial] ·
+  [Publication source][custom-publish] · [Path opening source][custom-paths] ·
+  [TLS identity source][custom-tls]
+- A tower endpoint's application connection can carry inner QUIC packet bytes over an
+  independently reachable path. The outer application datagram budget subtracts QUIC overhead
+  from the outer path MTU and can be too small for a 1,200-byte inner Initial plus forwarding
+  metadata. An end-to-end custom transport over tower endpoints was outside the lab.
+  [Datagram limits][datagram-limits]
+
+[iroh-non-home]: https://docs.rs/crate/iroh/1.5.0/source/src/socket/transports/relay/actor.rs#1322
+[relay-routing]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server/clients.rs#199
+[relay-access]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server.rs#280
+[relay-handle]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server.rs#831
+[relay-listener]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server/http_server.rs#915
+[relay-registry]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server/clients.rs#69
+[relay-stream]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/server/streams.rs#28
+[relay-message]: https://docs.rs/crate/iroh-relay/1.5.0/source/src/protos/relay.rs#326
+[custom-feature]: https://docs.rs/crate/iroh/1.5.0/source/Cargo.toml.orig#163
+[custom-transport]: https://docs.rs/crate/iroh/1.5.0/source/src/endpoint.rs#812
+[custom-dial]: https://docs.rs/crate/iroh/1.5.0/source/src/socket/remote_map/remote_state.rs#869
+[custom-publish]: https://docs.rs/crate/iroh/1.5.0/source/src/socket.rs#665
+[custom-paths]: https://docs.rs/crate/iroh/1.5.0/source/src/socket/remote_map/remote_state.rs#423
+[custom-tls]: https://docs.rs/crate/iroh/1.5.0/source/src/tls/verifier.rs#32
+[datagram-limits]: https://docs.rs/crate/noq-proto/1.5.0/source/src/connection/datagrams.rs#117

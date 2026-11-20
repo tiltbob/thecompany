@@ -619,6 +619,22 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `fs::create_dir_all` and `fs::write` with the process's default modes
   (`src/caches/dir.rs:36-38`), so the tower creates the directory with mode 0700 itself.
   tracing-subscriber 0.3.23's fmt layer writes to standard output (`src/fmt/fmt_layer.rs:749`).
+- **Relay forwarding (#164).** In iroh-relay 1.5.0, a packet for an absent destination is dropped
+  silently by the local registry. `Server::relay_service()` exposes the embedded service, whose
+  `clients()` handle supports live client registration. It has no missing-destination callback,
+  remote-route table or tower-to-tower protocol. Registration takes a live relay-protocol stream
+  under a public endpoint id. The newest registration becomes active, including when a real client
+  is already connected. A separate lab bridged two towers with an in-memory link and virtual
+  clients. A stock loopback dial with disjoint homes and only the caller's own tower in
+  lookup timed out at 30.005–30.011 s. When lookup also supplied the callee's tower from operator
+  configuration, the caller opened a separate relay connection to it and dialed in 39.552–49.206 ms
+  while keeping its original home. [Two-tower lab and pinned sources](notes/iroh-snippets.md#12-tower-forwarding-164)
+- **Custom paths (#164).** In iroh 1.5.0, `unstable-custom-transports` exposes a public
+  experimental datagram transport for a normal iroh connection. An explicit address or address
+  lookup can supply a custom initial path alongside ordinary IP and relay candidates. The
+  handshake still authenticates the intended endpoint id. Stock address publication omits custom
+  addresses, and supplying a custom candidate does not install a fallback path on an already
+  established connection. [Custom transport sources](notes/iroh-snippets.md#custom-paths)
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
