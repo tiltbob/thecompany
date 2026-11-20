@@ -58,7 +58,9 @@ fn a_status() -> Status {
         towers: vec![TowerStatus {
             url: "http://127.0.0.1:3340/".into(),
             state: TowerState::Connected,
+            source: None,
         }],
+        bootstrap_domain: None,
     }
 }
 

@@ -118,6 +118,10 @@ mod tests {
             "http://[::1]/"
         );
         assert_eq!(
+            canonical_tower_url("https://[2001:db8::1]").unwrap(),
+            "https://[2001:db8::1]/"
+        );
+        assert_eq!(
             canonical_tower_url("https://bücher.example.invalid").unwrap(),
             "https://xn--bcher-kva.example.invalid/"
         );
@@ -145,6 +149,10 @@ mod tests {
         assert_eq!(
             canonical_tower_url("https://127.0.0.1").unwrap(),
             "https://127.0.0.1/"
+        );
+        assert_eq!(
+            canonical_tower_url("https://192.0.2.1").unwrap(),
+            "https://192.0.2.1/"
         );
     }
 

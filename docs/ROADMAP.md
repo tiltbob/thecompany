@@ -82,15 +82,15 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | Path | Contents |
 |---|---|
 | `crates/base/src/frame.rs` | `write_frame` / `read_frame`: u32 length + JSON, with the size cap and read deadline as parameters (64 KiB on the wire, 1 MiB on the local socket) |
-| `crates/base/src/keyfile.rs` | key-file helper for daemons: create with `O_EXCL`, mode 0600 inside a 0700 dir, refuse a file with the wrong owner or mode. Keys reach the libraries as bytes |
+| `crates/base/src/keyfile.rs` | key-file helper for daemons: create with `O_EXCL`, mode 0600 inside a 0700 dir, refuse a file with the wrong owner or mode. Load or create by path or relative to an already opened data directory. Keys reach the libraries as bytes |
 | `crates/tower/src/lib.rs` | `TowerConfig`, `Tower::spawn(cfg)` wrapping `iroh_relay::server::Server::spawn` in plain-HTTP mode with a per-client rate limit; `url()`, `shutdown()`; no `iroh_relay` type in its public API |
 | `crates/tower/src/main.rs` | `tower [--bind 127.0.0.1:3340]`; loopback only in M1 |
 | `crates/numbers/src/identity.rs` | `NodeId` (iroh `EndpointId`) and node-key generation |
 | `crates/numbers/src/towers.rs` | `TowerSet`: canonical URL list with a QAD setting per tower. M1 takes one explicit URL |
 | `crates/numbers/src/endpoint.rs` | builds the iroh `Endpoint` from `presets::Minimal`: relay map with an explicit config per tower, `TowerLookup` (an `AddressLookup` mapping any node id to the tower URLs, so dialing needs only an id), port mapping off, lowered stream caps, a relay-only switch for tests |
 | `crates/numbers/src/gate.rs` | the one authorization point: an `Authorizer` that maps a node id and protocol to a caller (a peer name in M1, a roster entry later) or a refusal; a pre-handshake filter that ignores relayed attempts from ids it does not know and demands address validation from direct ones; the `after_handshake` hook; close codes |
-| `crates/numbers/src/link.rs` | ALPN `numbers/0`; a hello frame each way (`v`, with `network` and `head` empty until M3); one link per peer — either side opens streams on it, and if both dialed, the one dialed by the lower node id is kept; `StreamHeader {proto, v}`; stream dispatch; timeouts from config |
-| `crates/numbers/src/proto/chat.rs` | `ChatMessage {id, sent_at_ms, body}` answered by `Ack` / `Nack`; one stream per message; 16 KiB body cap; the receiver dedupes on (peer, id); the sender's id and time are untrusted |
+| `crates/numbers/src/link.rs` | Authenticated ALPN `numbers/0` with a version 1 hello each way and empty `network` and `head` fields. Either peer can open streams. Simultaneous dials keep the connection initiated by the lower node id. Configured deadlines cover dial, hello and chat. |
+| `crates/numbers/src/proto/` | Version 1 hello and typed stream headers. One chat per stream with a typed `Ack` or `Nack`. Bodies use padded standard base64 and decode to at most 16 KiB. `ReceiptWindow` tracks accepted messages by local peer name and message id. |
 | `crates/chief/src/api.rs` | the station API: `Request`, `Response`, `Event`, `ApiError`, `Status`, `Peer {name, stations: [{station_id, link}]}`, `Message {seq, rev, id, peer, direction, body, at_ms, status}`; FFI-exportable types only |
 | `crates/chief/src/client.rs` | `Transport` (methods return `impl Future + Send`; static dispatch), `Client` with typed methods, a concrete `Subscription` whose `next()` is cancel-safe; re-exports `SocketTransport` |
 | `crates/chief/src/socket.rs` | the local socket's envelope (`Hello`, `HelloReply`, `Open`, `Reply`; not part of the station API) and `SocketTransport`: one connection per call or subscription, the server's uid checked, a call timeout |
@@ -98,9 +98,16 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/chief/src/follow.rs` | `Client::follow_log`: the attach order (subscribe, page the log, drop live events already seen), re-reading after `Resync`, ending with the subscription or the station instance |
 | `crates/chief/src/fake.rs` | `FakeStation` (feature `fake`, tests only): an in-memory station that follows the API rules, for tests of transports, the socket server and frontends |
 | `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; replaces the characters of API rule 9 in peer text; usable in-process as a `Transport` |
-| `crates/station/src/ipc.rs` | the socket server (rules below), generic over any `Transport`; hello `{api: 1}` always answered with the station's API version, the station id and a per-start instance id, also on a version mismatch, and then the connection is closed; one connection per call or subscription; frames capped at 1 MiB both ways; both ends check the uid; a deadline on every frame of a call, never on an open subscription; an exclusive lock on `<socket>.lock` while it serves |
+| `crates/station/src/ipc.rs` | the socket server (rules below), generic over any `Transport`. The hello carries the client's API version. The reply gives the station's API version, station id and per-start instance id. The server closes the connection if the versions differ. Each call or subscription uses one connection. Both ends check the uid and cap frames at 1 MiB. Calls have frame deadlines. An open subscription has no deadline. The server holds `<socket>.lock` while serving. |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
-| `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
+| `crates/chief-cli/src/lib.rs`, `main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log`; the whole CLI is a library generic over `Transport` (tested in-process), `main.rs` only wires it to the socket; exit 0 done, 1 refused or failed, 2 usage, 3 no station |
+
+The receiving station uses one in-memory FIFO for the newest 1,000 first receipts across all
+peers. Its key is the local peer name and the message id, so retries from different stations of
+the same peer share a receipt. The receiving actor records a new receipt, logs the message and
+publishes its event as one operation before acknowledging it. Retries get another ACK without
+adding a log entry, publishing a new event or changing FIFO order. The window starts empty after
+a restart. [Decision #65](https://github.com/tiltbob/thecompany/issues/65)
 
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when
@@ -109,7 +116,8 @@ station takes the data-dir lock first; the socket server then locks `<socket>.lo
 another station is serving (two data dirs can name the same socket path) is never taken away, and
 only then removes a leftover socket, binds and sets 0600.
 The directory is created 0700, and an existing one must be owned by the same user with no group or
-other access. A path too long for a socket address is refused with a message naming `--data-dir`.
+other access. A path too long for a socket address is refused with a message naming `--data-dir`
+(by `chief`, naming `--station`).
 The peer uid comes from `tokio::net::UnixStream::peer_cred()`.
 
 **CLI surface**
@@ -121,7 +129,9 @@ station run --tower http://127.0.0.1:3340     # the chief's node; keeps running
 chief id                                      # this station's id, to hand to the other chief
 chief peer add bob <station-id> | peer ls | peer rm bob
 chief chat bob                                # last 50 lines, then live; shows other peers too
-chief send bob "on my way"                    # waits for the outcome: exit 0 delivered, 1 failed
+chief send bob "on my way"                    # waits up to 120 s for the outcome once the station
+                                              # accepted it: exit 0 delivered, 1 refused or failed,
+                                              # 3 outcome unknown
 chief log [bob]                               # print the message log and exit
 chief status                                  # tower state, peers, relayed or direct
 ```
@@ -170,7 +180,8 @@ unlisted station denied.
 | `crates/station/src/towers.rs` | owned by the actor: `towers.json` in the data dir (the set, each entry's source, the bootstrap domain), written atomically and only by the actor; the start order; `StationConfig` gains a tower input (`Pinned(TowerSet) \| Domain(String) \| Remembered`), a locator, `tls_roots` and `dns`; fills `source` and `bootstrap_domain` | #77, Codex |
 | `crates/station/src/towers.rs` | the watchdog on the home tower, the `Denied` state, and the return to SRV (below) | #78, Codex |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] [--domain DOMAIN] [--tower URL]... [--tower-ca PEM]`, and a hidden `--dns-server ADDR` for tests or none (open in #79). A first run with no `--tower`, no `--domain` and no remembered set is refused with a plain message. The rustls provider install stays in `main` | #79, Codex |
-| `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`), `Status.bootstrap_domain: Option<String>`; a state for a tower of the set that is not the home tower (working name `Standby`), which raises `API_VERSION` to 2; per decision 16 (#73), the candidates a station holds with the peer's name, and the request that takes one into the set | #68, Claude |
+| `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`) and `Status.bootstrap_domain: Option<String>`. `Standby` represents a tower whose state is unobserved, including when the home tower state is unavailable. `API_VERSION` is 2. | #68, Codex |
+| `crates/chief/src/api.rs` | Per decision 16 (#73), the candidates a station holds with the reporting peer's name and the explicit request that takes one into the tower set. | #109, Codex |
 | `crates/chief-cli/src/main.rs` | `chief status` prints each tower's state and source and the bootstrap domain; a denied tower reads "this station is not on <tower>'s list"; per decision 16 (#73), it shows the candidates and gets `chief tower add <url>` | #80, Claude |
 | `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` for the ACME cache, `CAP_NET_BIND_SERVICE`, sandboxing) and `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented). A unit test in each binary parses its unit's `ExecStart` with clap; CI runs `systemd-analyze verify` on both. Docs: "Running as a service" | #82, Claude |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
@@ -256,15 +267,15 @@ chief may take a candidate into the set with an explicit command, `chief tower a
 any tower URL the chief types; that is the chief's own act, so hard rule 8 is not touched. A station
 whose towers are all gone therefore recovers through SRV or through the chief, not through a peer.
 
-**What the station shows.** `home_relay_status()` lists the home tower only, so the API tells an
-observed state apart from a tower that is configured but not observed. The home tower is
-connected, failing or `Denied { reason }`. Every other tower of the set is not observed (working
-name `Standby`), never failing; an empty home status, such as after a TLS failure with a
-certificate the station does not trust, is not observed either. Each tower carries its source
-(`configured`, `remembered`, `srv`, `peer`); `Status` carries the bootstrap domain, and the API
-carries the candidates with the peer's name. `chief status` prints all of it, with control
-characters in peer and tower text replaced with spaces, and whether each peer is relayed or direct,
-as in M1.
+**What the station shows.** `home_relay_status()` lists the home tower only, so the API distinguishes
+an observed state from an unobserved tower in the station's set. The home tower can be connected,
+failing or `Denied { reason }`. Unobserved towers are shown as `Standby`, including when the home
+status is empty, such as after a TLS failure with a certificate the station does not trust. Each
+tower carries its source (`configured`, `remembered`, `srv`, `peer`). `Status` carries the bootstrap
+domain, and the API carries the candidates with the peer's name. `chief status` prints all of it,
+with control characters in peer and tower text replaced with spaces, and whether each peer is
+relayed or direct, as in M1.
+The station caps each cleaned tower error or denial reason at 1,024 UTF-8 bytes before it reports it.
 
 **CLI surface**
 

@@ -17,8 +17,8 @@
 //! - [`Request`], [`Response`], [`Event`], [`ApiError`], [`TowerState`] and [`MessageStatus`] are
 //!   internally tagged: `{"type":"<variant in snake_case>", ...fields}`, for example
 //!   `{"type":"peer_add","name":"bob","station_id":"..."}` or `{"type":"status"}`.
-//! - The label enums [`Link`], [`Direction`] and [`FailReason`] are bare snake_case strings, for
-//!   example `"relayed"`.
+//! - The label enums [`Link`], [`Direction`], [`FailReason`] and [`TowerSource`] are bare
+//!   snake_case strings, for example `"relayed"`.
 //! - Field names are the Rust names. Unknown fields are ignored on input, at every level.
 //! - An `Option` field that is `None` is left out on output. A missing field or `null` reads as
 //!   `None`.
@@ -119,8 +119,10 @@
 //!    message therefore contains none of these characters, so it is a single line also for a
 //!    consumer that splits on Unicode line breaks: U+000A to U+000D, U+001C to U+001E and U+0085
 //!    are control characters, and U+2028 and U+2029 are in the set. An outgoing body is logged as
-//!    the frontend sent it (rule 7). [`TowerState::Failing`] and [`TowerState::Denied`] carry
-//!    display text: show it, never match on it.
+//!    the frontend sent it (rule 7). The station uses [`clean_tower_display`] for the display
+//!    text in [`TowerState::Failing`] and [`TowerState::Denied`]. It limits each cleaned field
+//!    to a UTF-8 prefix of at most [`TOWER_TEXT_MAX_BYTES`] bytes before replying or publishing
+//!    an event. Show the text without matching on it.
 //! 10. **Peer book.** Peer names follow [`check_peer_name`] and are compared byte for byte.
 //!     [`Request::PeerAdd`] creates the peer or appends the station to an existing one and pushes
 //!     [`Event::Peer`]; adding a station the peer already has changes nothing and pushes nothing.
@@ -161,14 +163,20 @@ use std::fmt;
 /// any enum, a renamed, removed or retyped field, and a new required field all change
 /// `API_VERSION`.
 ///
-/// Version 1 is not final until the first station that implements it is released with M1. Until
-/// then its rules are being completed, and clarifications of them do not change the number; from
-/// that release on, the rule above applies as written.
-pub const API_VERSION: u32 = 1;
+/// The API rules remain provisional until the first station implementing them is released with
+/// M1. Clarifications before that release do not change the version. Wire-form changes still
+/// follow the versioning rule above.
+///
+/// Version 2 adds [`TowerState::Standby`]. The optional tower source and bootstrap domain can
+/// be absent from older JSON.
+pub const API_VERSION: u32 = 2;
 
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
 pub const BODY_MAX_BYTES: usize = 16 * 1024;
+
+/// The largest tower error or denial text a station reports, in bytes of cleaned UTF-8.
+pub const TOWER_TEXT_MAX_BYTES: usize = 1024;
 
 /// The longest [`Message::id`], in bytes (64). An id is 1 to this many ASCII letters, digits,
 /// underscores or hyphens. Equal to the chat protocol's cap.
@@ -302,7 +310,7 @@ pub enum Event {
         /// The removed peer's name.
         name: String,
     },
-    /// The station's status changed (in M1, the state of a tower).
+    /// The station's status changed.
     Status {
         /// The whole status as it is now.
         status: Status,
@@ -318,38 +326,62 @@ pub struct Status {
     /// Opaque, and new on every start of the station; compare for equality only (rule 1). A
     /// transport that reports an instance id when it connects reports this same value.
     pub instance_id: String,
-    /// Every configured tower, in configuration order. M1 has exactly one.
+    /// Every tower in the station's set, in the set's order.
     pub towers: Vec<TowerStatus>,
+    /// The DNS domain supplied for SRV bootstrap, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_domain: Option<String>,
 }
 
-/// One configured tower and the station's connection to it.
+/// One tower in the station's set and what the station knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TowerStatus {
-    /// The tower's URL as configured.
+    /// The tower's URL in the station's set.
     pub url: String,
-    /// The station's connection to the tower.
+    /// The station's observation of this tower, or [`TowerState::Standby`] when unknown.
     pub state: TowerState,
+    /// How the station learned about this tower, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TowerSource>,
 }
 
-/// The state of the station's connection to one tower.
+/// How the station learned about a tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TowerSource {
+    /// From the station's explicit configuration.
+    Configured,
+    /// From a previously stored tower set.
+    Remembered,
+    /// From a DNS SRV lookup.
+    Srv,
+    /// From another station's advertised tower set, adopted at the chief's explicit request.
+    Peer,
+}
+
+/// What the station knows about one tower. Live connection observations cover only the home
+/// tower.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TowerState {
-    /// Not connected, and no failure seen yet.
+    /// The observed home connection has yet to connect and has no reported failure.
     Connecting,
     /// Connected: the station can be reached through this tower.
     Connected,
     /// The last attempt failed; the station keeps trying.
     Failing {
-        /// Why, as display text (rule 9).
+        /// Cleaned display text of at most [`TOWER_TEXT_MAX_BYTES`] bytes (rule 9).
         error: String,
     },
     /// The tower refused this station. Trying again does not help until the tower's policy
     /// changes.
     Denied {
-        /// Why, as display text (rule 9).
+        /// Cleaned display text of at most [`TOWER_TEXT_MAX_BYTES`] bytes (rule 9).
         reason: String,
     },
+    /// The tower's connection state is unknown. This can happen for a tower other
+    /// than the home tower or when no home tower state is available.
+    Standby,
 }
 
 /// A peer in the station's peer book: a name for one or more stations.
@@ -597,8 +629,8 @@ impl std::error::Error for ApiError {}
 /// Unicode's Bidi_Control characters (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
 /// Every other `char` is kept.
 ///
-/// With [`clean`], the one definition of rule 9: the station core, the fake and any frontend that
-/// checks or cleans text again call these two rather than keeping their own list.
+/// This predicate defines the set for [`clean`] and [`clean_tower_display`], so stations and
+/// frontends can apply rule 9 without a separate list.
 pub fn is_replaced(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -625,6 +657,22 @@ pub fn clean(text: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Replaces rule 9 characters with spaces and returns the longest cleaned prefix that fits in
+/// [`TOWER_TEXT_MAX_BYTES`] bytes. The prefix ends at a UTF-8 character boundary.
+///
+/// This is a producer-side limit for tower display text. The wire form is unchanged.
+pub fn clean_tower_display(text: &str) -> String {
+    let mut prefix = String::with_capacity(text.len().min(TOWER_TEXT_MAX_BYTES));
+    for c in text.chars() {
+        let c = if is_replaced(c) { ' ' } else { c };
+        if prefix.len() + c.len_utf8() > TOWER_TEXT_MAX_BYTES {
+            break;
+        }
+        prefix.push(c);
+    }
+    prefix
 }
 
 /// Checks a peer name: 1 to [`PEER_NAME_MAX_BYTES`] ASCII letters, digits, `.`, `_` and `-`,
@@ -656,7 +704,7 @@ pub fn check_peer_name(name: &str) -> Result<(), ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean, is_replaced};
+    use super::{TOWER_TEXT_MAX_BYTES, clean, clean_tower_display, is_replaced};
     use std::borrow::Cow;
 
     /// Rule 9's set, written out.
@@ -707,5 +755,36 @@ mod tests {
             let one = c.to_string();
             assert_eq!(clean(&one), " ");
         }
+    }
+
+    #[test]
+    fn tower_display_keeps_ordinary_text_and_json_punctuation() {
+        let text = "warning: \"café\" \\路径 e\u{0301} 🧭";
+        assert_eq!(clean_tower_display(text), text);
+        assert!(clean_tower_display("").is_empty());
+    }
+
+    #[test]
+    fn tower_display_ends_at_the_longest_fitting_character_prefix() {
+        let head = "a".repeat(TOWER_TEXT_MAX_BYTES - 2);
+        assert_eq!(
+            clean_tower_display(&format!("{head}éx")),
+            format!("{head}é")
+        );
+        assert_eq!(clean_tower_display(&format!("{head}界x")), head);
+    }
+
+    #[test]
+    fn tower_display_caps_bytes_after_replacing_multibyte_characters() {
+        let separators = "\u{2028}\u{202E}".repeat((TOWER_TEXT_MAX_BYTES - 2) / 2);
+        let input = format!("{separators}éx");
+        let spaces = " ".repeat(TOWER_TEXT_MAX_BYTES - 2);
+        assert_eq!(clean_tower_display(&input), format!("{spaces}é"));
+
+        let head = "a".repeat(TOWER_TEXT_MAX_BYTES - 1);
+        assert_eq!(
+            clean_tower_display(&format!("{head}\u{2028}")),
+            format!("{head} ")
+        );
     }
 }
