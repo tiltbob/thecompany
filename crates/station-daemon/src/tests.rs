@@ -302,9 +302,11 @@ async fn two_daemons_serve_separate_sockets_and_log_without_an_attached_client()
 async fn a_socket_failure_releases_the_station_data_lock() {
     timeout(Duration::from_secs(15), async {
         let scratch = tempfile::tempdir().expect("create test directory");
-        let socket = scratch.path().join(format!("{PRIVATE_MARKER}.sock"));
+        let data_dir = scratch.path().join("station");
+        numbers_base::ensure_private_dir(&data_dir).expect("create private station directory");
+        let socket = data_dir.join(format!("{PRIVATE_MARKER}.sock"));
         std::fs::write(&socket, b"keep this file").expect("block the socket path");
-        let config = loopback_config(scratch.path(), TOWER);
+        let config = loopback_config(&data_dir, TOWER);
         let Err(error @ RunError::Socket(IpcError::NotASocket { .. })) =
             RunningStation::start(config.clone(), &socket).await
         else {
