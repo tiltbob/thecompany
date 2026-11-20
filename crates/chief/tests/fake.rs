@@ -1060,9 +1060,8 @@ async fn invalid_incoming_fixtures_are_refused_and_change_nothing() {
     assert_eq!(queued(&mut events).len(), 1);
     let too_long = "x".repeat(BODY_MAX_BYTES + 1);
     let id_too_long = "a".repeat(MESSAGE_ID_MAX_BYTES + 1);
-    let cases: [(&str, &str, &str); 9] = [
+    let cases: [(&str, &str, &str); 8] = [
         ("ID-X", &too_long, "body"),
-        ("ID-X", "", "body"),
         ("", "hi", "id"),
         ("ID\u{7}X", "hi", "id"),
         ("ID-X\n", "hi", "id"),
@@ -1075,7 +1074,6 @@ async fn invalid_incoming_fixtures_are_refused_and_change_nothing() {
         let err = fake.receive_with_id("bob", id, body).unwrap_err();
         assert_eq!(invalid_field(err), field, "id {id:?}");
     }
-    assert_eq!(invalid_field(fake.receive("bob", "").unwrap_err()), "body");
     assert_eq!(
         invalid_field(fake.receive("bob", &too_long).unwrap_err()),
         "body"
@@ -1089,6 +1087,27 @@ async fn invalid_incoming_fixtures_are_refused_and_change_nothing() {
         .unwrap();
     assert_eq!((accepted.seq, accepted.id.as_str()), (2, "ID-X"));
     assert_eq!(queued(&mut events).len(), 1);
+}
+
+#[tokio::test]
+async fn an_empty_incoming_body_is_accepted() {
+    // Rule 7's lower bound is for `Send`. A peer may send an empty body, and the station logs it.
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let made = fake.receive("bob", "").unwrap();
+    assert_eq!((made.seq, made.body.as_str()), (1, ""));
+    let given = fake.receive_with_id("bob", "EMPTY-1", "").unwrap().unwrap();
+    assert_eq!((given.seq, given.body.as_str()), (2, ""));
+    assert_eq!(fake.messages(), vec![made.clone(), given.clone()]);
+    assert_eq!(
+        queued(&mut events),
+        vec![
+            Event::Message { message: made },
+            Event::Message { message: given }
+        ]
+    );
+    // The sending side keeps its lower bound.
+    assert_eq!(invalid_field(c.send("bob", "").await.unwrap_err()), "body");
 }
 
 #[tokio::test]
@@ -1125,8 +1144,9 @@ async fn incoming_fixture_checks_run_in_order() {
         invalid_field(fake.receive_with_id("bob", "", "").unwrap_err()),
         "id"
     );
+    let too_long = "x".repeat(BODY_MAX_BYTES + 1);
     assert_eq!(
-        invalid_field(fake.receive_with_id("bob", "DUP", "").unwrap_err()),
+        invalid_field(fake.receive_with_id("bob", "DUP", &too_long).unwrap_err()),
         "body"
     );
     assert_eq!(fake.receive_with_id("bob", "DUP", "x").unwrap(), None);

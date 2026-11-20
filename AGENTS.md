@@ -35,7 +35,10 @@ cargo test --workspace --locked
 cargo check -p numbers --locked     # the exact iroh feature set, without workspace feature unification
 bash scripts/check-deps.sh          # hard rule 5, and the iroh features the libraries must not enable
 bash scripts/check-lints.sh         # the lints behind hard rules 1 and 10 are still switched on
+cargo doc --workspace --no-deps --locked   # with RUSTDOCFLAGS="-D warnings"; broken doc links fail
 ```
+
+`bash scripts/check.sh` runs all of them in order and stops at the first failure.
 
 The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed. Tests run in-process on
 127.0.0.1 and must not touch the external network.
