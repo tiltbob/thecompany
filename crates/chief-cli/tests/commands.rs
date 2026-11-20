@@ -11,8 +11,8 @@ use chief::client::{BindInstance, Client, SUBSCRIPTION_CAPACITY, Subscription, T
 use chief::fake::{FAKE_LOG_CAPACITY, FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
-    AFTER_HELP, Cli, Command, Exit, PeerCommand, format_change, format_message, format_time, run,
-    say, socket_path,
+    AFTER_HELP, Cli, Command, Exit, LOG_MAX_MESSAGES, PeerCommand, format_change, format_message,
+    format_time, run, say, socket_path,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -214,13 +214,31 @@ fn say_replaces_every_control_character() {
     say(&mut out, "a\x1b[2J\nb\tc\rd\u{7}e\u{9b}f").unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(text, "a [2J b c d e f\n");
+    // Unicode line and paragraph separators, and the bidirectional controls.
+    let mut out = Vec::new();
+    say(
+        &mut out,
+        "a\u{2028}b\u{2029}c\u{202A}d\u{202B}e\u{202C}f\u{202D}g\u{202E}h\u{2066}i\u{2067}j\
+         \u{2068}k\u{2069}l",
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text, "a b c d e f g h i j k l\n");
+    // Their neighbours stay.
+    let mut out = Vec::new();
+    say(&mut out, "\u{2027}\u{202F}\u{2065}\u{206A}").unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "\u{2027}\u{202F}\u{2065}\u{206A}\n"
+    );
 }
 
 /// No control character but the newline at the end of each line.
 fn assert_clean(text: &str) {
     for l in text.lines() {
         assert!(
-            !l.chars().any(char::is_control),
+            !l.chars().any(|c| c.is_control()
+                || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
             "control character in {l:?}"
         );
     }
@@ -235,7 +253,8 @@ async fn station_text_cannot_reach_the_terminal_raw() {
         // An outgoing body keeps its control characters in the station: it is what this chief
         // typed. The CLI still replaces them with spaces, like everything else it prints.
         fake.set_now_ms(T0);
-        let evil = "\x1b[2J\x1b]0;owned\x07hello\nforged 9 line";
+        let evil =
+            "\x1b[2J\x1b]0;owned\x07hello\nforged 9 line\u{2028}10 x\u{202E}desrever\u{2066}iso";
         let (exit, _, _) = exec(&c, &["send", "bob", evil]).await;
         assert_eq!(exit, Exit::Done);
         let (exit, out, err) = exec(&c, &["log"]).await;
@@ -244,7 +263,8 @@ async fn station_text_cannot_reach_the_terminal_raw() {
         assert_eq!(out.lines().count(), 1, "{out:?}");
         assert_eq!(
             out,
-            "1 2023-11-14T22:13:20Z -> bob (delivered)  [2J ]0;owned hello forged 9 line\n"
+            "1 2023-11-14T22:13:20Z -> bob (delivered)  [2J ]0;owned hello forged 9 line 10 x \
+             desrever iso\n"
         );
         assert_clean(&out);
 
@@ -1460,16 +1480,43 @@ async fn send_with_a_restart_before_its_send_never_sends() {
 }
 
 /// A fake whose `Log` answers `fix` rewrites: `fix(before, page)`, where `before` is the request's.
+///
+/// It counts its `Log` calls and panics at call `max_logs + 1`, so that a `log` that never stops
+/// asking fails the test at once instead of hanging it: an answer that comes without a pause
+/// never returns to the runtime, and the test's bound could not fire.
 #[derive(Clone)]
 struct Cursor {
     fake: FakeStation,
     fix: fn(Option<u64>, LogPage) -> LogPage,
+    logs: Arc<Mutex<usize>>,
+    max_logs: usize,
+}
+
+impl Cursor {
+    /// A wrapper for a log of a few pages: at most 10 `Log` calls.
+    fn new(fake: &FakeStation, fix: fn(Option<u64>, LogPage) -> LogPage) -> Self {
+        Self {
+            fake: fake.clone(),
+            fix,
+            logs: Arc::default(),
+            max_logs: 10,
+        }
+    }
 }
 
 impl Transport for Cursor {
     async fn call(&self, request: Request) -> Result<Response, ApiError> {
         let before = match &request {
-            Request::Log { before, .. } => Some(*before),
+            Request::Log { before, .. } => {
+                let mut logs = self.logs.lock().unwrap();
+                *logs += 1;
+                assert!(
+                    *logs <= self.max_logs,
+                    "log asked for more than {} pages",
+                    self.max_logs
+                );
+                Some(*before)
+            }
             _ => None,
         };
         match (before, self.fake.call(request).await?) {
@@ -1490,22 +1537,44 @@ impl BindInstance for Cursor {
         Self {
             fake: self.fake.bound_to(instance_id),
             fix: self.fix,
+            logs: Arc::clone(&self.logs),
+            max_logs: self.max_logs,
         }
+    }
+}
+
+/// A fake with the peer `bob` and more messages of his than one page holds.
+async fn fake_with_two_pages() -> FakeStation {
+    let n = usize::try_from(LOG_PAGE_MAX_MESSAGES).unwrap() + 200;
+    let fake = FakeStation::new("STATION-A", "INSTANCE-1").with_log_capacity(n);
+    Client::new(fake.clone())
+        .peer_add("bob", "STATION-B")
+        .await
+        .unwrap();
+    for i in 0..n {
+        fake.receive("bob", &format!("m{i}")).unwrap();
+    }
+    fake
+}
+
+/// Runs `chief log` over each wrapper: nothing on stdout, one `BadReply` line, exit 3.
+async fn assert_bad_log(wrappers: impl IntoIterator<Item = Cursor>) {
+    for (i, cursor) in wrappers.into_iter().enumerate() {
+        let c = Client::new(cursor);
+        let (exit, out, err) = exec(&c, &["log"]).await;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""), "fix {i}");
+        assert_eq!(err.lines().count(), 1, "fix {i}: {err}");
+        assert!(
+            err.starts_with("unexpected reply from the station: "),
+            "fix {i}: {err}"
+        );
     }
 }
 
 #[tokio::test]
 async fn a_log_cursor_that_does_not_move_back_is_a_bad_reply() {
     bounded(async {
-        let n = usize::try_from(LOG_PAGE_MAX_MESSAGES).unwrap() + 200;
-        let fake = FakeStation::new("STATION-A", "INSTANCE-1").with_log_capacity(n);
-        Client::new(fake.clone())
-            .peer_add("bob", "STATION-B")
-            .await
-            .unwrap();
-        for i in 0..n {
-            fake.receive("bob", &format!("m{i}")).unwrap();
-        }
+        let fake = fake_with_two_pages().await;
         let fixes: [fn(Option<u64>, LogPage) -> LogPage; 3] = [
             // The second page repeats the cursor it was asked with.
             |before, page| LogPage {
@@ -1523,19 +1592,74 @@ async fn a_log_cursor_that_does_not_move_back_is_a_bad_reply() {
                 ..page
             },
         ];
-        for (i, fix) in fixes.into_iter().enumerate() {
-            let c = Client::new(Cursor {
-                fake: fake.clone(),
-                fix,
-            });
-            let (exit, out, err) = exec(&c, &["log"]).await;
-            assert_eq!((exit, out.as_str()), (Exit::NoStation, ""), "fix {i}");
-            assert_eq!(err.lines().count(), 1, "fix {i}: {err}");
-            assert!(
-                err.starts_with("unexpected reply from the station: "),
-                "fix {i}: {err}"
-            );
-        }
+        assert_bad_log(fixes.map(|fix| Cursor::new(&fake, fix))).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_log_page_of_the_wrong_shape_is_a_bad_reply() {
+    bounded(async {
+        let fake = fake_with_two_pages().await;
+        let fixes: [fn(Option<u64>, LogPage) -> LogPage; 4] = [
+            // The first page has two messages out of order (not the first one).
+            |before, mut page| {
+                if before.is_none() {
+                    page.messages.swap(1, 2);
+                }
+                page
+            },
+            // The second page ends with a message at the cursor it was asked with.
+            |before, mut page| {
+                if let (Some(b), Some(last)) = (before, page.messages.last_mut()) {
+                    last.seq = b;
+                }
+                page
+            },
+            // The second page has a message above the cursor it was asked with.
+            |before, mut page| {
+                if let (Some(b), Some(last)) = (before, page.messages.last_mut()) {
+                    last.seq = b + 5;
+                }
+                page
+            },
+            // The first page's cursor is below its first message: the next page would skip one.
+            |before, page| LogPage {
+                next_before: page
+                    .next_before
+                    .map(|n| if before.is_none() { n - 1 } else { n }),
+                ..page
+            },
+        ];
+        assert_bad_log(fixes.map(|fix| Cursor::new(&fake, fix))).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_log_longer_than_any_station_keeps_is_a_bad_reply() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        // Every page is a full page of made-up messages just below the cursor asked, without end.
+        let endless = |before: Option<u64>, _page: LogPage| {
+            let top = before.unwrap_or(1 << 40);
+            let first = top - u64::from(LOG_PAGE_MAX_MESSAGES);
+            LogPage {
+                messages: (first..top)
+                    .map(|seq| message(seq, Direction::Incoming, "x", MessageStatus::Received))
+                    .collect(),
+                next_before: Some(first),
+            }
+        };
+        let pages = LOG_MAX_MESSAGES / usize::try_from(LOG_PAGE_MAX_MESSAGES).unwrap();
+        let cursor = Cursor {
+            max_logs: pages + 2,
+            ..Cursor::new(&fake, endless)
+        };
+        let logs = Arc::clone(&cursor.logs);
+        assert_bad_log([cursor]).await;
+        // It stopped at the cap: one page past it at most.
+        assert_eq!(*logs.lock().unwrap(), pages + 1);
     })
     .await;
 }
@@ -1923,7 +2047,7 @@ async fn transport_errors_exit_3() {
 }
 
 #[tokio::test]
-async fn a_stopping_station_exits_1() {
+async fn a_stopping_station_exits_3() {
     bounded(async {
         let fake = fake_with_peers().await;
         fake.stop();
@@ -1932,7 +2056,7 @@ async fn a_stopping_station_exits_1() {
             assert_eq!(
                 exec(&c, args).await,
                 (
-                    Exit::Failed,
+                    Exit::NoStation,
                     String::new(),
                     "the station is shutting down\n".to_owned()
                 ),
@@ -2108,4 +2232,43 @@ fn socket_path_resolution() {
         too_long.starts_with("cannot use the socket path: "),
         "{too_long}"
     );
+}
+
+#[test]
+fn a_socket_path_error_names_only_what_chief_has() {
+    let long_dir = format!("/{}", "x".repeat(200));
+    let long = format!("{long_dir}/station.sock");
+    let cases = [
+        // Given with --station.
+        (
+            socket_path(Some(Path::new("")), &env(None, None, None)),
+            "cannot use the socket path: the socket path is empty; pass another --station PATH"
+                .to_owned(),
+        ),
+        (
+            socket_path(Some(Path::new(&long)), &env(None, None, None)),
+            format!(
+                "cannot use the socket path: {long} is {} bytes long, but a Unix socket path \
+                 can be at most {} bytes here; pass another --station PATH",
+                long.len(),
+                chief::paths::SOCKET_PATH_MAX_BYTES
+            ),
+        ),
+        // The default, from the environment.
+        (
+            socket_path(None, &env(None, Some(&long_dir), Some("/h"))),
+            format!(
+                "cannot use the socket path: {long_dir}/thecompany/station.sock is {} bytes \
+                 long, but a Unix socket path can be at most {} bytes here; pass --station PATH, \
+                 or set XDG_RUNTIME_DIR to a shorter directory",
+                long_dir.len() + "/thecompany/station.sock".len(),
+                chief::paths::SOCKET_PATH_MAX_BYTES
+            ),
+        ),
+    ];
+    for (result, expected) in cases {
+        let message = result.unwrap_err();
+        assert_eq!(message, expected);
+        assert!(!message.contains("--data-dir"), "{message}");
+    }
 }

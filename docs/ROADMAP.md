@@ -109,7 +109,8 @@ station takes the data-dir lock first; the socket server then locks `<socket>.lo
 another station is serving (two data dirs can name the same socket path) is never taken away, and
 only then removes a leftover socket, binds and sets 0600.
 The directory is created 0700, and an existing one must be owned by the same user with no group or
-other access. A path too long for a socket address is refused with a message naming `--data-dir`.
+other access. A path too long for a socket address is refused with a message naming `--data-dir`
+(by `chief`, naming `--station`).
 The peer uid comes from `tokio::net::UnixStream::peer_cred()`.
 
 **CLI surface**
@@ -121,7 +122,8 @@ station run --tower http://127.0.0.1:3340     # the chief's node; keeps running
 chief id                                      # this station's id, to hand to the other chief
 chief peer add bob <station-id> | peer ls | peer rm bob
 chief chat bob                                # last 50 lines, then live; shows other peers too
-chief send bob "on my way"                    # waits for the outcome: exit 0 delivered, 1 failed
+chief send bob "on my way"                    # waits for the outcome (at most 120 s): exit 0
+                                              # delivered, 1 refused or failed, 3 outcome unknown
 chief log [bob]                               # print the message log and exit
 chief status                                  # tower state, peers, relayed or direct
 ```

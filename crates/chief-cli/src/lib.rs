@@ -33,6 +33,15 @@
 //! station other than the one whose messages it shows. `id`, `peer ls`, `peer add` and `peer rm`
 //! make one call each and need no binding.
 //!
+//! # log
+//!
+//! `log` reads the whole log page by page and prints it only once every page has been read. It
+//! checks every page against rule 6 in `chief::api`: its messages ascend by `seq`, lie below the
+//! cursor it was asked with, and its cursor is the `seq` of its first message; a page with a
+//! cursor is not empty, and the cursor moves back. It stops at [`LOG_MAX_MESSAGES`] (100,000)
+//! messages, far more than a station keeps. A page that breaks a rule, or a log that runs past
+//! that, ends `log` with exit 3, one line, and nothing printed.
+//!
 //! # send
 //!
 //! `send` reads the status, subscribes, sends the message and waits for its outcome, at most
@@ -87,9 +96,11 @@
 //!
 //! # Output (stable: scripts parse it)
 //!
-//! Every line goes through [`say`], which replaces every control character with a space, as the
-//! station does (rule 9 in `chief::api`, hard rule 8): nothing a peer or a tower wrote can move
-//! the cursor, clear the screen or forge a line. Fields are separated by one space; peer names,
+//! Every line goes through [`say`], which replaces with a space every control character, as the
+//! station does (rule 9 in `chief::api`, hard rule 8), and also U+2028 LINE SEPARATOR, U+2029
+//! PARAGRAPH SEPARATOR and the bidirectional controls U+202A to U+202E and U+2066 to U+2069:
+//! nothing a peer or a tower wrote can move the cursor, clear the screen, forge a line, or reorder
+//! the fields of a line. Fields are separated by one space; peer names,
 //! station ids, URLs, times and status words contain no space, so only the last field of a line
 //! may.
 //!
@@ -121,8 +132,10 @@
 //! See [`Exit`]: 0 done (for `send`: delivered); 1 the station refused or the operation failed
 //! (for `send`: refused, so not sent, or failed, so not delivered; for `chat`: at the end of the
 //! input, a line was refused or not sent, or the input failed); 2 usage error; 3 cannot talk
-//! to a station, or the station restarted during the command (`log`, `status`, `send`), or
-//! stopped during a `chat`; for `send` also an unknown outcome (see "send" above).
+//! to a station (none is running, it speaks another API version, it is shutting down, it stopped
+//! answering or answered nonsense), or the station restarted during the command (`log`,
+//! `status`, `send`), or stopped during a `chat`; for `send` also an unknown outcome (see "send"
+//! above).
 //!
 //! # Process-global state
 //!
@@ -130,7 +143,7 @@
 //! the environment once through [`PathEnv::read`] and owns the runtime.
 
 use chief::api::{
-    ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, Message,
+    ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message,
     MessageStatus, Peer, TowerState,
 };
 use chief::client::{BindInstance, Client};
@@ -152,6 +165,10 @@ pub const CHAT_TAIL: u32 = 50;
 /// the input until there is room.
 const CHAT_QUEUE_MAX: usize = 64;
 
+/// How many messages `log` reads at most, far above what a station keeps (M1 keeps 1,000): a
+/// station whose pages add up to more is answering nonsense ([`ApiError::BadReply`]).
+pub const LOG_MAX_MESSAGES: usize = 100_000;
+
 /// How long `send` waits for the outcome of a message the station accepted, before it gives up
 /// with exit 3: a bound of its own, whatever the station's send deadline is.
 pub const SEND_OUTCOME_WAIT: Duration = Duration::from_secs(120);
@@ -164,8 +181,8 @@ Exit status:
      (it was not sent) or reported that it failed (it was not delivered); for chat: at the end
      of the input, a line was refused, too long or not UTF-8, or the input failed
   2  usage error
-  3  cannot talk to a station: none is running, it speaks another API version, it stopped
-     answering, or it restarted during the command; for send: also when the outcome is unknown
+  3  cannot talk to a station: none is running, it speaks another API version, it is shutting
+     down, it stopped answering, or it restarted during the command; for send: also when the outcome is unknown
      (see chief send --help); for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
@@ -271,8 +288,8 @@ pub enum Exit {
     Failed,
     /// 2: a usage error, reported by clap.
     Usage,
-    /// 3: cannot talk to a station: none is running, it speaks another API version, the
-    /// connection broke, it did not answer in time or answered nonsense. Also when the station
+    /// 3: cannot talk to a station: none is running, it speaks another API version, it is
+    /// shutting down, the connection broke, it did not answer in time or answered nonsense. Also when the station
     /// restarted during a command of several calls (the next call is refused before it reaches
     /// the new instance), when a `chat` ends because the station stopped, when no socket path
     /// can be worked out, and when the outcome of a `send` is unknown (see the crate docs).
@@ -301,19 +318,20 @@ impl Exit {
     }
 
     /// The exit for a station API error: [`Exit::NoStation`] for the errors that mean the station
-    /// cannot be talked to, [`Exit::Failed`] for every error the station answers with.
+    /// cannot be talked to, [`ApiError::Stopping`] included (nothing was done), [`Exit::Failed`]
+    /// for every other error the station answers with.
     pub fn for_error(error: &ApiError) -> Self {
         match error {
             ApiError::NotRunning { .. }
             | ApiError::IncompatibleApi { .. }
             | ApiError::Disconnected { .. }
             | ApiError::Timeout { .. }
-            | ApiError::BadReply { .. } => Self::NoStation,
+            | ApiError::BadReply { .. }
+            | ApiError::Stopping => Self::NoStation,
             ApiError::PeerNotFound { .. }
             | ApiError::StationTaken { .. }
             | ApiError::MessageNotFound { .. }
             | ApiError::Invalid { .. }
-            | ApiError::Stopping
             | ApiError::Internal { .. }
             | ApiError::BadRequest { .. } => Self::Failed,
         }
@@ -331,7 +349,11 @@ impl From<Exit> for std::process::ExitCode {
 ///
 /// Fails, with a sentence for the user that names `--station`, when no default data dir can be
 /// worked out (neither `XDG_DATA_HOME` nor `HOME` is an absolute path) or the path does not fit a
-/// Unix socket address. The caller prints it and exits with [`Exit::NoStation`].
+/// Unix socket address. For a path that does not fit, the sentence keeps the reason of
+/// [`check_socket_path`] and replaces its advice, which is for the daemon, with `chief`'s own:
+/// another `--station PATH` when one was given, otherwise `--station PATH` or a shorter
+/// `XDG_RUNTIME_DIR` (the default socket is under it when it is set). The caller prints it and
+/// exits with [`Exit::NoStation`].
 pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, String> {
     let path = match station {
         Some(path) => path.to_path_buf(),
@@ -345,7 +367,17 @@ pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, Str
         }
     };
     check_socket_path(&path).map_err(|e| match e {
-        ApiError::Invalid { reason, .. } => format!("cannot use the socket path: {reason}"),
+        ApiError::Invalid { reason, .. } => {
+            // The library's reason ends with advice for the daemon (`--data-dir`), which `chief`
+            // does not have: keep the reason, give advice of its own.
+            let reason = reason.rsplit_once("; ").map_or(reason.as_str(), |(r, _)| r);
+            let advice = if station.is_some() {
+                "pass another --station PATH"
+            } else {
+                "pass --station PATH, or set XDG_RUNTIME_DIR to a shorter directory"
+            };
+            format!("cannot use the socket path: {reason}; {advice}")
+        }
         other => other.to_string(),
     })?;
     Ok(path)
@@ -362,10 +394,11 @@ pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, Str
 /// command" in the crate docs). `client` itself stays unbound.
 ///
 /// Exit codes ([`Exit`]): 0 done; 1 the station refused; 3 cannot talk to the station, which
-/// includes the bound instance being gone (the station restarted mid-command), a log cursor that
-/// does not move back ([`ApiError::BadReply`]), a `send` whose outcome is unknown (it got no
-/// answer, or the station accepted it and the wait for the outcome failed or passed
-/// [`SEND_OUTCOME_WAIT`]), and a `chat` that ends because the station stopped. At the end of
+/// includes a station that is shutting down, the bound instance being gone (the station restarted
+/// mid-command), a log page of the wrong shape or a log longer than [`LOG_MAX_MESSAGES`]
+/// ([`ApiError::BadReply`]), a `send` whose outcome is unknown (it got no answer, or the station
+/// accepted it and the wait for the outcome failed or passed [`SEND_OUTCOME_WAIT`]), and a `chat`
+/// that ends because the station stopped. At the end of
 /// `input`, once the lines read so far have been sent, `chat` returns 0 if the station accepted
 /// every non-empty line, and 1 if it refused one, a line was too long or not UTF-8, or `input`
 /// failed.
@@ -403,10 +436,13 @@ where
     }
 }
 
-/// Writes `text` and a newline to `w`. It replaces every control character in `text` with a
-/// space: every `char` for which [`char::is_control`] is true (C0, DEL and C1, so newline,
+/// Writes `text` and a newline to `w`. It replaces with a space every control character in
+/// `text`: every `char` for which [`char::is_control`] is true (C0, DEL and C1, so newline,
 /// carriage return, tab and escape too), the same words and the same rule as rule 9 in
-/// `chief::api` for the station.
+/// `chief::api` for the station. It also replaces the characters that rule leaves, but that can
+/// break a line or reorder its fields for a reader that splits on Unicode line breaks or shows
+/// bidirectional text: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, the bidirectional
+/// embeddings and overrides U+202A to U+202E, and the bidirectional isolates U+2066 to U+2069.
 ///
 /// The one way this crate prints anything, so that no text from a station, a peer or a tower
 /// reaches the terminal unfiltered (hard rule 8). The station replaces control characters in peer
@@ -414,10 +450,15 @@ where
 pub fn say(w: &mut dyn Write, text: &str) -> io::Result<()> {
     let clean: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if replaced(c) { ' ' } else { c })
         .collect();
     writeln!(w, "{clean}")?;
     w.flush()
+}
+
+/// Whether [`say`] replaces `c` with a space.
+fn replaced(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Formats unix milliseconds as UTC `YYYY-MM-DDTHH:MM:SSZ`, dropping the milliseconds. Years past
@@ -731,8 +772,16 @@ async fn log<T: BindInstance>(
     // are buffered and printed only once the whole read has succeeded.
     let mut pages: Vec<Vec<Message>> = Vec::new();
     let mut before: Option<u64> = None;
+    let mut read = 0usize;
     loop {
         let page = client.log(peer, before, LOG_PAGE_MAX_MESSAGES).await?;
+        check_page(&page, before)?;
+        read = read.saturating_add(page.messages.len());
+        if read > LOG_MAX_MESSAGES {
+            return Err(Stop::Api(ApiError::BadReply {
+                detail: format!("the log runs past {LOG_MAX_MESSAGES} messages"),
+            }));
+        }
         let empty = page.messages.is_empty();
         pages.push(page.messages);
         match page.next_before {
@@ -771,13 +820,38 @@ async fn log<T: BindInstance>(
     Ok(Exit::Done)
 }
 
+/// Checks the shape of a page of the log asked with `before` (rule 6 in `chief::api`): its
+/// messages ascend by `seq`, are all below `before` if one was asked, and its cursor, if any, is
+/// the `seq` of its first message. An empty page with a cursor is left to the caller.
+fn check_page(page: &LogPage, before: Option<u64>) -> Result<(), ApiError> {
+    let bad = |detail: &str| {
+        Err(ApiError::BadReply {
+            detail: detail.to_owned(),
+        })
+    };
+    if !page.messages.windows(2).all(|w| w[0].seq < w[1].seq) {
+        return bad("the messages of a page of the log do not ascend");
+    }
+    if let Some(b) = before
+        && page.messages.iter().any(|m| m.seq >= b)
+    {
+        return bad("a page of the log holds a message at or after its cursor");
+    }
+    match (page.next_before, page.messages.first()) {
+        (Some(next), Some(first)) if next != first.seq => {
+            bad("the cursor of a page of the log is not its first message")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A send of `chat` in flight.
 type PendingSend<'a> = Pin<Box<dyn Future<Output = Result<Message, ApiError>> + 'a>>;
 
 /// Whether `error` means that the chat cannot go on with this station: the errors of "cannot talk
-/// to a station" ([`Exit::NoStation`]) and a station that is shutting down.
+/// to a station" ([`Exit::NoStation`]), a station that is shutting down included.
 fn station_gone(error: &ApiError) -> bool {
-    Exit::for_error(error) == Exit::NoStation || *error == ApiError::Stopping
+    Exit::for_error(error) == Exit::NoStation
 }
 
 /// Why a chat ended before the end of its input.
