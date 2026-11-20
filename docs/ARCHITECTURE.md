@@ -366,7 +366,7 @@ crates/
   numbers/          the network library: towers, endpoint + gate, link, protocols
   tower/            `tower` binary + embeddable lib (used by tests)              package `numbers-tower`
   station/          station core + local-socket server (library)                 package `numbers-station`
-  station-daemon/   `station` binary
+  station-daemon/   `station` binary                                             package `numbers-station-daemon`
   chief/            the shared frontend library: station API types + client
   chief-cli/        `chief` binary
   airspace/         persistence: a blind half towers also use, a sealed half for members   (M4)
@@ -385,7 +385,8 @@ depends on `chief` for the API types, never the reverse.
 
 ## Appendix: verified facts the first milestones rely on
 
-Read from published sources, not compiled.
+Read from published sources, not compiled, except the dependency line, which CI builds
+(`cargo check -p numbers`).
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
   (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and
