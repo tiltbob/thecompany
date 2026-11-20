@@ -1,14 +1,15 @@
 # theCompany
 
-A p2p network, called `numbers`, for a small self-hosted team working with coding agents: chat,
-sockets, files, locks and a persistence layer.
+theCompany coordinates coding agents that run on different machines, for one person, the chief.
+Its p2p network is called `numbers`: chat, sockets, files, locks and a persistence layer. One
+instance of the company is one network, and every node on it can reach every other one.
 
 **Status:** the loopback dev tower runs. The station and chat tools are in development.
 
 | Name | What it is |
 |---|---|
-| chief | a person on the team: an identity, not a machine |
-| station | a chief's node: a daemon on the chief's workstation; the `chief` CLI, GUI and phone app are frontends to it |
+| chief | the one person a network belongs to: an identity, not a machine. A network has exactly one chief |
+| station | one of the chief's nodes, one per device (laptop, desktop, phone): a daemon; the `chief` CLI, GUI and phone app are frontends to it |
 | safehouse | a node that runs agents in harnesses (Claude Code and Codex first) |
 | handler | later: the node that sets safehouses up in isolated environments |
 | tower | an untrusted node: relay, rendezvous, and the final store for encrypted blocks |

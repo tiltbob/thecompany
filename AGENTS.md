@@ -5,13 +5,15 @@ file through `CLAUDE.md`.
 
 ## What this is
 
-**theCompany** is a p2p network, called `numbers`, for a small self-hosted team working with coding
-agents: chat, sockets, files, locks and a persistence layer.
+**theCompany** coordinates coding agents that run on different machines, for one person, the
+chief. Its p2p network is called `numbers`: chat, sockets, files, locks and a persistence layer.
+One instance of the company is one network, and every node on it can reach every other one;
+towers do the routing, forwarding and replication that takes.
 
 | Name | What it is |
 |---|---|
-| chief | a person on the team: an identity, not a machine |
-| station | a chief's node: a daemon on the chief's workstation; the `chief` CLI, GUI and phone app are frontends to it |
+| chief | the one person a network belongs to: an identity, not a machine. A network has exactly one chief |
+| station | one of the chief's nodes, one per device (laptop, desktop, phone): a daemon; the `chief` CLI, GUI and phone app are frontends to it |
 | safehouse | a node that runs agents in harnesses (Claude Code and Codex first) |
 | handler | later: the node that sets safehouses up in isolated environments |
 | tower | an untrusted node: relay, rendezvous, and the final store for encrypted blocks |
@@ -52,11 +54,13 @@ The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed. Tes
    documented exception, in a frontend started by the chief: the git helper running git.
 2. **Towers never hold keys.** A tower sees ciphertext only. The tower binary contains no sealing or
    key code.
-3. **Harness credentials.** Harnesses authenticate with API keys only. Never drive, relay or
-   automate a subscription sign-in (claude.ai, ChatGPT), never parse, copy or move a harness's own
-   credential files, and never inject tokens. An API key is entered by its chief and passed to the
-   safehouse that chief names: never log it, echo it, return it from an API or put it in an error or
-   an event, and never give it to a tower, another chief or airspace.
+3. **Harness credentials and secrets.** Harnesses authenticate with API keys only. Never drive,
+   relay or automate a subscription sign-in (claude.ai, ChatGPT), never parse, copy or move a
+   harness's own credential files, and never inject tokens. An API key is a secret. A secret is
+   entered by the chief into one scope — the chief's own (user) or a project — and is opened only
+   on the chief's stations and for the sessions it is for on a safehouse: never log a secret's
+   value, echo it, return it from an API or put it in an error or an event, and never give it in
+   the clear to a tower or to airspace, or to a session of another project.
 4. **One station per identity.** A station takes an exclusive lock on its data dir. Two processes
    must never share a node key.
 5. **Frontends hold no network state.** `chief` and `chief-cli` depend on `numbers-base` only, never
