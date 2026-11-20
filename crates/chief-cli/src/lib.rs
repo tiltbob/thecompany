@@ -183,8 +183,8 @@ Exit status:
      of the input, a line was refused, too long or not UTF-8, or the input failed
   2  usage error
   3  cannot talk to a station: none is running, it speaks another API version, it is shutting
-     down, it stopped answering, or it restarted during the command; for send: also when the outcome is unknown
-     (see chief send --help); for chat: the station stopped or restarted
+     down, it stopped answering, or it restarted during the command; for send: also when the
+     outcome is unknown (see chief send --help); for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
 set, otherwise station.sock in the station's data dir, $XDG_DATA_HOME/thecompany/station (or
@@ -247,7 +247,8 @@ pub enum Command {
     ///
     /// End of input (Ctrl-D) ends the chat once the lines typed so far have been sent, without
     /// waiting for their outcome; `chief send` is the command that waits for it. The exit is then
-    /// 0 if every line was sent, and 1 if a line was refused or not sent.
+    /// 0 if the station accepted every line, and 1 if it refused one, a line was not sent, or the
+    /// input could not be read.
     ///
     /// The chat ends with exit 3 when the station stops or restarts. Then stderr also says if the
     /// last line may have been sent (check `chief log <peer>`) and how many typed lines were not
