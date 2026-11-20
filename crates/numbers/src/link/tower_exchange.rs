@@ -53,14 +53,17 @@ pub struct IncomingTowers {
 }
 
 impl IncomingTowers {
-    /// Runs `commit` only while this station and its exact admitted transport remain current.
+    /// Runs `commit` only while the announcing station, its authorization and its exact admitted
+    /// transport remain current. A stale envelope skips the callback.
     ///
-    /// The callback runs synchronously under the link's peer lock. It must check the station's
-    /// current peer book and return `true` only after committing the entire snapshot. Keep it
-    /// short and make no Link calls from it.
+    /// The callback receives the announcing station's node ID, its authorized peer name and its
+    /// validated snapshot. It runs synchronously under the link's peer lock. It must check the
+    /// receiving station's current peer book and return `true` only after committing the entire
+    /// snapshot. Keep it short and make no Link calls from it.
     ///
-    /// Returns whether the snapshot was committed. The sender can lose the acknowledgement
-    /// even when the callback commits successfully.
+    /// Returns whether the snapshot was committed. A successful commit queues an acknowledgement.
+    /// Returning `false` from the callback, rejecting a stale envelope or dropping the envelope
+    /// queues an `unavailable` reply. The sender can lose the reply if the stream has already ended.
     pub fn accept_if_current(
         self,
         commit: impl FnOnce(NodeId, &str, TowerAnnouncement) -> bool,
@@ -262,5 +265,102 @@ fn is_current(state: &PeerState, connection: &Arc<EstablishedConnection>) -> boo
 fn unavailable() -> TowerReply {
     TowerReply::Nack {
         reason: TowerNackReason::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::tests::{connect, endpoint_with_streams};
+    use super::super::{DialResult, LinkConfig};
+    use super::*;
+
+    fn envelope(
+        shared: &Shared,
+        peer: &Arc<Peer>,
+        connection: &Arc<EstablishedConnection>,
+    ) -> (IncomingTowers, oneshot::Receiver<TowerReply>) {
+        let (reply, receive) = oneshot::channel();
+        (
+            IncomingTowers {
+                peer: Arc::downgrade(peer),
+                connection: Arc::downgrade(connection),
+                authorizer: Arc::downgrade(&shared.authorizer),
+                name: Arc::from("peer"),
+                announcement: TowerAnnouncement::from_working_set(&TowerSet::default()),
+                reply,
+            },
+            receive,
+        )
+    }
+
+    #[tokio::test]
+    async fn replaced_envelope_cannot_commit_while_old_transport_is_held() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let local = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
+            let remote = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
+            local
+                .authorizer()
+                .replace_peers([(remote.iroh().id(), "peer".into())]);
+            remote
+                .authorizer()
+                .replace_peers([(local.iroh().id(), "local".into())]);
+            let (towers, _exchange) = TowerProtocol::new(&TowerSet::default());
+            let (shared, _inbox) = Shared::with_towers(
+                &local,
+                LinkConfig {
+                    connect_timeout: budget,
+                    send_deadline: budget,
+                },
+                Some(towers),
+            );
+            let peer = shared.peer(remote.iroh().id()).unwrap();
+            let (old, _old_remote) = connect(&local, &remote).await;
+            let held = {
+                let mut state = peer.state();
+                assert!(shared.admit(&peer, &mut state, &old, None, [1; 16]) == DialResult::Ready);
+                Arc::clone(&state.active.as_ref().unwrap().connection)
+            };
+            let (obsolete, mut obsolete_reply) = envelope(&shared, &peer, &held);
+
+            let (new, _new_remote) = connect(&local, &remote).await;
+            let active = {
+                let mut state = peer.state();
+                assert!(
+                    shared.admit(&peer, &mut state, &new, Some([1; 16]), [2; 16])
+                        == DialResult::Ready
+                );
+                assert!(state.is_current(&new));
+                Arc::clone(&state.active.as_ref().unwrap().connection)
+            };
+
+            // A lease held by an in-flight send can keep the old connection alive after replacement.
+            assert!(obsolete.peer.upgrade().is_some());
+            assert!(obsolete.connection.upgrade().is_some());
+            assert!(obsolete.authorizer.upgrade().is_some());
+            assert!(!obsolete.accept_if_current(|_, _, _| panic!("replaced item must not commit")));
+            assert!(matches!(
+                obsolete_reply.try_recv(),
+                Ok(TowerReply::Nack {
+                    reason: TowerNackReason::Unavailable
+                })
+            ));
+
+            let (current, mut current_reply) = envelope(&shared, &peer, &active);
+            assert!(current.accept_if_current(|station, name, snapshot| {
+                assert!(station == peer.id, "authenticated peer matches");
+                assert_eq!(name, "peer");
+                assert!(snapshot.entries().is_empty());
+                true
+            }));
+            assert!(matches!(current_reply.try_recv(), Ok(TowerReply::Ack)));
+
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("check the replaced envelope before the test deadline");
     }
 }

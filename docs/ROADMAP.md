@@ -289,14 +289,15 @@ connection whose selected relay path goes down does not move to the new home tow
 through its original tower.
 
 **Towers named by a peer** (decision 16, settled on #73: exchange and show only). Over an
-established link with a peer in the peer book, a station sends its own working set. What arrives
-must be `https`, in the canonical form, with a root path, at most 8 entries and within the 64 KiB
-frame cap; anything else drops the whole list. The station keeps what arrives as candidates, with
-the source `peer` and the peer's name, and shows them. It never connects to a candidate, never adds
-one to its relay map and never passes one on, also when every tower of its own set has failed. A
-chief may take a candidate into the set with an explicit command, `chief tower add <url>`, as with
-any tower URL the chief types; that is the chief's own act, so hard rule 8 is not touched. A station
-whose towers are all gone therefore recovers through SRV or through the chief, not through a peer.
+established link with a peer in the peer book, a station sends the HTTPS entries of its working
+set. What arrives must be `https`, in the canonical form, with a root path, at most 8 entries and
+within the 64 KiB frame cap. Anything else drops the whole list. The station keeps what arrives as
+candidates, with the source `peer` and the peer's name, and shows them. It never connects to a
+candidate, never adds one to its relay map and never passes one on, even when every tower in its
+own set has failed. A chief may take a candidate into the set with the explicit command
+`chief tower add <url>`, as with any tower URL the chief types. That explicit choice follows
+hard rule 8. A station whose towers are all gone therefore recovers through SRV or through
+the chief.
 
 **What the station shows.** `home_relay_status()` lists the home tower only, so the API distinguishes
 an observed state from an unobserved tower in the station's set. The home tower can be connected,
@@ -486,10 +487,11 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     iroh's `portmapper` feature out of the libraries. If real deployments show links that stay
     relayed and hurt, it comes back as an explicit opt-in of the station.
 16. **Tower sets passed on by peers (M2).** Decided by both agents on #73: exchange and show only.
-    A station sends its own working set to peers in its peer book and shows what it gets as
-    candidates with the peer's name; it never connects to one, adds one to its relay map or passes
-    one on, and a chief may take one into the set with an explicit command. Whether a station may
-    ever use a peer's candidates on its own is an exception to hard rule 8 and left to the owner.
+    A station sends the HTTPS entries of its working set to peers in its peer book and shows what
+    it gets as candidates with the peer's name. The station never connects to a candidate, adds
+    one to its relay map or passes one on. A chief may take one into the set with an explicit
+    command. Whether a station may ever use a peer's candidates on its own is an exception to
+    hard rule 8 and left to the owner.
 17. **Recovering a tower (M2).** Decided by both agents on #74: a watchdog in the station removes
     and re-inserts towers only after it has seen no home tower, or a home tower that is not
     connected, for some seconds, at a growing, capped interval, and never while the home tower is

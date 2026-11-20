@@ -174,10 +174,15 @@ async fn reply(mut send: SendStream, value: &Value) {
 }
 
 async fn read_towers(connection: &Connection, url: &str, response: Value) {
+    let send = read_tower_request(connection, url).await;
+    reply(send, &response).await;
+}
+
+async fn read_tower_request(connection: &Connection, url: &str) -> SendStream {
     let (header, body, send) = read_request(connection).await;
     assert_eq!(header, StreamHeader::towers());
     assert_eq!(body, json!({"towers":[{"url":url,"qad_port":7842}]}));
-    reply(send, &response).await;
+    send
 }
 
 async fn open_request<T: Serialize>(
@@ -346,10 +351,9 @@ async fn a_same_path_replacement_announces_the_new_snapshot_and_invalidates_old_
             .await;
             let committed = commit(next(&mut exchange).await, peer, "second");
             assert_eq!(frame::<Value>(&mut response).await, ack());
-            second.close(0u32.into(), b"");
-            checked(link.shutdown().await, "stop the local link");
             assert_eq!(committed.entries()[0].url(), "https://candidate.invalid/");
             assert_eq!(committed.entries()[0].qad(), Qad::Port(8610));
+            checked(link.shutdown().await, "stop the local link");
             checked(
                 timeout(CONNECT, remote.endpoint.iroh().close()).await,
                 "close raw endpoint",
@@ -557,6 +561,91 @@ async fn legacy_version_and_stream_gate_refusals_leave_chat_available() {
         })
         .await,
         "tower version and gate tests completed",
+    );
+}
+
+#[tokio::test]
+async fn an_outgoing_announcement_refusal_leaves_chat_available_without_retrying() {
+    checked(
+        timeout(CASE, async {
+            for reset in [false, true] {
+                let (local, remote) = pair().await;
+                let address = local.address.clone();
+                let peer = remote.id();
+                let (link, mut chats, _exchange) = Link::start_with_towers(
+                    local.endpoint,
+                    config(),
+                    &snapshot("https://local.invalid/"),
+                );
+                let connection = dial(&remote, &address).await;
+                raw_client_hello(&connection).await;
+                let mut send = read_tower_request(&connection, "https://local.invalid/").await;
+                if reset {
+                    checked(send.reset(403u32.into()), "refuse outgoing tower stream");
+                } else {
+                    reply(send, &nack("unsupported_version")).await;
+                }
+                raw_chat(&connection, &mut chats, peer).await;
+                assert_no_stream(&connection).await;
+                assert!(connection.close_reason().is_none());
+                checked(link.shutdown().await, "stop the local link");
+                remote.endpoint.iroh().close().await;
+            }
+        })
+        .await,
+        "outgoing tower refusals test completed",
+    );
+}
+
+#[tokio::test]
+async fn an_announcement_ack_requires_a_successful_whole_snapshot_commit() {
+    checked(
+        timeout(CASE, async {
+            let (local, remote) = pair().await;
+            let address = local.address.clone();
+            let peer = remote.id();
+            let (link, _chat, mut exchange) = Link::start_with_towers(
+                local.endpoint,
+                config(),
+                &snapshot("https://local.invalid/"),
+            );
+            let connection = dial(&remote, &address).await;
+            raw_client_hello(&connection).await;
+            read_towers(&connection, "https://local.invalid/", ack()).await;
+
+            let snapshot = json!({"towers":[
+                {"url":"https://candidate.invalid/","qad_port":8610},
+                {"url":"https://another.invalid/"}
+            ]});
+            let mut refused = tower_request(&connection, &snapshot).await;
+            let held = next(&mut exchange).await;
+            assert!(timeout(QUIET, refused.read(&mut [0])).await.is_err());
+            let mut called = false;
+            let accepted = held.accept_if_current(|_, _, _| {
+                called = true;
+                false
+            });
+            assert!(called, "the current envelope reached the callback");
+            assert_eq!(frame::<Value>(&mut refused).await, nack("unavailable"));
+            assert!(!accepted);
+
+            let mut accepted = tower_request(&connection, &snapshot).await;
+            let held = next(&mut exchange).await;
+            assert!(timeout(QUIET, accepted.read(&mut [0])).await.is_err());
+            let committed = commit(held, peer, "second");
+            let entries = committed.entries();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].url(), "https://candidate.invalid/");
+            assert_eq!(entries[0].qad(), Qad::Port(8610));
+            assert_eq!(entries[1].url(), "https://another.invalid/");
+            assert_eq!(entries[1].qad(), Qad::Off);
+            assert_eq!(frame::<Value>(&mut accepted).await, ack());
+
+            checked(link.shutdown().await, "stop the local link");
+            remote.endpoint.iroh().close().await;
+        })
+        .await,
+        "tower commit reply test completed",
     );
 }
 

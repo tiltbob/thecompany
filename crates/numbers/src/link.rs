@@ -1130,21 +1130,28 @@ mod tests {
     use crate::{EndpointConfig, IpTransport, generate_node_key};
 
     async fn loopback_endpoint() -> Endpoint {
+        endpoint_with_streams(&[CHAT_PROTOCOL]).await
+    }
+
+    pub(super) async fn endpoint_with_streams(streams: &'static [&'static str]) -> Endpoint {
         let endpoint = Endpoint::bind(
             &generate_node_key(),
             EndpointConfig {
                 ip_transport: IpTransport::LoopbackOnly,
                 ..EndpointConfig::default()
             },
-            Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL])),
+            Arc::new(Authorizer::new(&[LINK_ALPN], streams)),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("bind a loopback endpoint"));
         endpoint.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
         endpoint
     }
 
-    async fn connect(dialer: &Endpoint, listener: &Endpoint) -> (Connection, Connection) {
+    pub(super) async fn connect(
+        dialer: &Endpoint,
+        listener: &Endpoint,
+    ) -> (Connection, Connection) {
         let socket = listener.iroh().bound_sockets()[0];
         let address = iroh::EndpointAddr::new(listener.iroh().id()).with_ip_addr(socket);
         let (client, server) = tokio::join!(dialer.iroh().connect(address, LINK_ALPN), async {
