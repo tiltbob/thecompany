@@ -21,6 +21,7 @@ use iroh_relay::server::{
 };
 
 mod certs;
+pub mod config;
 mod tls;
 
 pub use certs::TlsFileProblem;
