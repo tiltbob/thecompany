@@ -3,7 +3,7 @@
 use std::future::{Future, poll_fn, ready};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +24,7 @@ use numbers_station::{
 };
 use numbers_tower::{Tower, TowerConfig};
 use tokio::sync::mpsc;
+use tokio::task::yield_now;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -441,6 +442,83 @@ async fn restart_keeps_key_and_book_and_reconnects_on_next_send() {
             network.shutdown().await;
         },
         "station restart timed out",
+    )
+    .await;
+}
+
+/// Polls `future` once without waiting.
+async fn poll_now<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+    poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
+}
+
+/// Whether the station has ended this subscription, after reading what was queued. Never waits.
+async fn subscription_ended(events: &mut Subscription) -> bool {
+    loop {
+        let mut next = pin!(events.next());
+        match poll_now(&mut next).await {
+            Poll::Ready(Some(_)) => {}
+            Poll::Ready(None) => return true,
+            Poll::Pending => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_second_start_is_refused_until_shutdown_has_returned() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let config = network.config("station", IpTransport::RelayOnly);
+            let (station, client) = start(config.clone()).await;
+            let target = station_id(&client).await;
+            let ((), peer) = tokio::join!(
+                wait_online(&client),
+                WirePeer::connect(&network.tower, &client, "peer")
+            );
+            // A live link gives the endpoint a peer connection to close besides the tower's. With
+            // only the tower connection, the shutdown ended before any attempt could overlap it.
+            peer.send(target, "open-link", "open the link", 0).await;
+            wait_api_link(&client, ApiLink::Relayed).await;
+            let mut events = subscribe(&client).await;
+
+            // This test runs on a current-thread runtime, so the actor runs only while this task
+            // waits. A refused start does not wait, so an attempt made between two polls that
+            // both found the shutdown pending overlapped it. Only attempts made after the actor
+            // left its loop count, since an earlier one proves nothing about the shutdown steps.
+            let mut shutdown = pin!(stop(station));
+            let mut refused_while_pending = 0_u32;
+            loop {
+                yield_now().await;
+                // The actor drops every subscription after it left its loop and before it
+                // closes its jobs and the endpoint.
+                let stopping = subscription_ended(&mut events).await;
+                if poll_now(&mut shutdown).await.is_ready() {
+                    break;
+                }
+                assert!(
+                    matches!(
+                        Station::start(config.clone()).await,
+                        Err(StartError::AlreadyRunning)
+                    ),
+                    "a second station started before the first one's shutdown returned"
+                );
+                if poll_now(&mut shutdown).await.is_ready() {
+                    break;
+                }
+                if stopping {
+                    refused_while_pending += 1;
+                }
+            }
+            assert!(
+                refused_while_pending > 0,
+                "no start attempt overlapped the pending shutdown"
+            );
+            let (restarted, _client) = start(config).await;
+            tokio::join!(stop(restarted), peer.shutdown());
+            network.shutdown().await;
+        },
+        "shutdown lock test timed out",
     )
     .await;
 }
