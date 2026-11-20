@@ -15,5 +15,5 @@ pub use frame::{
 #[cfg(unix)]
 pub use keyfile::{
     KeyOrigin, PrivatePathError, StoredKey, check_private_dir, create_key_file, ensure_private_dir,
-    load_or_create_key, read_key_file,
+    load_or_create_key, load_or_create_key_in, read_key_file,
 };
