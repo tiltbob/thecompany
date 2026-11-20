@@ -473,7 +473,7 @@ moves from OS accounts inside one safehouse to one safehouse per chief or per jo
 Cargo.toml  rust-toolchain.toml  clippy.toml  CLAUDE.md  .github/workflows/ci.yml  scripts/
 docs/               ARCHITECTURE.md  ROADMAP.md         (this plan, kept current per milestone)
 crates/
-  base/             leaf crate: frame codec, key files; later the roster codec   package `numbers-base`
+  base/             leaf crate: frame codec, key files, pure tower URL validation; later the roster codec   package `numbers-base`
   numbers/          the network library: towers, endpoint + gate, link, protocols
   tower/            `tower` binary + embeddable lib (used by tests)              package `numbers-tower`
   station/          station core + local-socket server (library)                 package `numbers-station`
