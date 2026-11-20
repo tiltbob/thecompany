@@ -17,10 +17,13 @@ use numbers_station::ipc::{IpcConfig, IpcError, IpcServer};
 use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Notify, watch};
 
 /// The bound on every test.
 const TEST_BOUND: Duration = Duration::from_secs(60);
@@ -137,6 +140,199 @@ fn mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o7777
+}
+
+/// Binds a server for `fake` on `path`, retrying while the socket is still in use (a dropped
+/// server on its way down), within the read bound.
+async fn bind_when_free(fake: &FakeStation, path: &Path) -> IpcServer {
+    tokio::time::timeout(READ_BOUND, async {
+        loop {
+            match IpcServer::bind(fake.clone(), path, IpcConfig::default()).await {
+                Ok(server) => return server,
+                Err(IpcError::InUse { .. }) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .expect("the socket was not freed in time")
+}
+
+// A transport whose calls can stay pending.
+
+/// The call that [`Pending`] holds: [`Request::Message`] for this seq.
+const PENDING_SEQ: u64 = 4_242;
+
+fn pending_call() -> Open {
+    Open::Call {
+        request: Request::Message { seq: PENDING_SEQ },
+    }
+}
+
+/// What happened to the calls [`Pending`] held.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Counts {
+    /// Held calls that reached the transport.
+    started: usize,
+    /// Held calls whose future is being dropped unfinished (counted before a held drop blocks).
+    dropping: usize,
+    /// Held calls whose future was dropped unfinished.
+    cancelled: usize,
+    /// Held calls that were released and answered.
+    answered: usize,
+}
+
+/// Shared between a [`Pending`] transport and its test.
+struct Probe {
+    counts: Mutex<Counts>,
+    changed: Notify,
+    /// The gate of held calls: they answer once it is `true`.
+    gate: watch::Sender<bool>,
+    /// If set, the next held call that is dropped unfinished blocks in its drop until this
+    /// receives a message (or the read bound passes), so that its connection task cannot finish.
+    hold_drop: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl Probe {
+    fn new() -> Arc<Probe> {
+        Arc::new(Probe {
+            counts: Mutex::new(Counts::default()),
+            changed: Notify::new(),
+            gate: watch::Sender::new(false),
+            hold_drop: Mutex::new(None),
+        })
+    }
+
+    fn counts(&self) -> Counts {
+        *self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Counts)) {
+        change(&mut self.counts.lock().unwrap_or_else(PoisonError::into_inner));
+        self.changed.notify_waiters();
+    }
+
+    /// Waits, within the read bound, until `done` holds for the counts.
+    async fn wait(&self, what: &str, done: impl Fn(Counts) -> bool) {
+        tokio::time::timeout(READ_BOUND, async {
+            loop {
+                let notified = self.changed.notified();
+                let mut notified = pin!(notified);
+                notified.as_mut().enable();
+                if done(self.counts()) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: not within the bound; {:?}", self.counts()));
+    }
+
+    /// Lets every held call answer.
+    fn release(&self) {
+        self.gate.send_replace(true);
+    }
+}
+
+/// Counts one held call from its start until it is answered or dropped.
+struct Held {
+    probe: Arc<Probe>,
+    answered: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if self.answered {
+            self.probe.update(|c| c.answered += 1);
+            return;
+        }
+        let hold = self
+            .probe
+            .hold_drop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.probe.update(|c| c.dropping += 1);
+        if let Some(hold) = hold {
+            // Blocks this runtime worker on purpose: the connection task cannot finish meanwhile.
+            let _ = hold.recv_timeout(READ_BOUND);
+        }
+        self.probe.update(|c| c.cancelled += 1);
+    }
+}
+
+/// The fake station, except that [`Request::Message`] for [`PENDING_SEQ`] waits for
+/// [`Probe::release`] before the fake answers it.
+#[derive(Clone)]
+struct Pending {
+    fake: FakeStation,
+    probe: Arc<Probe>,
+}
+
+impl Transport for Pending {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        if !matches!(request, Request::Message { seq: PENDING_SEQ }) {
+            return self.fake.call(request).await;
+        }
+        let mut held = Held {
+            probe: Arc::clone(&self.probe),
+            answered: false,
+        };
+        self.probe.update(|c| c.started += 1);
+        let mut gate = self.probe.gate.subscribe();
+        let _ = gate.wait_for(|open| *open).await;
+        let answer = self.fake.call(request).await;
+        held.answered = true;
+        answer
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.fake.subscribe().await
+    }
+}
+
+/// A server on a [`Pending`] transport with `config`, and a client.
+async fn pending_rig(
+    config: IpcConfig,
+) -> (
+    TempDir,
+    FakeStation,
+    Arc<Probe>,
+    IpcServer,
+    Client<SocketTransport>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake("STATION-A");
+    let probe = Probe::new();
+    let transport = Pending {
+        fake: fake.clone(),
+        probe: Arc::clone(&probe),
+    };
+    let server = IpcServer::bind(transport, &socket_in(&dir), config)
+        .await
+        .unwrap();
+    let client = Client::new(SocketTransport::new(server.path()));
+    (dir, fake, probe, server, client)
+}
+
+/// One slot, and frames that never time out within a test: only the client leaving can free the
+/// slot.
+fn one_slot() -> IpcConfig {
+    IpcConfig {
+        frame_timeout: Duration::from_secs(600),
+        max_connections: 1,
+    }
+}
+
+/// A raw client that has sent the hello and `open`, and keeps the connection open.
+async fn raw_open(path: &Path, open: &Open) -> UnixStream {
+    let mut stream = raw_connect(path).await;
+    raw_hello(&mut stream, API_VERSION).await;
+    write_frame(&mut stream, open, LOCAL_FRAME_MAX)
+        .await
+        .unwrap();
+    stream
 }
 
 // 1. Calls.
@@ -682,6 +878,136 @@ async fn an_open_subscription_holds_its_slot_until_it_is_dropped() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_leaves_while_its_subscription_is_opened_frees_the_station_and_its_slot() {
+    bounded(async {
+        let rig = rig_with(one_slot()).await;
+        rig.fake.hold_subscribes(true);
+
+        // A raw client that closes its connection while the station holds its subscribe.
+        let raw = raw_open(rig.path(), &Open::Subscribe).await;
+        rig.fake.wait_for_held_subscribes(1).await;
+        drop(raw);
+        tokio::time::timeout(READ_BOUND, rig.fake.wait_for_held_subscribes(0))
+            .await
+            .expect("the server kept waiting for a subscribe whose client is gone");
+        assert_eq!(rig.client.status().await.unwrap(), rig.fake.status());
+
+        // A `SocketTransport` whose call timeout fires while the station holds its subscribe.
+        let t = SocketTransport::new(rig.path()).with_call_timeout(Duration::from_millis(200));
+        assert_eq!(
+            t.subscribe().await.unwrap_err(),
+            ApiError::Timeout { after_ms: 200 }
+        );
+        tokio::time::timeout(READ_BOUND, rig.fake.wait_for_held_subscribes(0))
+            .await
+            .expect("the server kept waiting for a subscribe whose client timed out");
+        // The only slot is free: the next client is served, by the same server.
+        assert_eq!(rig.client.status().await.unwrap(), rig.fake.status());
+        assert_eq!(rig.fake.subscriber_count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_leaves_while_its_call_is_pending_frees_its_slot() {
+    bounded(async {
+        let (_dir, fake, probe, server, client) = pending_rig(one_slot()).await;
+
+        // A raw client that closes its connection while the station works on its call.
+        let raw = raw_open(server.path(), &pending_call()).await;
+        probe
+            .wait("the call reached the station", |c| c.started == 1)
+            .await;
+        drop(raw);
+        probe
+            .wait("the pending call was dropped", |c| c.cancelled == 1)
+            .await;
+        assert_eq!(client.status().await.unwrap(), fake.status());
+
+        // A `SocketTransport` whose call timeout fires while the station works on its call.
+        let t = SocketTransport::new(server.path()).with_call_timeout(Duration::from_millis(200));
+        assert_eq!(
+            t.call(Request::Message { seq: PENDING_SEQ })
+                .await
+                .unwrap_err(),
+            ApiError::Timeout { after_ms: 200 }
+        );
+        probe
+            .wait("the pending call was dropped", |c| c.cancelled == 2)
+            .await;
+        // The only slot is free: the next client is served, by the same server.
+        assert_eq!(client.status().await.unwrap(), fake.status());
+        assert_eq!(probe.counts().answered, 0);
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_half_closes_after_open_is_treated_as_gone() {
+    bounded(async {
+        let (_dir, fake, probe, server, client) = pending_rig(one_slot()).await;
+
+        // A call: the server stops waiting and closes without an answer.
+        let mut raw = raw_open(server.path(), &pending_call()).await;
+        probe
+            .wait("the call reached the station", |c| c.started == 1)
+            .await;
+        raw.shutdown().await.unwrap();
+        probe
+            .wait("the pending call was dropped", |c| c.cancelled == 1)
+            .await;
+        match raw_read::<Reply>(&mut raw).await {
+            Err(FrameError::Closed | FrameError::Io(_)) => {}
+            other => panic!("expected the end of the stream, got {other:?}"),
+        }
+
+        // A subscription that is being opened: the same.
+        fake.hold_subscribes(true);
+        let mut raw = raw_open(server.path(), &Open::Subscribe).await;
+        fake.wait_for_held_subscribes(1).await;
+        raw.shutdown().await.unwrap();
+        tokio::time::timeout(READ_BOUND, fake.wait_for_held_subscribes(0))
+            .await
+            .expect("the server kept waiting for a subscribe whose client half-closed");
+        wait_closed(&mut raw).await;
+        assert_eq!(fake.subscriber_count(), 0);
+
+        assert_eq!(client.status().await.unwrap(), fake.status());
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_answer_reaches_a_client_that_waits() {
+    bounded(async {
+        let (_dir, _fake, probe, server, _client) = pending_rig(one_slot()).await;
+        let t = SocketTransport::new(server.path()).with_call_timeout(READ_BOUND);
+        let mut call =
+            tokio::spawn(async move { t.call(Request::Message { seq: PENDING_SEQ }).await });
+        probe
+            .wait("the call reached the station", |c| c.started == 1)
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut call)
+                .await
+                .is_err(),
+            "the call was answered before the station answered it"
+        );
+        probe.release();
+        assert_eq!(
+            call.await.unwrap().unwrap_err(),
+            ApiError::MessageNotFound { seq: PENDING_SEQ }
+        );
+        assert_eq!(probe.counts().answered, 1);
+        assert_eq!(probe.counts().cancelled, 0);
+        server.shutdown().await;
+    })
+    .await;
+}
+
 // 7. Setup.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -853,13 +1179,15 @@ async fn after_shutdown_the_socket_is_gone_and_clients_get_not_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dropped_server_stops_serving_and_its_socket_is_replaced_later() {
+async fn a_dropped_server_stops_serving_removes_its_socket_and_frees_it() {
     bounded(async {
         let rig = rig().await;
         let path = rig.path().to_path_buf();
+        // Idle connections: an open subscription, and a client that has not said hello.
         let mut events = rig.client.subscribe().await.unwrap();
+        let mut silent = raw_connect(&path).await;
         drop(rig.server);
-        // Aborting happens on the runtime after the drop; the subscription ending shows it did,
+        // The teardown runs on the runtime after the drop; the subscription ending shows it did,
         // and the listener was closed before that.
         assert_eq!(
             tokio::time::timeout(READ_BOUND, events.next())
@@ -867,24 +1195,78 @@ async fn a_dropped_server_stops_serving_and_its_socket_is_replaced_later() {
                 .unwrap(),
             None
         );
-        assert!(std::fs::symlink_metadata(&path).is_ok());
+        wait_closed(&mut silent).await;
         assert!(matches!(
             rig.client.status().await.unwrap_err(),
             ApiError::NotRunning { .. }
         ));
-        // The lock goes with the aborted task, which may still be on its way out: retry.
-        let mut attempts = 0;
-        let again = loop {
-            match IpcServer::bind(rig.fake.clone(), &path, IpcConfig::default()).await {
-                Ok(server) => break server,
-                Err(IpcError::InUse { .. }) if attempts < 500 => {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+        // The dropped server removes its socket file itself (no new `bind` has run yet that could
+        // have removed it as a leftover).
+        tokio::time::timeout(READ_BOUND, async {
+            while std::fs::symlink_metadata(&path).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped server left its socket file behind");
+        // The lock is released right after; the task may still be on its way out: retry.
+        let again = bind_when_free(&rig.fake, &path).await;
+        assert!(rig.client.status().await.is_ok());
+        again.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_server_frees_its_socket_only_after_every_connection_has_finished() {
+    bounded(async {
+        let (_dir, fake, probe, server, client) = pending_rig(IpcConfig {
+            frame_timeout: Duration::from_secs(600),
+            ..IpcConfig::default()
+        })
+        .await;
+        let path = server.path().to_path_buf();
+        // The connection task of the pending call cannot finish until `release` is sent.
+        let (release, held) = mpsc::channel();
+        *probe
+            .hold_drop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(held);
+        let mut raw = raw_open(&path, &pending_call()).await;
+        probe
+            .wait("the call reached the station", |c| c.started == 1)
+            .await;
+
+        drop(server);
+        probe
+            .wait("the server began to drop the pending call", |c| {
+                c.dropping == 1
+            })
+            .await;
+        // While that connection is still going down, the socket stays taken. The old server's
+        // listener is closed and nothing else holds the lock up, so a released lock would show
+        // within these attempts.
+        for _ in 0..20 {
+            match IpcServer::bind(fake.clone(), &path, IpcConfig::default()).await {
+                Err(IpcError::InUse { .. }) => {}
+                Ok(_) => panic!(
+                    "a new server took the socket while a connection of the dropped one was still \
+                     going down"
+                ),
                 Err(e) => panic!("{e}"),
             }
-        };
-        assert!(rig.client.status().await.is_ok());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(probe.counts().cancelled, 0);
+
+        release.send(()).unwrap();
+        probe
+            .wait("the pending call was dropped", |c| c.cancelled == 1)
+            .await;
+        let again = bind_when_free(&fake, &path).await;
+        assert_eq!(client.status().await.unwrap(), fake.status());
+        wait_closed(&mut raw).await;
+        assert_eq!(probe.counts().answered, 0);
         again.shutdown().await;
     })
     .await;
