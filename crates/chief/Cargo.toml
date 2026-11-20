@@ -24,7 +24,7 @@ rustix = { workspace = true, features = ["process"] }
 # The crate itself with the fake station, for its integration tests.
 chief = { workspace = true, features = ["fake"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
