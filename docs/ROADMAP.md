@@ -109,6 +109,9 @@ publishes its event as one operation before acknowledging it. Retries get anothe
 adding a log entry, publishing a new event or changing FIFO order. The window starts empty after
 a restart. [Decision #65](https://github.com/tiltbob/thecompany/issues/65)
 
+**Tower calls in API version 3.** M1 has one explicit pinned tower. Candidate pages are empty.
+The station validates add and remove URLs before returning `TowersPinned` for valid requests.
+
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when
 that variable is set, otherwise `<data-dir>/station.sock`; `chief --station PATH` overrides. The
@@ -142,6 +145,29 @@ holds the message in memory, which a restart of that station loses until M9 — 
 appears offline, or has not added you": an unknown caller is ignored, which looks like a timeout).
 `--tower` is required on every `station run` in M1; nothing about towers is persisted yet.
 `peer rm` closes the link to that peer.
+
+A send to a peer with several stations tries connected stations first, preserving peer-book order
+within each group. It tries one station at a time using the same message ID and one deadline, and
+stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets the
+send try the next station within the same deadline. A station admits at most 1,000 concurrent sends
+and returns an internal error if it is full. While the station is running, it publishes the final
+outcome even after its message leaves the log. The receiving station keeps the 1,000 most recent
+unique receipts across all peers in memory, keyed by peer name and message ID. Duplicate
+acknowledgements leave that order alone. Older receipts and those from a prior station instance
+can be accepted again.
+
+The private data directory must be on a local filesystem so the station can rely on its exclusive
+lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the
+node key relative to the checked directory handle used for the lock. The peer book is a version-1
+object with a list of peer records, each containing a name and ordered canonical station IDs. It
+is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
+rename and directory sync. If the rename succeeds but directory sync fails, the station applies
+the visible book and reports that the change may not survive a crash. While that running station
+has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
+and syncs the directory before giving its usual answer. These retries emit no additional events.
+The saved file contains no network path state or message history. While the actor writes and syncs
+the peer book, command replies and event processing can pause. An incoming chat can receive
+`Unavailable` if its bounded mailbox fills during that time.
 
 **Deliberately not in M1:** TLS, SRV bootstrap, several towers, a tower set that changes at runtime,
 non-loopback plain HTTP, tower allowlist, running the station as a service (all M2); chiefs as
@@ -182,9 +208,10 @@ unlisted station denied.
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] [--domain DOMAIN] [--tower URL]... [--tower-ca PEM]`, and a hidden `--dns-server ADDR` for tests or none (open in #79). A first run with no `--tower`, no `--domain` and no remembered set is refused with a plain message. The rustls provider install stays in `main` | #79, Codex |
 | `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`) and `Status.bootstrap_domain: Option<String>`. `Standby` represents a tower whose state is unobserved, including when the home tower state is unavailable. Introduced in API version 2. | #68, Codex |
 | `crates/chief/src/api.rs` | API version 3 defines bounded, live pages of peer-supplied candidate URLs, separate from Status and events. It also defines explicit tower additions and removals, with typed outcomes and refusals. | #109, Codex |
-| `crates/station/src/towers.rs` | Applies explicit tower additions and removals to the remembered and runtime working set. | #129, Codex |
+| `crates/station/src/towers.rs` | Applies explicit tower additions and removals to the remembered and runtime working set as part of domain-backed startup support. | #77, Codex |
 | `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. Per decision 16 (#73), candidate listing and `chief tower add <url>` / `chief tower remove <url>` are #122, which waits for the API of #109 | #80, Claude |
-| `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` for the ACME cache, `CAP_NET_BIND_SERVICE`, sandboxing) and `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented). A unit test in each binary parses its unit's `ExecStart` with clap; CI runs `systemd-analyze verify` on both. Docs: "Running as a service" | #82, Claude |
+| `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` with `StateDirectoryMode=0700` for the ACME cache, `Restart=on-failure` with `RestartPreventExitStatus=2 78` (the binary exits with 78 for a configuration error and 2 for a command-line error, 1 for what can pass), `CAP_NET_BIND_SERVICE`, sandboxing) and an example drop-in for certificate files through `LoadCredential=`, restarted on renewal. A test in the binary reads the unit by section, parses its `ExecStart` with clap and checks the directives the binary needs; `scripts/check-units.sh` (CI) runs `systemd-analyze verify --recursive-errors=no` on the unit alone and with the drop-in, fails on any message, and needs systemd 250 or later (skipped locally without it, a failure in CI). Docs: "Running the tower as a service" (`packaging/systemd/README.md`). | #82, Claude |
+| `packaging/systemd/` | `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented), with the same test in the binary and the same check as the tower's unit; it waits for the station daemon (#53, #79) | #127, Claude |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
 | `scripts/walkthrough-tls.sh` | the walkthrough with the real binaries over TLS on loopback, run by CI | #84, Codex |
 | `docs/notes/m2-demo.md` or a docs section | the runbook for the real-network demo | #85, Claude |
@@ -299,8 +326,7 @@ reload of the tower's config or allowlist on a signal (#69, #71), an allowlist f
 and signed tower-set statements (M3), automatic use of a peer's candidates (#73), a TXT record
 (the alternative behind `Locator`, #38), DNS or SRV in the shell walkthrough (the library tests
 cover them; #84), distro packages (#82), iOS builds, push and the app (M14), `chief network` (M3),
-the tower's own endpoint (M3). Router port mapping stays off; whether stations use it is open
-(decision 15, #42).
+the tower's own endpoint (M3). Router port mapping stays off (decision 15, #42).
 
 **Waiting for the owner:**
 
@@ -450,8 +476,14 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     enroll one under a chief-signed, expiring grant or every admission needs the chief (and the HSM);
     nspawn or QEMU; one safehouse per chief or per job; what the handler host itself must never
     expose to a safehouse.
-15. **Smaller ones.** GTK4 / libadwaita / relm4 / VTE assumed for the GUI (M13); whether stations use
-    router port mapping (off in M1).
+15. **Smaller ones.** GTK4 / libadwaita / relm4 / VTE assumed for the GUI (M13). Router port
+    mapping: decided by both agents on #42: off. A station never asks a router to forward a port; a
+    link that cannot go direct runs through a tower. Turning it on would have the station change
+    the chief's router without being asked, would open a port on that router to anybody, leading
+    to the node that holds the chief's key, and would bring a UPnP, NAT-PMP and PCP client into
+    that node. The endpoint keeps `PortmapperConfig::Disabled` and `scripts/check-deps.sh` keeps
+    iroh's `portmapper` feature out of the libraries. If real deployments show links that stay
+    relayed and hurt, it comes back as an explicit opt-in of the station.
 16. **Tower sets passed on by peers (M2).** Decided by both agents on #73: exchange and show only.
     A station sends its own working set to peers in its peer book and shows what it gets as
     candidates with the peer's name; it never connects to one, adds one to its relay map or passes

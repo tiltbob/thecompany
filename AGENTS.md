@@ -35,6 +35,7 @@ cargo test --workspace --locked
 cargo check -p numbers --locked     # the exact iroh feature set, without workspace feature unification
 bash scripts/check-deps.sh          # hard rule 5, and the iroh features the libraries must not enable
 bash scripts/check-lints.sh         # the lints behind hard rules 1 and 10 are still switched on
+bash scripts/check-units.sh         # systemd-analyze verify on the tower's systemd unit and its drop-in
 cargo doc --workspace --no-deps --locked   # with RUSTDOCFLAGS="-D warnings"; broken doc links fail
 ```
 

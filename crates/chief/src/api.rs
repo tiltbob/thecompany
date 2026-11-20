@@ -130,10 +130,11 @@
 //!     field `name`); the form of the station id ([`ApiError::Invalid`], field `station_id`; what
 //!     a valid id looks like is the station's to say); the station's own id
 //!     ([`ApiError::Invalid`], field `station_id`); a station that belongs to another peer
-//!     ([`ApiError::StationTaken`]). [`Request::PeerRemove`] fails the
-//!     peer's outgoing messages that are still `Sending` (rule 7, with their events), closes its
-//!     links and pushes [`Event::PeerRemoved`]. Any other change of a link pushes [`Event::Peer`]
-//!     with the whole peer; the links that `PeerRemove` closes push no [`Event::Peer`]:
+//!     ([`ApiError::StationTaken`]). Returned station IDs may use the station's canonical
+//!     representation. [`Request::PeerRemove`] fails the peer's outgoing messages that are still
+//!     `Sending` (rule 7, with their events), closes its links and pushes [`Event::PeerRemoved`].
+//!     Any other change of a link pushes [`Event::Peer`] with the whole peer; the links that
+//!     `PeerRemove` closes push no [`Event::Peer`]:
 //!     [`Event::PeerRemoved`] stands for the whole peer, its links included.
 //! 11. **End of a subscription.** A subscription ends when the station stops or the transport
 //!     loses its connection: [`crate::client::Subscription::next`] returns the events still queued,
@@ -150,23 +151,24 @@
 //!     announcement from each logical peer. Any of that peer's stations can replace its set,
 //!     including with an empty set. Removing the peer or restarting the station forgets the set.
 //!     Candidate URLs are canonical HTTPS root URLs as stored, including ASCII names for IDNs,
-//!     with at most [`numbers_base::MAX_TOWERS`] distinct URLs per peer. Validation performs no
+//!     with at most [`MAX_TOWERS`] distinct URLs per peer. Validation performs no
 //!     lookup or probe. Receiving or listing a candidate never initiates a connection to its URL,
 //!     installs it or re-shares it. Candidates are outside rules 2, 3 and 5: receipt emits no event
 //!     and listing is not a stream snapshot.
 //!     The station filters out all URLs in its installed set, including denied towers currently
 //!     outside the relay map, then omits empty groups. An empty terminal listing means only that
-//!     no cached set names an outside URL after the requested boundary.
+//!     no cached set names an outside URL after the requested boundary. A pinned station with no
+//!     cached announcements returns an empty terminal page.
 //!
 //!     Groups are ordered by peer name, byte for byte. Only names strictly after `after_peer`
 //!     match. This boundary is not validated and need not name a current peer. A page returns up
 //!     to `min(limit, TOWER_CANDIDATES_PAGE_MAX_GROUPS)` matching groups and at least one if any
 //!     match and `limit > 0`. [`TowerCandidatesPage::next_after_peer`] is `None` only at the end.
 //!     If more groups match, it is the last returned peer, or, for `limit: 0`, the requested
-//!     `after_peer` (the empty string if absent). Echoing a supplied boundary at a zero limit
-//!     remains subject to the transport's frame limit. Use a returned cursor as the next
-//!     exclusive boundary. Pagination is live. A frontend reading several pages binds to the
-//!     instance that supplied them (see [`crate::client::Client::bound_to`]).
+//!     `after_peer` (the empty string if absent). If echoing the boundary exceeds the local
+//!     socket's reply frame limit, the socket server answers [`ApiError::Internal`]. Use a
+//!     returned cursor as the next exclusive boundary. Pagination is live. A frontend reading
+//!     several pages binds to the instance that supplied them (see [`crate::client::Client::bound_to`]).
 //! 14. **Explicit tower changes.** [`Request::TowerAdd`] and [`Request::TowerRemove`] first
 //!     validate and canonicalize the supplied URL with [`check_tower_url`], then refuse with
 //!     [`ApiError::TowersPinned`] if this run uses pins. This includes adds of installed URLs and
@@ -248,8 +250,11 @@ pub const LOG_PAGE_MAX_MESSAGES: u32 = 1000;
 /// a [`Response::Log`] well under the local socket's 1 MiB frame cap.
 pub const LOG_PAGE_MAX_BYTES: usize = 512 * 1024;
 
+/// The cap on installed towers and on URLs in one peer's candidate announcement.
+pub use numbers_base::MAX_TOWERS;
+
 /// The most peer groups one [`Request::TowerCandidates`] returns, whatever its `limit` says.
-/// Each group has at most [`numbers_base::MAX_TOWERS`] canonical URLs. A full page with its
+/// Each group has at most [`MAX_TOWERS`] canonical URLs. A full page with its
 /// generated peer-name cursor fits within the local socket frame limit.
 pub const TOWER_CANDIDATES_PAGE_MAX_GROUPS: u32 = 32;
 
@@ -691,7 +696,7 @@ pub enum ApiError {
     },
     /// [`Request::PeerAdd`] named a station that already belongs to another peer.
     StationTaken {
-        /// The station asked for.
+        /// The requested station, which may be returned in canonical form.
         station_id: String,
         /// The peer it belongs to.
         peer: String,
@@ -713,7 +718,7 @@ pub enum ApiError {
     TowersPinned,
     /// All slots in the installed tower set are in use. Remove a tower to make room.
     TowerSetFull {
-        /// The maximum number of installed towers, including denied ones.
+        /// The maximum number of installed towers, including denied ones ([`MAX_TOWERS`]).
         max: u32,
     },
     /// The station is shutting down and takes no more calls.

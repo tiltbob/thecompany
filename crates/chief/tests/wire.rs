@@ -395,6 +395,20 @@ fn tower_sources() -> [TowerSource; 4] {
     ]
 }
 
+fn tower_add_outcomes() -> [(TowerAddOutcome, &'static str); 2] {
+    [
+        (TowerAddOutcome::Added, r#""added""#),
+        (TowerAddOutcome::AlreadyInSet, r#""already_in_set""#),
+    ]
+}
+
+fn tower_remove_outcomes() -> [(TowerRemoveOutcome, &'static str); 2] {
+    [
+        (TowerRemoveOutcome::Removed, r#""removed""#),
+        (TowerRemoveOutcome::NotInSet, r#""not_in_set""#),
+    ]
+}
+
 // Exhaustive matches: a new variant does not compile until it is numbered here, and the coverage
 // tests then fail until the samples above hold a value of it.
 
@@ -522,6 +536,22 @@ fn tower_source_variant(value: &TowerSource) -> usize {
     }
 }
 
+const TOWER_ADD_OUTCOME_VARIANTS: usize = 2;
+fn tower_add_outcome_variant(value: &TowerAddOutcome) -> usize {
+    match value {
+        TowerAddOutcome::Added => 0,
+        TowerAddOutcome::AlreadyInSet => 1,
+    }
+}
+
+const TOWER_REMOVE_OUTCOME_VARIANTS: usize = 2;
+fn tower_remove_outcome_variant(value: &TowerRemoveOutcome) -> usize {
+    match value {
+        TowerRemoveOutcome::Removed => 0,
+        TowerRemoveOutcome::NotInSet => 1,
+    }
+}
+
 // Helpers.
 
 /// Serializes `value`, reads it back, checks it is equal, and returns the JSON text.
@@ -577,6 +607,16 @@ fn every_state_value_round_trips() {
         tower_source_variant,
         TOWER_SOURCE_VARIANTS,
     );
+    round_trip_all(
+        &values(&tower_add_outcomes()),
+        tower_add_outcome_variant,
+        TOWER_ADD_OUTCOME_VARIANTS,
+    );
+    round_trip_all(
+        &values(&tower_remove_outcomes()),
+        tower_remove_outcome_variant,
+        TOWER_REMOVE_OUTCOME_VARIANTS,
+    );
 }
 
 #[test]
@@ -597,7 +637,7 @@ fn numbers_keep_their_full_range() {
 #[test]
 fn a_full_tower_status_fits_local_socket_frames() {
     use chief::socket::wire::Reply;
-    use numbers_base::{LOCAL_FRAME_MAX, MAX_TOWERS, encode_frame};
+    use numbers_base::{LOCAL_FRAME_MAX, encode_frame};
 
     // Quotes and backslashes each double in JSON after cleaning.
     let worst = "\"\\".repeat(TOWER_TEXT_MAX_BYTES);
@@ -633,7 +673,7 @@ fn a_full_tower_status_fits_local_socket_frames() {
 #[test]
 fn a_full_candidate_page_fits_local_socket_frames() {
     use chief::socket::wire::Reply;
-    use numbers_base::{LOCAL_FRAME_MAX, MAX_TOWERS, canonical_tower_url, encode_frame};
+    use numbers_base::{LOCAL_FRAME_MAX, canonical_tower_url, encode_frame};
 
     let groups: Vec<_> = (0..TOWER_CANDIDATES_PAGE_MAX_GROUPS)
         .map(|peer| TowerCandidateGroup {
@@ -743,14 +783,8 @@ fn label_enums_are_bare_strings() {
 
 #[test]
 fn tower_outcome_labels_are_bare_strings() {
-    assert_golden(&[
-        (TowerAddOutcome::Added, r#""added""#),
-        (TowerAddOutcome::AlreadyInSet, r#""already_in_set""#),
-    ]);
-    assert_golden(&[
-        (TowerRemoveOutcome::Removed, r#""removed""#),
-        (TowerRemoveOutcome::NotInSet, r#""not_in_set""#),
-    ]);
+    assert_golden(&tower_add_outcomes());
+    assert_golden(&tower_remove_outcomes());
 }
 
 #[test]

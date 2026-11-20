@@ -3,9 +3,10 @@
 //! that transport, server and frontend tests trust. Nothing sleeps or touches the network.
 
 use chief::api::*;
-use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription};
+use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
 use chief::fake::*;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1669,7 +1670,7 @@ async fn candidates_replace_the_whole_logical_peer_set_only_on_valid_delivery() 
     );
     assert_eq!(page.next_after_peer, None);
 
-    let over_count = [CANDIDATE_B; numbers_base::MAX_TOWERS + 1];
+    let over_count = [CANDIDATE_B; MAX_TOWERS + 1];
     for invalid_list in [
         over_count.as_slice(),
         &[CANDIDATE_B, CANDIDATE_B],
@@ -1868,9 +1869,65 @@ async fn tower_changes_use_canonical_urls_and_emit_only_for_changes() {
 }
 
 #[tokio::test]
+async fn presentation_overrides_leave_pin_policy_in_force() {
+    let pinned = station();
+    let c = client(&pinned);
+    pinned.set_bootstrap_domain(Some("team.synthetic.invalid".into()));
+    pinned.set_towers(
+        (0..MAX_TOWERS)
+            .map(|index| {
+                tower(
+                    &format!("https://pin-{index}.synthetic.invalid/"),
+                    TowerState::Standby,
+                    Some(TowerSource::Configured),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(c.tower_add(CANDIDATE_A).await, Err(ApiError::TowersPinned));
+    assert_eq!(
+        c.tower_remove("https://pin-0.synthetic.invalid/").await,
+        Err(ApiError::TowersPinned),
+    );
+
+    let (mutable, c) = domain_backed();
+    mutable.set_bootstrap_domain(None);
+    mutable.set_towers(Vec::new());
+    assert_eq!(
+        c.tower_add(CANDIDATE_A).await.unwrap().outcome,
+        TowerAddOutcome::Added
+    );
+}
+
+#[tokio::test]
+async fn invalid_domain_backed_fixtures_panic_before_changing_towers_or_events() {
+    let (fake, c) = domain_backed();
+    let row = |url: &str| tower(url, TowerState::Standby, Some(TowerSource::Configured));
+    let valid = row(CANDIDATE_A);
+    fake.set_towers(vec![valid.clone()]);
+    let before = fake.status();
+    let mut events = c.subscribe().await.unwrap();
+    for invalid in [
+        vec![
+            valid.clone(),
+            row("https://tower.synthetic.invalid/not-root"),
+        ],
+        vec![valid.clone(), row("https://Tower.synthetic.invalid")],
+        vec![valid.clone(), valid.clone()],
+        (0..=MAX_TOWERS)
+            .map(|index| row(&format!("https://over-{index}.synthetic.invalid/")))
+            .collect(),
+    ] {
+        assert!(catch_unwind(AssertUnwindSafe(|| fake.set_towers(invalid))).is_err());
+        assert_eq!(fake.status(), before);
+        assert!(queued(&mut events).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn duplicate_add_checks_the_installed_set_before_capacity() {
     let (fake, c) = domain_backed();
-    for index in 0..numbers_base::MAX_TOWERS {
+    for index in 0..MAX_TOWERS {
         c.tower_add(&format!("https://tower-{index}.synthetic.invalid/"))
             .await
             .unwrap();
@@ -1880,6 +1937,10 @@ async fn duplicate_add_checks_the_installed_set_before_capacity() {
     });
     let before = c.status().await.unwrap();
     let mut events = c.subscribe().await.unwrap();
+    assert!(matches!(
+        c.tower_add("https://invalid.synthetic.invalid/?marker").await,
+        Err(ApiError::Invalid { field, .. }) if field == "url"
+    ));
     let duplicate = c
         .tower_add("https://TOWER-0.SYNTHETIC.INVALID.:443")
         .await
@@ -1922,4 +1983,64 @@ async fn validation_precedes_pins_and_pins_precede_no_ops() {
     );
     assert_eq!(c.status().await.unwrap(), before);
     assert!(queued(&mut events).is_empty());
+}
+
+#[tokio::test]
+async fn a_hook_can_script_a_visible_tower_change_with_uncertain_durability() {
+    let (fake, c) = domain_backed();
+    let mut events = c.subscribe().await.unwrap();
+    let configured = tower(
+        CANDIDATE_A,
+        TowerState::Standby,
+        Some(TowerSource::Configured),
+    );
+    let uncertain = ApiError::Internal {
+        detail: "the tower set sync failed".into(),
+    };
+
+    for (request, visible, durable_reply) in [
+        (
+            Request::TowerAdd {
+                url: CANDIDATE_A.into(),
+            },
+            vec![configured.clone()],
+            Response::TowerAdd {
+                tower: configured,
+                outcome: TowerAddOutcome::AlreadyInSet,
+            },
+        ),
+        (
+            Request::TowerRemove {
+                url: CANDIDATE_A.into(),
+            },
+            Vec::new(),
+            Response::TowerRemove {
+                url: CANDIDATE_A.into(),
+                outcome: TowerRemoveOutcome::NotInSet,
+            },
+        ),
+    ] {
+        let once = request.clone();
+        let next = visible.clone();
+        let error = uncertain.clone();
+        fake.on_call(move |fake, request| {
+            if request == &once {
+                fake.clear_on_call();
+                fake.set_towers(next.clone());
+                fake.fail_calls(Some(error.clone()));
+            }
+        });
+
+        assert_eq!(fake.call(request.clone()).await, Err(uncertain.clone()));
+        let status = fake.status();
+        assert_eq!(status.towers, visible);
+        assert_eq!(queued(&mut events), vec![Event::Status { status }]);
+
+        assert_eq!(fake.call(request.clone()).await, Err(uncertain.clone()));
+        assert!(queued(&mut events).is_empty());
+
+        fake.fail_calls(None);
+        assert_eq!(fake.call(request).await, Ok(durable_reply));
+        assert!(queued(&mut events).is_empty());
+    }
 }

@@ -19,11 +19,16 @@
 //! [`FakeStation::set_link`]), there is no send deadline (a held send stays `Sending` until
 //! [`FakeStation::resolve`]), and nothing is written to disk. The domain-backed fixture keeps
 //! its installed set across simulated restarts.
+//!
+//! To exercise uncertain durability (API rule 14), have a [`FakeStation::on_call`] hook
+//! apply the visible set once with [`FakeStation::set_towers`] and make the call answer
+//! [`ApiError::Internal`] with [`FakeStation::fail_calls`]. Retries fail until the test clears
+//! that error. The next retry then answers with the regular no-op outcome and pushes no event.
 
 use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
-    LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
-    PeerStation, RECEIPT_WINDOW, Request, Response, Status, TOWER_CANDIDATES_PAGE_MAX_GROUPS,
+    LOG_PAGE_MAX_MESSAGES, Link, LogPage, MAX_TOWERS, MESSAGE_ID_MAX_BYTES, Message, MessageStatus,
+    Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status, TOWER_CANDIDATES_PAGE_MAX_GROUPS,
     TowerAddOutcome, TowerCandidate, TowerCandidateGroup, TowerCandidatesPage, TowerRemoveOutcome,
     TowerSource, TowerState, TowerStatus, check_peer_name, check_tower_url, clean,
     clean_tower_display,
@@ -31,7 +36,6 @@ use crate::api::{
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
 };
-use numbers_base::MAX_TOWERS;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -263,7 +267,27 @@ impl FakeStation {
     ///
     /// The bootstrap domain is left as it is. See [`FakeStation::restart`] for how the fixture
     /// presents the retained entries after restart.
+    ///
+    /// # Panics
+    ///
+    /// The domain-backed fixture requires at most [`MAX_TOWERS`] unique canonical tower URLs.
+    /// Invalid input panics before replacing the set or pushing an event. The pinned fixture
+    /// also accepts arbitrary presentation data for frontend tests.
     pub fn set_towers(&self, towers: Vec<TowerStatus>) {
+        let mut state = self.state();
+        if !state.towers_pinned {
+            assert!(towers.len() <= MAX_TOWERS, "too many tower fixtures");
+            for (index, tower) in towers.iter().enumerate() {
+                assert!(
+                    check_tower_url(&tower.url).is_ok_and(|url| url == tower.url),
+                    "a domain-backed tower fixture needs a canonical URL",
+                );
+                assert!(
+                    !towers[..index].iter().any(|other| other.url == tower.url),
+                    "a domain-backed tower fixture needs distinct URLs",
+                );
+            }
+        }
         let towers = towers
             .into_iter()
             .map(|tower| TowerStatus {
@@ -272,7 +296,6 @@ impl FakeStation {
                 source: tower.source,
             })
             .collect();
-        let mut state = self.state();
         state.status.towers = towers;
         let status = state.status.clone();
         state.emit(&Event::Status { status });

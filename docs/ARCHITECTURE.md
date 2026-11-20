@@ -240,9 +240,10 @@ connection while that hello is pending is refused immediately with code `0`. A s
 outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
 If the fallback also loses and no open link, incoming hello or shared dial remains, the send
 returns `Disconnected` even if the deadline has time left. A send that shares a failed dial
-receives that dial's error under the same conditions. In direct-only multithreaded restart tests,
-iroh could redial the peer's old address immediately after a stall close. M1 relies on the tower
-path for recovery in this case. [#120](https://github.com/tiltbob/thecompany/issues/120)
+receives that dial's error under the same conditions. When the direct-only restart tests were run
+on a multi-thread runtime, iroh could redial the peer's old address immediately after a stall
+close. M1 relies on the tower path for recovery in this case.
+[#120](https://github.com/tiltbob/thecompany/issues/120)
 
 If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
 lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
@@ -256,8 +257,10 @@ authorization refusal, `409` for replacement, and `0` for ordinary closure. At i
 deadline, the dialer reports `Timeout` and closes any pending connection with `0`. During setup,
 a remote `400` or `403` ends the dial as `BadHello` or `NotAllowed`, respectively. A remote `409`
 uses the winner and fallback rules above. Other 32-bit application close codes are classified as
-`Disconnected`. Either end of an admitted link can open a bidirectional chat stream with the
-header `{"proto":"chat","v":1}`, followed by one message.
+`Disconnected`. During the hello exchange, a close without an application code, such as a
+transport-level close, or with a code above 32 bits ends the dial as `BadHello`, because every I/O
+failure of the hello exchange is mapped to it. Either end of an admitted link can open a
+bidirectional chat stream with the header `{"proto":"chat","v":1}`, followed by one message.
 Each JSON frame has a four-byte big-endian length and a payload limit of 64 KiB.
 
 A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
@@ -275,11 +278,17 @@ connection, the sender checks for transport progress a full `connect_timeout` af
 request, if this interval is positive and shorter than the remaining send budget. A
 `connect_timeout` equal to or longer than `send_deadline` leaves the overall deadline in force
 and skips that early check. If the connection is still current and has received no
-authenticated QUIC frames since before the request was written, the sender closes it. A send
-waiting for stream credit skips the progress check. After a crash leaves a connection with no
-stream credit, sends can time out until QUIC's 30 s idle timeout or until the restarted peer
-connects first. QUIC replenishes credits in batches. The stall was reproduced with 14 unanswered
-sends on loopback. [#119](https://github.com/tiltbob/thecompany/issues/119)
+authenticated QUIC frames since before the request was written, the sender closes it.
+
+On that first attempt, a send waiting to open a stream also checks for authenticated QUIC
+frames. The wait for stream credit allows the greater of `connect_timeout` and the configured
+5 s transport keepalive plus 1 s for its acknowledgement. A quiet link can take a keepalive
+to transmit its queued STREAMS_BLOCKED frame. The observation stays with the current connection
+across short sends and resets when new authenticated frames arrive. A caller checks only within
+its original send deadline. If the observed connection is still current and has made
+no progress for the full interval, the sender closes it and can redial. QUIC replenishes
+credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
+[#119](https://github.com/tiltbob/thecompany/issues/119)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that
 connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
@@ -614,7 +623,7 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
-  31 s. Keep-alive is 5 s and idle timeout 30 s; a dial to an
+  31 s. At the QUIC layer, keepalive is 5 s and idle timeout is 30 s; a dial to an
   offline peer, or one whose filter ignores us, fails only by that timeout (30.0 s), and a peer
   killed without closing is noticed after 30.0 s. Two processes on one node key: the relay keeps
   only the newest, and the older one notices nothing (measured with two endpoints in one process).
