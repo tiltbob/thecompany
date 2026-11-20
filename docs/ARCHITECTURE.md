@@ -13,7 +13,7 @@ The cast:
 
 | Name | What it is |
 |---|---|
-| **chief** | A person on the team. An identity, not a machine: a chief owns stations, signs admin actions, and harness accounts and agent sessions run under their name. |
+| **chief** | A person on the team. An identity, not a machine: a chief owns stations and harness API keys, signs admin actions, and agent sessions run under their name. |
 | **station** | A chief's node: a daemon on the chief's workstation. The `chief` CLI, the Linux GUI and the iOS app are frontends to a station. |
 | **safehouse** | A node that runs agents in arbitrary harnesses (Claude Code and Codex first). At first a chief sets one up by hand. |
 | **handler** | Later: the node that sets safehouses up, creating each in an isolated environment (an nspawn container, maybe a full QEMU VM). To be fleshed out. |
@@ -24,7 +24,8 @@ The cast:
 Decided: **Rust**; **iroh** as transport (1.0 since June 2026, now 1.5.0: stable API and wire
 protocol, dial-by-public-key QUIC, hole punching, relay fallback, official iOS support); the audience
 is a **small trusted team** — chiefs are co-equal, every action is attributable to a person, one
-person can be removed cleanly, everyone signs in to harnesses with their own account; work is
+person can be removed cleanly, every chief gives harnesses their own API key, and harnesses
+authenticate with **API keys only** (no subscription sign-in is driven, relayed or supported); work is
 **tracked in GitHub issues**; in airspace, **every tower keeps every block and a write counts as
 stored once two towers confirm it**; a station and a safehouse on one machine is **never suggested
 and always warned against, but the two packages do not conflict**; the **SRV record only bootstraps
@@ -35,7 +36,8 @@ just enough for two chiefs to chat.
 
 How far this has been checked: the transport, tower, login and first-slice parts were reviewed
 against the published sources of iroh 1.5.0, Claude Code 2.1.328 and Codex 0.170, with a second
-reviewer trying to refute each finding. The chief/station identity model and the first slice had one
+reviewer trying to refute each finding; the API-key design that has since replaced the login part
+has not had that review. The chief/station identity model and the first slice had one
 further review after the rewrite, without the refutation pass. Airspace's transfer and git parts
 were researched against current sources; its encryption format, naming rules and garbage collection
 have **not** had that scrutiny yet and get a design pass at the start of M4. The M0 `numbers`
@@ -54,7 +56,7 @@ dependency set builds, and loopback tests exercise the M1 dev tower.
 | Node | Binary | Trust | Does | Never |
 |---|---|---|---|---|
 | tower | `tower` | untrusted with content; relied on, with checks, to keep blocks | relays ciphertext; rendezvous by node id; stores encrypted blocks | reads traffic or stored data, holds member or airspace keys, runs agents |
-| safehouse | `safehouse` | member, admitted by a chief | hosts agents, terminals and harness logins; serves files, sockets, locks; keeps working copies of airspace | admin actions; starts anything on a station |
+| safehouse | `safehouse` | member, admitted by a chief | hosts agents, terminals and harness API keys; serves files, sockets, locks; keeps working copies of airspace | admin actions; starts anything on a station |
 | station | `station` | member, commissioned by its chief | its chief's presence on the network: chat, management, driving safehouses; keeps working copies of airspace | spawns agents; executes anything for a peer |
 | handler (later) | `handler` | member, admitted by a chief | creates and removes safehouses in isolated environments on a chief's request | runs agents itself; admin actions |
 
@@ -72,11 +74,11 @@ chief.
   phone, a Keychain item behind biometrics. Admin keys sign every admin action, so each change names
   a person, and they commission that chief's stations. A station on a device without an admin key
   does everything except administer. Losing a device costs one key revocation and one station
-  decommission; the chief, their accounts on safehouses and their harness logins stay (**decision 1**).
+  decommission; the chief, their accounts on safehouses and their harness API keys stay (**decision 1**).
 - **What a station may do** is act as its own chief on each safehouse: that chief's terminals,
   sessions, files and chat. Anything that changes what other chiefs' sessions run, or what a node
-  allows others — shared harness definitions, forward-target policy, grants, the tower set, login URL
-  templates — is an admin-signed statement. So a stolen station is that chief on every safehouse until
+  allows others — shared harness definitions, forward-target policy, grants, the tower set — is an
+  admin-signed statement. So a stolen station is that chief on every safehouse until
   it is decommissioned, but cannot change membership or shared configuration.
 - **What the split protects.** The admin key at rest (a stolen disk or backup, a leaked station data
   dir) and against a bug that leaks station memory. It does not protect against code running as the
@@ -88,7 +90,7 @@ chief.
   admin key still signs first, so every enrollment names a person. The frontend signs through
   PKCS#11; the key never leaves the token, signing needs the token and its PIN, and the roster can
   demand the token's own proof that the key was generated inside it.
-  **Nothing else needs the token.** Not daily use — chat, airspace, driving safehouses, logins,
+  **Nothing else needs the token.** Not daily use — chat, airspace, driving safehouses, API keys,
   sessions — and not routine administration either: removing a node or a chief, settings, shared
   harness definitions and issuing an invite are signed by the ordinary admin key alone. The token
   can stay in a drawer between enrollments, and a compromised node can be removed without fetching
@@ -123,7 +125,7 @@ Rules the membership milestone (M3) implements:
   commissioned so the subtree can go in the same action. A signer picks its own parents, so "who was
   first" cannot settle two chiefs removing each other (**decision 2**).
 - **Removal suspends at once and purges later.** Suspending closes that chief's links, terminals and
-  forwards, stops their sessions and locks their harness profiles. Purging (vendor sign-out,
+  forwards, stops their sessions and locks their harness profiles. Purging (API-key and file
   deletion) waits until the removal is settled: acknowledged by a station of every remaining chief,
   or older than a grace period, or forced with `chief purge`. `chief network` lists nodes that have
   not acknowledged it. A chief-signed staleness limit makes a safehouse that has heard from no other
@@ -171,7 +173,7 @@ by id through the towers, and iroh moves the connection to a direct path when it
 
 Two members share **one authenticated link** (ALPN `numbers/0`). It opens with a hello (version,
 network id, roster head); each feature is then a typed stream whose first frame is `{proto, v}` —
-`chat`, `roster`, `airspace`, `pty`, `sock`, `agent`, `login`, `file`, `lock`. One gate decides, default
+`chat`, `roster`, `airspace`, `pty`, `sock`, `agent`, `apikey`, `file`, `lock`. One gate decides, default
 deny, whether this caller may open this protocol:
 
 | Caller → callee | Allowed |
@@ -271,15 +273,15 @@ structurally:
 
 - All PTY and harness code lives in the `safehouse` crate. No other daemon or library depends on it
   (CI: `cargo tree` per package) or may name `std::process::Command` / `tokio::process::Command`
-  (CI: clippy `disallowed-types`). Two documented exceptions, both in frontends started by the
-  chief: opening a sign-in URL the user asked for, and the git helper running git. The later
+  (CI: clippy `disallowed-types`). One documented exception, in a frontend started by the chief:
+  the git helper running git. The later
   `handler` crate will be the one other place allowed to start processes — containers and VMs,
   never harnesses.
-- Only safehouses serve `pty`, `agent` and `login`; a station has no code that answers them.
+- Only safehouses serve `pty`, `agent` and `apikey`; a station has no code that answers them.
 - On a safehouse the daemon runs as its own OS account, holds the node key and never executes harness
-  code in-process. Each chief maps to a dedicated OS account (or container), and every terminal,
-  login and session of that chief is spawned under it. That, not an environment variable, is what
-  separates one person's harness logins from another's and from the safehouse's key (**decision 3**).
+  code in-process. Each chief maps to a dedicated OS account (or container), and every terminal and
+  session of that chief is spawned under it. That, not an environment variable, is what separates
+  one person's harness API keys from another's and from the safehouse's key (**decision 3**).
 - Agents never hold node keys or airspace keys. They reach chat, files, locks and airspace only through
   an MCP bridge the safehouse injects per session, attributed as (safehouse, session, owner chief) and
   granted no more than the owner has. That owner is the safehouse's assertion: a station accepts it as
@@ -301,48 +303,54 @@ protocol.
 - Harness definitions are data, so new ones need no code and no SSH. One a chief pushes for
   themselves is private to them; one shared on a safehouse is an admin-signed statement. Kinds:
   - `pty` — any command in a safehouse-hosted terminal (server-side screen model, reattachable). The
-    universal fallback; it ships with the safehouse, so `claude` and `codex` are usable, and can be
-    logged in by hand, before the login broker exists.
+    universal fallback; it ships with the safehouse, so `claude` and `codex` are usable, with an API
+    key set by hand, before M6 exists.
   - `acp` — a generic Agent Client Protocol client, with the safehouse as the only ACP client. Covers
     Claude Code and Codex through the ACP project's adapters and about fifteen other agents natively.
   - native adapters where they are better (**decision 9**, per harness).
-- A session belongs to the chief who started it and runs under that chief's harness account. Only
-  the owner's stations may prompt, approve or type; other chiefs may watch and stop. Shared steering
-  is offered only for accounts backed by an API key, because steering someone else's
-  subscription-backed session breaks both vendors' account terms.
+- A session belongs to the chief who started it and runs on that chief's API key. Only the owner's
+  stations may prompt, approve or type; other chiefs may watch and stop. Shared steering can be
+  offered: every session runs on an API key, so the vendors' terms for subscription accounts do not
+  stand in the way.
 
-### Logging a safehouse's harness in from a chief
+### Giving a safehouse's harness an API key
 
-`chief login <safehouse> claude|codex` runs the harness's **own** login command on the safehouse, under
-the chief's OS account there. theCompany never parses, logs or stores harness credentials and never moves
-credential files between nodes; tokens are minted and kept only by the harness CLI on the safehouse.
-The encrypted station–safehouse stream carries only what the vendor's flow itself passes through the chief's
-browser or terminal.
+Harnesses authenticate with **API keys only**. theCompany drives no sign-in: no browser flow, no
+device code, no pasted code and no callback relay, and a station never opens a URL for a harness.
+A chief creates the key in the vendor's console.
 
-Login is a structured session, so CLI, GUI and phone each render it natively; the raw terminal is an
-escape hatch.
+`chief apikey set <safehouse> claude|codex` reads the key without echo, or from stdin, never from
+the command line. The key travels over the encrypted station–safehouse stream to the safehouse,
+which keeps it for that chief and that harness. Every terminal and session that chief starts there
+gets the key the way the harness takes one:
 
-| Harness | First choice | Fallbacks |
-|---|---|---|
-| Claude Code | browser sign-in; the callback to `localhost` is relayed to the safehouse | paste-the-code URL; `--console` for API billing |
-| Codex | device code (OpenAI's recommendation for headless machines; no ports; works from a phone) | browser sign-in with relayed callback (**decision 7**); API key piped to the CLI's stdin |
+| Harness | How it takes an API key |
+|---|---|
+| Claude Code | no login command reads a key; it takes one from the `ANTHROPIC_API_KEY` environment variable (an interactive session asks once whether to use it, `-p` uses it without asking) or from the output of the command the `apiKeyHelper` setting names |
+| Codex | `codex login --with-api-key` reads it from stdin, refusing a terminal, and keeps it in Codex's own store: `auth.json` under `CODEX_HOME`, or the OS credential store |
 
-Guards, because this is the one place a safehouse asks a station to do something:
+- **Write-only from outside.** `chief apikey status` says for each harness whether a key is set,
+  when it was set and whether the vendor last rejected it. It never returns the key or a part of
+  it: the safehouse answers from its own record and never passes on what a harness CLI prints
+  (`codex login status` prints part of the key). `chief apikey rm` removes it; replacing a key is
+  `set` again.
+- **Never in the open.** A key is never logged and never part of an error or an event. It never
+  reaches a tower, another chief or airspace, and the station does not keep it after sending it.
+- **Per chief.** On the safehouse the key belongs to the chief's OS account (**decision 3**), so
+  another chief's sessions cannot read it.
+- **The agent can read it.** A harness needs its key to work, so an agent in a session can read the
+  key that session runs on. A spending limit set at the vendor is the control for that. Hiding the
+  key from the agent behind a proxy on the safehouse that adds it to requests is part of
+  **decision 8**.
+- **No lifecycle to manage.** A key has no session to renew. One the vendor rejects shows in the
+  status and is reported to the owner's stations.
+- theCompany never reads, copies or moves a harness's own credential files. A subscription sign-in
+  typed by hand into a terminal on a safehouse is outside what theCompany supports.
 
-- A sign-in URL is accepted only inside a login this chief just started on that link, and only if it
-  matches a station-side template for that harness (scheme, host, path, client id, redirect). The
-  templates ship with the station and can be superseded by admin-signed settings; a safehouse never
-  supplies them. A mismatch is shown as inert text, never opened. The frontend opens the browser,
-  not the library.
-- The callback relay is an HTTP-aware forwarder for one login, not a port pipe. It binds loopback on
-  the port named in the captured redirect, passes only the exact requests that harness's flow needs
-  (Claude: one `GET /callback` with the expected `state`; Codex: `/auth/callback`, then one
-  `/success`), refuses everything else, logs nothing and closes when the login ends. One pending
-  login per harness per safehouse. If a station and a safehouse do share a host, the relay is
-  skipped and the browser reaches the harness's listener directly.
-- Logins have a lifecycle. The safehouse caches method, account and expiry per profile and warns the
-  owner's stations before a Claude login ends. It never re-runs `codex login` implicitly (that signs
-  the profile out first). `chief logout` exists.
+Still open (**decision 8**): where the key is kept on the safehouse and in what form; whether the
+harness process gets the key or a proxy adds it; whether a team may share one key; whether
+cloud-provider credentials count; whether presets also switch off a harness's other sign-in methods
+where it has a setting for that.
 
 ### Handlers (later)
 
@@ -370,7 +378,7 @@ crates/
   chief/            the shared frontend library: station API types + client
   chief-cli/        `chief` binary
   airspace/         persistence: a blind half towers also use, a sealed half for members   (M4)
-  safehouse/        `safehouse` daemon: harnesses, terminals, login, MCP bridge  (M5)
+  safehouse/        `safehouse` daemon: harnesses, terminals, API keys, MCP bridge (M5)
   handler/          `handler` daemon: creates safehouses in containers or VMs    (M15)
   git-remote-numbers/   git remote helper                                        (M7)
   chief-ffi/        UniFFI → Swift, embeds the station core                      (M2 smoke check, M14)
@@ -440,18 +448,26 @@ loopback. The remaining iroh examples are source references.
   back without one; NXDOMAIN is `Err(Error::NxDomain {..})`, an empty answer is `Ok(vec![])`.
   `RelayUrl` equality is textual, so canonicalise once. SRV-located towers are always `https`. The
   system resolver falls back to public resolvers unless that is disabled.
-- **Claude Code login.** `claude auth login [--claudeai|--console|--sso|--email]` prints a sign-in
-  URL whose redirect expects a pasted code, and hands `$BROWSER` a second URL redirecting to
-  `http://localhost:<random port>/callback` (listener on 127.0.0.1; any other `/callback` request
-  aborts the login). `claude auth status` prints JSON (`loggedIn`, `authMethod`, `loginExpiresAt`,
-  `configDirectory`) and exits 0 or 1. There is no login command that reads an API key. `BROWSER` is
-  undocumented for this, so capturing the URL from terminal output is the baseline.
-- **Codex login.** `codex login` listens on 127.0.0.1:1455 (fallback 1457), answers
-  `/auth/callback` with a redirect to `/success?id_token=…` and exits only once `/success` is
-  fetched; `GET /cancel` is unauthenticated and a second login cancels the first; starting a login
-  clears and revokes the stored one. `--device-auth` needs the ChatGPT device-code setting and lasts
-  15 minutes. `--with-api-key` reads stdin and refuses a terminal. `codex app-server` offers
-  `account/login/start|completed|cancel` and `account/read`.
+- **Claude Code and API keys.** There is no login command that reads an API key. The CLI takes
+  one from `ANTHROPIC_API_KEY`: an interactive session asks once whether to use it and remembers the
+  answer, and `-p` always uses it. The `apiKeyHelper` setting (any settings file) names a shell
+  command whose output is sent as the key; the output is cached for five minutes by default
+  (`CLAUDE_CODE_API_KEY_HELPER_TTL_MS`) and the command is re-run after a 401 or 403. Precedence:
+  cloud-provider variables, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `apiKeyHelper`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, a named Anthropic profile, then a stored subscription sign-in. No setting
+  limits the CLI to API keys: `forceLoginMethod` takes `claudeai`, `console` or `gateway`, and with
+  it set the CLI refuses an `ANTHROPIC_API_KEY` or `apiKeyHelper` credential at startup.
+  `claude auth status` reports `authMethod` as `api_key` or `api_key_helper` for these. (Read in
+  the published Claude Code documentation on 2026-11-20, not checked against a CLI version.)
+- **Codex and API keys.** `codex login --with-api-key` reads the key from stdin, refuses a terminal
+  and does not check it ("Authentication is checked when you send a request"). It stores the key
+  through `cli_auth_credentials_store`: `file` (`auth.json` under `CODEX_HOME`, default
+  `~/.codex`), `keyring`, `auto` or `ephemeral`. `codex login status` exits 0 or 1 and, for a key,
+  prints its first 8 and last 5 characters to stderr, so its output must not be passed on.
+  `codex logout` clears the stored credentials. `CODEX_API_KEY` is read only by `codex exec`, where
+  it overrides the stored credentials; the interactive CLI ignores it. `forced_login_method = "api"`
+  allows only API-key login; if the active credentials do not match, Codex signs the user out and
+  exits. (Read in the Codex source on 2026-11-20, `main` after release 0.171.0.)
 - **Nitrokey HSM 2 (M3).** Per the vendor: RSA 1024–4096, ECC 192–521 bit (NIST P-256/384/521,
   secp256k1, brainpool) with ECDSA and ECDH, AES; no Ed25519. PKCS#11 through OpenSC. ECDSA-256
   signing takes about 80 ms. Keys can be generated on the device, and its built-in PKI can certify
