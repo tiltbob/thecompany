@@ -696,8 +696,10 @@ fn chain_in(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
     (cert, key, ca.der().clone())
 }
 
-/// webpki parses an intermediate or CA certificate like a leaf, so a real chain passes the
-/// check of every certificate; a client that trusts only the CA proves the CA is sent.
+/// webpki parses an intermediate or CA certificate like a leaf, so a real chain of leaf and CA
+/// passes the check of every certificate, and the tower serves with it: a client that trusts the
+/// CA accepts the leaf. This does not show that the CA certificate itself is sent, since a
+/// client that trusts the CA needs only the leaf.
 #[tokio::test]
 async fn a_two_certificate_chain_is_accepted_and_served() {
     bounded(async {
