@@ -4,6 +4,8 @@
 //! local socket. [`Client`] gives any transport typed methods. A subscription is a pair made by
 //! [`subscription`]: the transport keeps the [`EventSink`] and pushes events into it; the frontend
 //! pulls them from the [`Subscription`]. The rules both sides keep are in [`crate::api`].
+//!
+//! The attach order for a live view of the log is [`Client::follow_log`] in [`crate::follow`].
 
 use crate::api::{
     ApiError, Event, LogPage, Message, MessageStatus, Peer, Request, Response, Status,
@@ -364,6 +366,11 @@ impl<T: Transport> Client<T> {
     /// [`Client::message`]. If the re-read message has another `id` than the one sent, the station
     /// restarted and the `seq` names another message: that gives [`ApiError::Disconnected`], as does
     /// a subscription that ends first. Other errors of the calls are passed through.
+    ///
+    /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
+    /// [`crate::api`]). In the one remaining corner, a [`Event::Resync`] that hides that event for a
+    /// message that has left the log, the re-read gives [`ApiError::MessageNotFound`], which is
+    /// returned.
     ///
     /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
     /// call in a timeout.
