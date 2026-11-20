@@ -64,9 +64,12 @@ done < <(git grep --untracked -l CLIPPY_CONF_DIR -- .cargo .github || true)
 if [[ ! -f clippy.toml ]]; then
     err "clippy.toml: missing; it holds the confinement lint (hard rule 1)"
 else
-    for want in 'path = "std::process::Command"' 'path = "tokio::process::Command"'; do
-        if ! grep -qF -- "$want" clippy.toml; then
-            err "clippy.toml: no disallowed-types entry with $want (hard rule 1)"
+    # An entry counts only on a line of its own that starts with `{`: a commented-out entry still
+    # contains the text. Only the std path can be probed below (the tokio one needs tokio's
+    # `process` feature, which nothing enables), so this is the one check of the tokio entry.
+    for path in 'std::process::Command' 'tokio::process::Command'; do
+        if ! grep -qE "^[[:space:]]*\\{[[:space:]]*path = \"$path\"" clippy.toml; then
+            err "clippy.toml: no active disallowed-types entry with path = \"$path\" (hard rule 1)"
         fi
     done
     if ! grep -qx 'allow-unwrap-in-tests = true' clippy.toml; then
@@ -78,6 +81,9 @@ if ! section_has Cargo.toml '[workspace.lints.rust]' 'unsafe_code = "forbid"'; t
 fi
 if ! section_has Cargo.toml '[workspace.lints.clippy]' 'unwrap_used = "deny"'; then
     err 'Cargo.toml: [workspace.lints.clippy] must have unwrap_used = "deny" (hard rule 10)'
+fi
+if ! section_has Cargo.toml '[workspace.lints.clippy]' 'disallowed_types = "deny"'; then
+    err 'Cargo.toml: [workspace.lints.clippy] must have disallowed_types = "deny" (hard rule 1)'
 fi
 
 # 4. Every crate inherits the workspace lints.
@@ -91,8 +97,11 @@ for manifest in crates/*/Cargo.toml; do
 done
 
 # 5. No allow attribute (or other mention) that switches these lints off for an item or a crate.
-#    `disallowed_types` is in clippy's style group, `unwrap_used` in restriction.
-pattern='disallowed_types|clippy::(all|style|restriction|unwrap_used)([^a-z_]|$)|(allow|expect)\([[:space:]]*warnings[[:space:]]*\)'
+#    `disallowed_types` is in clippy's style group (and so in clippy::all), `unwrap_used` in
+#    restriction. Any mention of these names is refused, whatever the attribute looks like.
+#    `allow(warnings)` is not in the list because it cannot reach them: it lowers only lints at
+#    warn level, and both are denied by name in Cargo.toml (check 3). The probe below proves it.
+pattern='disallowed_types|clippy::(all|style|restriction|unwrap_used)([^a-z_]|$)'
 while IFS= read -r hit; do
     file=${hit%%:*}
     if in_list "$file" ${allowed_lint_mentions[@]+"${allowed_lint_mentions[@]}"}; then
@@ -101,7 +110,8 @@ while IFS= read -r hit; do
     err "$hit: names a lint behind hard rules 1 and 10; an allow attribute would switch it off"
 done < <(git grep --untracked -nE "$pattern" -- 'crates/*.rs' || true)
 
-# 6. Live probe: clippy must still reject std::process::Command in a workspace crate.
+# 6. Live probe: clippy must still reject std::process::Command in a workspace crate, on its own
+#    (no `-D warnings` on the command line) and under a blanket `allow(warnings)`.
 probe_dir=crates/base/tests
 probe=$probe_dir/zz_check_lints_probe.rs
 if [[ -e $probe ]]; then
@@ -124,6 +134,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 cat >"$probe" <<'EOF'
 //! Temporary probe written by scripts/check-lints.sh. It must never be committed.
+#![allow(warnings, reason = "the confinement lint must survive a blanket allow")]
 #[test]
 fn spawns_a_process() {
     let _ = std::process::Command::new("true");
@@ -131,7 +142,7 @@ fn spawns_a_process() {
 EOF
 # shellcheck disable=SC2016 # the backticks are literal clippy output
 expected='use of a disallowed type `std::process::Command`'
-if out=$(cargo clippy -p numbers-base --tests --locked -- -D warnings 2>&1); then
+if out=$(cargo clippy -p numbers-base --tests --locked 2>&1); then
     echo "$out" >&2
     err "clippy accepted std::process::Command in numbers-base: the confinement lint is off (hard rule 1)"
 elif ! grep -qF -- "$expected" <<<"$out"; then
