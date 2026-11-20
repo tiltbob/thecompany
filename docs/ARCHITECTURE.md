@@ -251,8 +251,9 @@ encrypted blocks**.
   What travels and rests everywhere is the same ciphertext block, addressed by the BLAKE3 hash of its
   bytes, so any node, a tower included, can verify a block without being able to read it. Small
   things (text objects, git data) are packed into blocks of a few MiB; large files are cut into
-  blocks and can be resumed, streamed and read by range. The tower binary contains no sealing or key
-  code, and CI checks that.
+  blocks and can be resumed, streamed and read by range. The tower binary contains no sealing code
+  and no member, admin or airspace key, and CI checks that it links no member code. Its only keys
+  are its own TLS key and, when it takes its certificate from Let's Encrypt, its ACME account key.
 - **Durability (agreed).** Every tower keeps every block. A write counts as stored once two towers
   confirm it; a tower that was down catches up afterwards. The writer keeps its copy until then and
   airspace reports "not yet durable" (always, with a single tower). A member uploads once and the
@@ -479,7 +480,27 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   After `Server::shutdown()` right after a client came online,
   the client still reported itself connected in 8 of 180 runs (whether it could still relay was not
   tested); it was not observed in 180 runs each when shutting down at least 1 s after the last
-  connect or stopping the tower's own runtime (observations, not guarantees).
+  connect or stopping the tower's own runtime (observations, not guarantees). The relay's
+  supervisor ends as soon as any of its tasks ends (`src/server.rs:960-978`), and nothing
+  listens after that: the address-discovery accept loop ends when noq's endpoint driver fails on
+  a UDP receive error other than `ECONNRESET` or `EMSGSIZE` (noq 1.5.0 `src/endpoint.rs:1036`,
+  then `accept` gives `None`, `:812`; iroh-relay `src/quic.rs:146`), and the ACME task ends with
+  its event stream. `Server::join` (`:901`) waits for the supervisor without stopping it, and
+  `Server::shutdown` (`:879`) awaits the same handle, so it must not be called after `join`
+  returned; `Tower::stopped` waits on `join`. Start errors, from the source: `BindTlsListener`
+  (`:807`) is, despite its name, the plain-HTTP listener of a TLS tower; `BindTcpListener`
+  (`src/server/http_server.rs:462`) is the relay's own listener and names its address in its
+  message; a taken address-discovery port is `QuicSpawn` with `QuicSpawnError::EndpointServer`
+  (`src/quic.rs:114`), whose type is in a private module, so the `io::Error` is read through
+  `Error::source`. The ACME client's events are logged under the target `iroh_relay::server` in
+  a span named `acme` (`src/server.rs:777-783`): `debug!("acme event: {ok:?}")` for a step
+  (tokio-rustls-acme 0.10.0 `EventOk`: `DeployedCachedCert`, `DeployedNewCert`,
+  `CertCacheStore`, `AccountCacheStore`, `src/state.rs:56`) and `error!("error: {err:?}")` for a
+  failure, which carries the domain. After a failure it waits 2^n seconds, n growing to 16
+  (`src/state.rs:424-425`). Its cache writes use `fs::create_dir_all` and `fs::write` with the
+  process's default modes (`src/caches/dir.rs:36-38`), so the tower creates the directory with
+  mode 0700 itself. tracing-subscriber 0.3.23's fmt layer writes to standard output
+  (`src/fmt/fmt_layer.rs:749`).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
@@ -545,7 +566,8 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
   DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
   requires a literal loopback address.
-- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself (regular files
+- **TLS and QAD (M2).** A tower takes its certificate either from Let's Encrypt (ACME; see Tower
+  above) or from PEM files. From files, it reads the certificate and key itself (regular files
   only; a directory, device or FIFO could block) and checks the pair before it serves it: the
   chain holds a certificate, every one is an X.509 version 3 certificate that webpki parses (no
   version 1 root), the key file holds exactly one key that ring can use, and the key belongs to
