@@ -2,10 +2,14 @@
 # Runs `systemd-analyze verify` on the tower's systemd unit in packaging/systemd/, once alone (as
 # shipped) and once with the example drop-in for certificate files. ExecStart points at a stub:
 # verify checks only that the program exists and is executable, and a test in
-# crates/tower/src/main.rs checks the arguments. Outcomes:
+# crates/tower/src/main.rs checks the arguments. Before those two runs, a preflight verifies a
+# minimal unit of the script's own, to tell whether verify works in this environment at all.
+# Outcomes:
 # - pass: verify printed nothing and exited 0, in both runs;
-# - fail: any message, a warning as much as an error, or a non-zero exit status;
-# - systemd-analyze missing, or older than 250 (no --recursive-errors): fail if the environment
+# - fail: any message, a warning as much as an error, or a non-zero exit status, in either run;
+# - systemd-analyze missing, `systemd-analyze --version` failing, a version older than 250 (no
+#   --recursive-errors) or one that cannot be read, or a preflight that printed anything or exited
+#   non-zero (verify cannot run here, see the comment above preflight()): fail if the environment
 #   variable CI is set, otherwise print a `skipped:` line and succeed.
 # Works from any directory; builds nothing.
 set -euo pipefail
@@ -29,7 +33,10 @@ skip_or_fail() {
 if ! command -v systemd-analyze >/dev/null 2>&1; then
     skip_or_fail "systemd-analyze is not installed"
 fi
-version=$(systemd-analyze --version | awk 'NR == 1 { print $2 }')
+if ! version_output=$(systemd-analyze --version); then
+    skip_or_fail "systemd-analyze --version failed"
+fi
+version=$(awk 'NR == 1 { print $2 }' <<<"$version_output")
 if ! [[ $version =~ ^[0-9]+$ ]] || ((version < min_version)); then
     skip_or_fail "systemd-analyze is version ${version:-unknown}; the check needs $min_version or later"
 fi
@@ -58,6 +65,43 @@ printf '#!/bin/sh\nexit 0\n' >"$stub"
 chmod +x "$stub"
 quoted=${stub//%/%%}
 
+# How systemd-analyze reports (src/analyze/analyze-verify-util.c, read at 255): an error, such
+# as an ExecStart program that is not executable, gives a non-zero exit status. A syntax
+# warning, such as an unknown key or a value it cannot parse ("..., ignoring."), is only
+# printed, unless --recursive-errors is given. With --recursive-errors=no a syntax warning in the
+# unit or its drop-ins gives a non-zero exit status too, and the units it depends on
+# (network-online.target, multi-user.target) are not loaded, so warnings about the host's own
+# unit files cannot appear. verify needs no running systemd: it starts a manager in test mode.
+# In 255 and 256 that manager needs no root either. In 257 and 258 (src/core/manager.c) it
+# creates /run/systemd even in this mode, so an unprivileged user on a machine without that
+# directory cannot verify any unit: "Failed to create directory '/run/systemd/': Permission
+# denied".
+#
+# verify prints nothing for a clean unit, so any output also fails the check. No message has
+# been seen from the host here (systemd 255 with no systemd running); if one shows up in CI,
+# filter that exact message below, with a comment saying where it comes from.
+#
+# preflight: verify a minimal unit of our own, with the same options and the same stub, before
+# ours. systemd 255 prints nothing for it and exits 0. Any output or a non-zero status means that
+# verify does not work in this environment, whatever the reason (the /run/systemd case above is
+# one), so it is a skip, or a failure under CI, and not blamed on our files. The result decides,
+# not the text of a message. The path checks above come first, so a path systemd refuses is not
+# taken for a broken environment.
+preflight() {
+    local status=0 output unit_file=$scratch/preflight/numbers-preflight.service
+    mkdir "$scratch/preflight"
+    printf '[Service]\nType=oneshot\nExecStart="%s"\n' "$quoted" >"$unit_file"
+    output=$(systemd-analyze verify --recursive-errors=no "$unit_file" 2>&1) || status=$?
+    if [[ $status != 0 || -n $output ]]; then
+        local reason="systemd-analyze verify does not work in this environment: on a minimal"
+        reason+=" unit of this script's own it exited with status $status and printed:"
+        reason+=" ${output:-nothing}"
+        skip_or_fail "$reason"
+    fi
+}
+
+preflight
+
 # The copy keeps the unit's file name (verify derives the unit's name from it) and its line
 # numbers: one line is replaced by one line, without sed.
 mkdir "$scratch/units"
@@ -69,20 +113,8 @@ while IFS= read -r line || [[ -n $line ]]; do
     printf '%s\n' "$line"
 done <"$unit" >"$copy"
 
-# How systemd-analyze reports (src/analyze/analyze-verify-util.c, read at 255): an error, such
-# as an ExecStart program that is not executable, gives a non-zero exit status. A syntax
-# warning, such as an unknown key or a value it cannot parse ("..., ignoring."), is only
-# printed, unless --recursive-errors is given. With --recursive-errors=no a syntax warning in the
-# unit or its drop-ins gives a non-zero exit status too, and the units it depends on
-# (network-online.target, multi-user.target) are not loaded, so warnings about the host's own
-# unit files cannot appear. verify needs no running systemd (it starts a manager in test mode)
-# and no root.
-#
-# verify prints nothing for a clean unit, so any output also fails the check. No message has
-# been seen from the host here (systemd 255 with no systemd running); if one shows up in CI,
-# filter that exact message below, with a comment saying where it comes from.
-#
-# verify <run> <file>: <run> names the run, <file> the file in packaging/systemd/ it checks.
+# verify <run> <file>: runs after a clean preflight, so every message is about our files. <run>
+# names the run, <file> the file in packaging/systemd/ it checks.
 verify() {
     local status=0 output
     output=$(systemd-analyze verify --recursive-errors=no "$copy" 2>&1) || status=$?
