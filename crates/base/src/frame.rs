@@ -162,7 +162,7 @@ where
     W: AsyncWrite + Unpin + ?Sized,
     T: Serialize + ?Sized,
 {
-    let buf = encode(value, cap)?;
+    let buf = encode_frame(value, cap)?;
     writer.write_all(&buf).await?;
     writer.flush().await?;
     Ok(())
@@ -205,8 +205,14 @@ where
     Ok(serde_json::from_slice(&body)?)
 }
 
-/// Serializes `value` into one buffer holding the header and the body.
-fn encode<T: Serialize + ?Sized>(value: &T, cap: usize) -> Result<Vec<u8>, FrameError> {
+/// Serializes `value` into one buffer holding a whole frame, header and body.
+///
+/// For a caller that must know that a value fits before it opens a connection: write the buffer
+/// as it is, and flush. [`write_frame`] is this followed by the write.
+///
+/// Fails with [`FrameError::TooLarge`] if the body is larger than `cap`, and with
+/// [`FrameError::Json`] if `value` does not serialize.
+pub fn encode_frame<T: Serialize + ?Sized>(value: &T, cap: usize) -> Result<Vec<u8>, FrameError> {
     let mut buf = vec![0u8; HEADER_LEN];
     serde_json::to_writer(&mut buf, value)?;
     let body_len = buf.len() - HEADER_LEN;
