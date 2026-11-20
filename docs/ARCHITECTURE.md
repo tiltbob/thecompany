@@ -121,6 +121,13 @@ two networks do not meet.
   no Ed25519, so the HSM backs *who may enroll*, not each node's transport key; and the token signs
   with ECDSA P-256, so roster signatures carry an algorithm tag. A phone cannot enroll under this
   rule. One token plus a spare is the plan (**decision 1**).
+- **The HSM key outranks every admin key** (settled by the owner). The key on the token is
+  recorded in genesis as the network's root key. A statement it signs wins over any conflicting
+  statement by an admin key, whatever order the two arrived in: that is what settles a stolen
+  device and the chief's other device revoking each other. It can also add an admin key when
+  the chief has lost every one, which is the recovery path. It is used for nothing day to day;
+  the token still stays in a drawer. What a network created without a token does in these two
+  cases is open (**decision 2**).
 
 Membership is a **roster**: a hash-linked log (a DAG — each statement names its parents) of
 statements signed by admin keys. The network id is the hash of genesis. No node shares a secret
@@ -148,8 +155,8 @@ Rules the membership milestone (M3) implements:
 - **Revocation is strong:** statements by a revoked admin key that the revocation did not already
   know about are void, with everything that depends on them. `chief device revoke` lists what that
   key signed so the subtree can go in the same action. A signer picks its own parents, so "who was
-  first" cannot settle a stolen device and the chief's other device revoking each other
-  (**decision 2**).
+  first" cannot settle a stolen device and the chief's other device revoking each other; the
+  HSM key does: a revocation it signs stands, and the other is void (**decision 2**).
 - **Revocation suspends at once and purges later.** Suspending closes that station's links,
   terminals and forwards, and it is given no further version of any secret. Purging what the
   revoked node kept waits until the revocation is settled: acknowledged by every remaining
