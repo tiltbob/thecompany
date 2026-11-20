@@ -1,0 +1,16 @@
+[package]
+name = "numbers-station-daemon"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "station"
+path = "src/main.rs"
+
+[dependencies]
+numbers-station.workspace = true
+
+[lints]
+workspace = true

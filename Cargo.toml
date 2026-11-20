@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+# Internal crates.
+numbers-base = { path = "crates/base" }
+numbers = { path = "crates/numbers" }
+chief = { path = "crates/chief" }
+numbers-station = { path = "crates/station" }
+
+# iroh without default features (no portmapper, metrics or fast-apple-datapath); tls-ring is
+# required for `presets::Minimal`. See docs/ARCHITECTURE.md, appendix "Dependencies".
+iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

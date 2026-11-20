@@ -1,0 +1,10 @@
+# The only clippy.toml in the workspace: clippy uses the first one it finds walking up and never
+# merges. crates/safehouse gets its own in M5.
+allow-unwrap-in-tests = true
+
+disallowed-types = [
+    { path = "std::process::Command", reason = "agent confinement: only the safehouse crate spawns processes (AGENTS.md, hard rule 1)" },
+    # allow-invalid: the path exists only when something enables tokio's `process` feature. Without
+    # it clippy would warn that the path is unreachable in every crate that links tokio.
+    { path = "tokio::process::Command", reason = "agent confinement: only the safehouse crate spawns processes (AGENTS.md, hard rule 1)", allow-invalid = true },
+]

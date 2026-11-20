@@ -366,7 +366,7 @@ crates/
   numbers/          the network library: towers, endpoint + gate, link, protocols
   tower/            `tower` binary + embeddable lib (used by tests)              package `numbers-tower`
   station/          station core + local-socket server (library)                 package `numbers-station`
-  station-daemon/   `station` binary
+  station-daemon/   `station` binary                                             package `numbers-station-daemon`
   chief/            the shared frontend library: station API types + client
   chief-cli/        `chief` binary
   airspace/         persistence: a blind half towers also use, a sealed half for members   (M4)
