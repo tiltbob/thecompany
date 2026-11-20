@@ -18,14 +18,15 @@ ExecStart=/usr/local/bin/tower serve --config /etc/numbers-tower/tower.toml
 Restart=on-failure
 RestartSec=5s
 
-# A user allocated at start and released at stop. It implies ProtectSystem=strict,
-# ProtectHome=read-only, PrivateTmp=yes and NoNewPrivileges=yes; the settings below say so
-# explicitly or make them stricter.
+# A user allocated at start and released at stop. It also implies a private /tmp,
+# ProtectSystem=strict, ProtectHome=read-only, NoNewPrivileges=yes, RestrictSUIDSGID=yes and
+# RemoveIPC=yes. The lines at the end repeat two of them and make ProtectHome stricter.
 DynamicUser=yes
 
 # /var/lib/numbers-tower, owned by the dynamic user and writable despite ProtectSystem=strict.
-# The ACME cache lives in it. The tower refuses a cache that the group or others can access,
-# so nothing above the cache may be open either.
+# The documented config keeps the ACME cache, with the tower's keys, in it. Mode 0700 keeps it
+# private (systemd's default is 0755), and it is the mode the tower requires when cache_dir is
+# the state directory itself.
 StateDirectory=numbers-tower
 StateDirectoryMode=0700
 
@@ -36,7 +37,6 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]

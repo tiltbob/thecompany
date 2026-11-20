@@ -19,11 +19,11 @@ owned by root and readable by everyone, so the service's user can read them alth
 nothing in `/etc`. The unit does not use `ConfigurationDirectory=`: the files must be in place
 before the first start anyway, and the tower takes the config path from `ExecStart`.
 
-The service runs as a user that systemd allocates when it starts (`DynamicUser=yes`), with
-the whole file system read-only except its state directory. `StateDirectory=numbers-tower`
-makes `/var/lib/numbers-tower` a symbolic link to `/var/lib/private/numbers-tower`; systemd
-gives that directory to the service's user and sets its mode to 0700 at every start
-(`StateDirectoryMode=0700`). `/var/lib/private` is accessible to root only. The ACME cache
+The service runs as a user that systemd allocates when it starts (`DynamicUser=yes`). It sees
+the file system read-only, except its state directory and a private `/tmp`, and no home
+directories. `StateDirectory=numbers-tower` makes `/var/lib/numbers-tower` a symbolic link to
+`/var/lib/private/numbers-tower`; systemd gives that directory to the service's user and sets
+its mode to 0700 at every start (`StateDirectoryMode=0700`). `/var/lib/private` is accessible to root only. The ACME cache
 holds the tower's TLS key and its ACME account key: the tower creates it with mode 0700 and
 refuses to start with a cache that the group or others can access.
 
@@ -64,7 +64,7 @@ defaults: HTTPS on `0.0.0.0:443`, HTTP on `0.0.0.0:80`, address discovery on UDP
 `0.0.0.0:7842`. `production = false` (also the default) takes the certificate from Let's
 Encrypt's staging directory, which stations do not trust. Start with staging; once the tower
 gets a certificate, set `production = true` and restart it. Staging has much higher rate
-limits, so mistakes there cost nothing.
+limits, so mistakes there do not use up production's.
 
 Write `/etc/numbers-tower/allow.txt`: one endpoint id per line, `#` starts a comment. Then
 make both files readable:
@@ -90,11 +90,13 @@ sudo systemctl enable --now numbers-tower
 ```
 
 ```bash
-journalctl -u numbers-tower -f
+journalctl -u numbers-tower -o cat -f
 ```
 
-Each line starts with a timestamp, left out here. The start line gives the bound addresses,
-the number of listed ids and where the certificate comes from:
+`-o cat` shows the tower's own lines only: journald's usual prefix holds this machine's host
+name. The tower's log lines start with its own timestamp (UTC), left out below; its `tower: …`
+error lines have none. The start line gives the bound addresses, the number of listed ids and
+where the certificate comes from:
 
 ```text
 INFO numbers_tower::cli: tower listening https=0.0.0.0:443 http=0.0.0.0:80 qad=0.0.0.0:7842 access=3 ids listed certificate="acme staging"
@@ -116,8 +118,9 @@ WARN numbers_tower::cli: ACME: a certificate step failed; the tower retries with
 If the relay stops by itself, the tower logs `tower: the tower's relay stopped by itself` and
 exits with a failure; `Restart=on-failure` starts it again after 5 seconds. `systemctl stop`
 ends it with success, and it stays stopped. A config error also ends the tower with one
-`tower: …` line, which names the key and the file but no value from them; systemd then tries
-again every 5 seconds until the config is fixed.
+`tower: …` line. It quotes nothing from the files: a syntax error, an unknown key or a value
+of the wrong form gives the line number in the config file, and a missing key names the key.
+systemd then tries again every 5 seconds until the config is fixed.
 
 The tower logs no host name, endpoint id or path, on purpose: logs get copied into issues and
 chats. To see which host or file a problem is about, look at the config.
