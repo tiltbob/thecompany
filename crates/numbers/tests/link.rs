@@ -870,9 +870,11 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
                 .await,
                 "reset the unanswered chat by the receiver deadline",
             );
-            // The receiver's timer starts after `started`, so a correct reset is never early.
+            // `started` is taken before the request opens its stream, and the receiver creates
+            // its timer only after it accepts that stream. Tokio never fires a timer early, so
+            // on a correct receiver this cannot be shorter than the deadline.
             assert!(
-                started.elapsed() >= SEND_DEADLINE - Duration::from_millis(250),
+                started.elapsed() >= SEND_DEADLINE,
                 "the receiver reset the chat before its send deadline"
             );
             let held = held.expect("receive the complete chat before it times out");
@@ -1033,7 +1035,7 @@ async fn chats_reset_at_the_receiver_deadline_release_their_stream_slots() {
 }
 
 #[tokio::test]
-async fn acceptor_closes_a_silent_dialer_with_400_at_its_connect_timeout() {
+async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeout() {
     checked(
         timeout(CASE_TIMEOUT, async {
             let (endpoint, auth) = bind_direct().await;
@@ -1056,10 +1058,34 @@ async fn acceptor_closes_a_silent_dialer_with_400_at_its_connect_timeout() {
                 .await,
                 "the acceptor did not close a silent dialer by its hello timeout",
             );
-            // The acceptor starts its timer after the dialer's handshake completes.
+            // The dialer sees the connection before the acceptor does: the acceptor needs the
+            // dialer's Finished first, and only then starts its hello timer. Tokio never fires
+            // a timer early, so on a correct acceptor this cannot be shorter than the timeout.
             assert!(
-                dialed.elapsed() >= CONNECT_TIMEOUT - Duration::from_millis(250),
+                dialed.elapsed() >= CONNECT_TIMEOUT,
                 "the acceptor closed a silent dialer before its hello timeout"
+            );
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+            assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+
+            // This dialer sends its hello and reads the acceptor's answer, but never sends the
+            // echo, so the acceptor waits in the read of the echo under the same timeout.
+            let stalled = dial(&peer, &address).await;
+            let dialed = Instant::now();
+            let (_held_hello, _) =
+                begin_hello(&stalled, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            checked(
+                timeout(
+                    CONNECT_TIMEOUT + Duration::from_secs(1),
+                    expect_close(&stalled, 400),
+                )
+                .await,
+                "the acceptor did not close a stalled hello by its hello timeout",
+            );
+            // As above, the acceptor's timer starts after `dialed`.
+            assert!(
+                dialed.elapsed() >= CONNECT_TIMEOUT,
+                "the acceptor closed a stalled hello before its hello timeout"
             );
             assert_eq!(handle.path(peer_id), LinkPath::Down);
             assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
