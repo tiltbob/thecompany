@@ -18,6 +18,8 @@ numbers-tower = { path = "crates/tower" }
 # iroh without default features (no portmapper, metrics or fast-apple-datapath); tls-ring is
 # required for `presets::Minimal`. See docs/ARCHITECTURE.md, appendix "Dependencies".
 iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
+# Only the endpoint id type (`key`), for the tower's allowlist.
+iroh-base = { version = "1.5.0", default-features = false, features = ["key"] }
 iroh-relay = { version = "1.5", default-features = false, features = ["tls-ring"] }
 
 clap = { version = "4", features = ["derive"] }

@@ -2101,6 +2101,8 @@ name = "numbers-tower"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "iroh",
+ "iroh-base",
  "iroh-relay",
  "rustls",
  "thiserror 2.0.21",
