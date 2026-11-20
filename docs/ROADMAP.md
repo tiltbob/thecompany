@@ -198,7 +198,7 @@ unlisted station denied.
 | `crates/numbers/src/towers.rs` | `TowerSet`: up to 8 `TowerEntry { url, qad }`, `Qad` = `Off \| Port(u16)`, default `https` → 7842 and `http` → off. `diff`, `urls`, `len`; the serde form `[{url, qad_port}]` | #67, Codex |
 | `crates/base/src/towers.rs` | `canonical_tower_url` for explicit, SRV, remembered and peer-sent URLs, shared with frontends and re-exported by `numbers` with `TowerSetError` and `MAX_TOWERS`. Plain `http` requires a literal loopback IP address | #116, Codex |
 | `crates/numbers/src/endpoint.rs` | `EndpointConfig.tls_roots` (`WebPki` by default, `WebPkiPlus` with extra DER roots, `CustomOnly` for tests) and `EndpointConfig.dns` (`System` with no fallback, `Nameserver(addr)` for tests) | #67, Codex |
-| `crates/numbers/src/endpoint.rs` | several towers at runtime: `set_towers(&TowerSet)` applies the diff with `insert_relay` / `remove_relay`; `tower_states()` as plain data (the home tower observed, every other tower unknown); `nudge_towers()` removes and re-inserts the set; a control handle whose lifetime the station owns | #75, Codex |
+| `crates/numbers/src/endpoint.rs` | several towers at runtime: `set_towers(&TowerSet)` reconciles the relay map; `tower_states()` lists configured towers with the last observed outcome of the configured home; `nudge_towers()` requests a fresh net report; a weak control handle the station retains | #75, Codex |
 | `crates/numbers/src/endpoint.rs` | `tls_roots` wired to `ca_tls_config`; `dns` wired to iroh's resolver with no public fallback; the relay map carries each entry's QAD port | #76, Codex |
 | `crates/numbers/src/bootstrap.rs` | `srv_name(domain)` → `_numbers._tcp.<domain>.`; `towers_from_srv` (pure); the object-safe `Locator` trait, held as `Arc<dyn Locator>`; `DnsLocator` on `n0-dns-resolver`, no public fallback: with the system's resolvers it builds a fresh resolver for each lookup; with one given nameserver it keeps one resolver and clears its cache before each lookup; its own deadline (10 s by default) bounds the lookup's network waits, not the synchronous read of the system's resolver configuration; `LocateError`, whose text never carries a name | #72, Claude |
 | `crates/numbers/src/testing.rs` | `FakeDns` (cargo feature `test-support`): a DNS server on 127.0.0.1 answering SRV and A from a table the test sets, able to stay silent, recording every query. The station tests reuse it | #72, Claude |
@@ -257,15 +257,15 @@ resolver nor iroh's resolver for the tower host names falls back to a public res
 **Watching the home tower** (decision 17, settled on #74). iroh alone is slow in three situations
 that the lab measured: a tower that was down at start (online 14 to 24 s after it is up), a home
 tower that dies while another is in the set (41 to 49 s to move), and a home tower that denies the
-station while another would admit it (45 s or more, often not online within 60 s). Removing and
-re-inserting a tower makes iroh probe at once. The station watches `home_relay_status()` and never
-acts while the home tower is connected:
+station while another would admit it (45 s or more, often not online within 60 s). Calling
+`insert_relay` with a tower already in the map makes iroh probe the map at once. The station
+watches `home_relay_status()` and leaves a connected home alone:
 
-- **No home tower** for some seconds after start or after the set changed: it removes and
-  re-inserts every tower of the set, and repeats that at a growing, capped interval while the
-  status stays empty.
-- **The home tower not connected** for some seconds: it removes and re-inserts that tower; with
-  another tower in the set, the endpoint moves there.
+- **No home tower** for some seconds after start or after the set changed: it nudges iroh to
+  probe the configured relay map and repeats that at a growing, capped interval while the status
+  stays empty.
+- **The home tower not connected** for some seconds: it nudges iroh to probe. An available
+  replacement can become home.
 - **The home tower denies the station:** the tower is marked `Denied` with the reason, control
   characters replaced with spaces, and shown. It is taken out of the relay map only if another
   tower of the set is not marked denied. If it is the only tower, or every tower denies, the
@@ -379,10 +379,11 @@ run time.
   - tower set: canonical URLs, `http` refused off loopback, the cap of 8, the serde round trip (#67)
   - SRV against the fake DNS server: two targets give two canonical towers; NXDOMAIN, an empty
     answer and the target `.` give no tower; a silent server fails within the deadline (#72)
-  - several towers: two endpoints on {tower 1, tower 2} are shown homed on tower 1; tower 1 stops
-    and a fresh relay-only connection goes through tower 2 within 30 s; `set_towers` moves the home
-    tower without a rebind; a denied endpoint shows denied; a tower that is not home shows as not
-    observed, never as failing (#75)
+  - several towers: prove both endpoints have tower 1 as home, stop that tower, and explicitly
+    nudge the endpoints. A fresh relay-only connection goes through tower 2 within 30 s.
+    `set_towers` moves the home without rebinding when a replacement answers. The configured
+    snapshot omits a removed home even if iroh remains connected. A denied home retains the last
+    observed denial during retries, and other configured towers are unobserved (#75)
   - two endpoints chat through a TLS tower with QAD, and a tower named `tower1.example.com` is
     reached through the fake DNS server (#76)
   - a station given a domain gets its towers from a counting locator and chats; restarted, it comes
@@ -489,8 +490,8 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     candidates with the peer's name; it never connects to one, adds one to its relay map or passes
     one on, and a chief may take one into the set with an explicit command. Whether a station may
     ever use a peer's candidates on its own is an exception to hard rule 8 and left to the owner.
-17. **Recovering a tower (M2).** Decided by both agents on #74: a watchdog in the station removes
-    and re-inserts towers only after it has seen no home tower, or a home tower that is not
+17. **Recovering a tower (M2).** Decided by both agents on #74: a watchdog in the station requests
+    a fresh net report only after it has seen no home tower, or a home tower that is not
     connected, for some seconds, at a growing, capped interval, and never while the home tower is
     connected. A denying tower is shown and taken out of the relay map only when another tower is
     not denied; the station limits its own attempts and DNS queries, not iroh's own retries.
