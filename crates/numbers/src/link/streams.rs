@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason, WireChatMessage};
-use crate::proto::{CHAT_PROTOCOL, Hello, StreamHeader};
+use crate::proto::{CHAT_PROTOCOL, Hello, HelloEcho, StreamHeader};
 use crate::{CLOSE_NOT_ALLOWED, Protocol};
 
 use super::{CLOSE_LINK, IncomingChat, Peer, SendError, Shared, lock};
@@ -26,45 +26,70 @@ pub(super) fn close_code(connection: &Connection) -> Option<u32> {
 
 pub(super) async fn exchange_hello(
     connection: &Connection,
+    mut local: Hello,
     budget: Duration,
-) -> Result<(), SendError> {
-    match connection.side() {
+) -> Result<[u8; 16], SendError> {
+    let (mut send, mut recv) = match connection.side() {
+        Side::Client => connection.open_bi().await,
+        Side::Server => connection.accept_bi().await,
+    }
+    .map_err(|_| SendError::BadHello)?;
+
+    let remote = match connection.side() {
         Side::Client => {
-            let (mut send, mut recv) = connection
-                .open_bi()
+            write_frame(&mut send, &local, WIRE_FRAME_MAX)
                 .await
                 .map_err(|_| SendError::BadHello)?;
-            write_hello(&mut send).await?;
-            read_hello(&mut recv, budget).await
+            let remote = read_hello(&mut recv, budget).await?;
+            if remote.echo != Some(local.challenge) {
+                return Err(SendError::BadHello);
+            }
+            write_frame(
+                &mut send,
+                &HelloEcho {
+                    echo: remote.challenge,
+                },
+                WIRE_FRAME_MAX,
+            )
+            .await
+            .map_err(|_| SendError::BadHello)?;
+            remote
         }
         Side::Server => {
-            let (mut send, mut recv) = connection
-                .accept_bi()
+            let remote = read_hello(&mut recv, budget).await?;
+            if remote.echo.is_some() {
+                return Err(SendError::BadHello);
+            }
+            local.echo = Some(remote.challenge);
+            write_frame(&mut send, &local, WIRE_FRAME_MAX)
                 .await
                 .map_err(|_| SendError::BadHello)?;
-            read_hello(&mut recv, budget).await?;
-            write_hello(&mut send).await
+            let response: HelloEcho = read_frame(&mut recv, WIRE_FRAME_MAX, Some(budget))
+                .await
+                .map_err(hello_read_failure)?;
+            if response.echo != local.challenge {
+                return Err(SendError::BadHello);
+            }
+            remote
         }
-    }
-}
-
-async fn write_hello(send: &mut SendStream) -> Result<(), SendError> {
-    write_frame(send, &Hello::local(), WIRE_FRAME_MAX)
-        .await
-        .map_err(|_| SendError::BadHello)?;
-    // The peer may already have read the frame and closed its receive half.
+    };
     let _ = send.finish();
-    Ok(())
+    Ok(remote.generation)
 }
 
-async fn read_hello(recv: &mut RecvStream, budget: Duration) -> Result<(), SendError> {
+async fn read_hello(recv: &mut RecvStream, budget: Duration) -> Result<Hello, SendError> {
     let hello: Hello = read_frame(recv, WIRE_FRAME_MAX, Some(budget))
         .await
-        .map_err(|error| match error {
-            FrameError::Timeout => SendError::Timeout,
-            _ => SendError::BadHello,
-        })?;
-    hello.validate().map_err(|_| SendError::BadHello)
+        .map_err(hello_read_failure)?;
+    hello.validate().map_err(|_| SendError::BadHello)?;
+    Ok(hello)
+}
+
+fn hello_read_failure(error: FrameError) -> SendError {
+    match error {
+        FrameError::Timeout => SendError::Timeout,
+        _ => SendError::BadHello,
+    }
 }
 
 pub(super) async fn send_chat(

@@ -12,11 +12,11 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
-use crate::proto::CHAT_PROTOCOL;
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
-use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol};
+use crate::proto::{CHAT_PROTOCOL, Hello};
+use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
 
 use self::streams::{close_code, exchange_hello, receive_chat, send_chat};
 
@@ -224,29 +224,42 @@ impl LinkHandle {
         peer: &Arc<Peer>,
         message: &ChatMessage,
     ) -> Result<ChatReply, SendError> {
-        let connection = self.connection(peer, false).await?;
-        let mut result = send_chat(&connection, message, self.shared.config.send_deadline).await;
-        // A replacement or a stale connection can interrupt a stream after the peer accepted the
-        // message. The retry uses the same ID and remains under the original send deadline.
-        if result == Err(SendError::Disconnected) && connection.close_reason().is_some() {
-            let replaced = close_code(&connection) == Some(CLOSE_REPLACED);
-            let winner = self.connection(peer, replaced).await?;
+        let start = Instant::now();
+        let connection = self.connection(peer).await?;
+        let remaining = self
+            .shared
+            .config
+            .send_deadline
+            .saturating_sub(start.elapsed());
+        let progress = self.shared.config.connect_timeout.min(remaining / 2);
+        let mut result = timeout(progress, send_chat(&connection, message, progress))
+            .await
+            .unwrap_or(Err(SendError::Timeout));
+        // A stalled or interrupted stream may already have delivered the message. Retry
+        // the same ID once, within the original deadline, to keep receipt de-duplication intact.
+        if result == Err(SendError::Timeout) {
+            let state = peer.state();
+            if state.is_current(&connection) {
+                connection.close(CLOSE_LINK.into(), b"");
+            }
+        }
+        if result == Err(SendError::Timeout)
+            || (result == Err(SendError::Disconnected) && connection.close_reason().is_some())
+        {
+            let winner = self.connection(peer).await?;
             result = send_chat(&winner, message, self.shared.config.send_deadline).await;
         }
-        if peer.state().revoked {
+        if result.is_err() && peer.state().revoked {
             return Err(SendError::Closed);
         }
         result
     }
 
-    async fn connection(
-        &self,
-        peer: &Arc<Peer>,
-        mut await_winner: bool,
-    ) -> Result<Connection, SendError> {
+    async fn connection(&self, peer: &Arc<Peer>) -> Result<Connection, SendError> {
         // Subscribe before inspecting state. A later update stays visible across the await.
         let mut changes = peer.changed.subscribe();
         let mut attempt: Option<Arc<Dial>> = None;
+        let mut dialed_after_replacement = false;
         loop {
             {
                 let mut state = peer.state();
@@ -261,20 +274,20 @@ impl LinkHandle {
                 }
                 if let Some(pending) = &state.dial {
                     attempt = Some(Arc::clone(pending));
-                } else {
+                } else if state.incoming.is_none() {
                     let result = attempt.as_ref().and_then(|dial| *lock(&dial.result));
-                    if result == Some(DialResult::Replaced) {
-                        await_winner = true;
-                    }
-                    if state.incoming.is_none() && !await_winner {
-                        if let Some(DialResult::Failed(error)) = result {
-                            return Err(error);
+                    match result {
+                        Some(DialResult::Failed(error)) => return Err(error),
+                        Some(DialResult::Replaced) if dialed_after_replacement => {
+                            return Err(SendError::Disconnected);
                         }
-                        let dial = Arc::new(Dial::default());
-                        self.spawn_dial(peer, &dial)?;
-                        state.dial = Some(Arc::clone(&dial));
-                        attempt = Some(dial);
+                        Some(DialResult::Replaced) => dialed_after_replacement = true,
+                        _ => {}
                     }
+                    let dial = Arc::new(Dial::default());
+                    self.spawn_dial(peer, &dial)?;
+                    state.dial = Some(Arc::clone(&dial));
+                    attempt = Some(dial);
                 }
             }
             if changes.changed().await.is_err() {
@@ -332,6 +345,7 @@ impl LinkHandle {
 
 struct Shared {
     local_id: NodeId,
+    generation: [u8; 16],
     config: LinkConfig,
     authorizer: Arc<Authorizer>,
     incoming: Mutex<Option<mpsc::Sender<IncomingChat>>>,
@@ -345,6 +359,7 @@ impl Shared {
         let (paths, _) = broadcast::channel(MAILBOX_CAPACITY);
         let shared = Arc::new(Self {
             local_id: endpoint.iroh().id(),
+            generation: fresh_nonce(),
             config,
             authorizer: endpoint.authorizer_handle(),
             incoming: Mutex::new(Some(incoming)),
@@ -394,7 +409,18 @@ impl Shared {
         lock(&self.incoming).take();
     }
 
-    fn admit(&self, peer: &Peer, state: &mut PeerState, connection: &Connection) -> DialResult {
+    fn hello(&self) -> Hello {
+        Hello::local(self.generation, fresh_nonce())
+    }
+
+    fn admit(
+        &self,
+        peer: &Peer,
+        state: &mut PeerState,
+        connection: &Connection,
+        observed_generation: Option<[u8; 16]>,
+        remote_generation: [u8; 16],
+    ) -> DialResult {
         if state.revoked {
             connection.close(CLOSE_LINK.into(), b"");
             return DialResult::Failed(SendError::Closed);
@@ -406,16 +432,24 @@ impl Shared {
         if connection.close_reason().is_some() {
             return dial_failure(connection, SendError::Disconnected);
         }
+        let same_generation = state.remote_generation == Some(remote_generation);
+        // The peer answered a fresh challenge after this snapshot. If another generation
+        // was admitted in the meantime, this handshake no longer proves a newer peer.
+        if !same_generation && state.remote_generation != observed_generation {
+            connection.close(CLOSE_REPLACED.into(), b"");
+            return DialResult::Replaced;
+        }
         if let Some(active) = state.active.as_ref().filter(|active| active.is_open()) {
             let existing = initiator(self.local_id, peer.id, active.connection.side());
             let candidate = initiator(self.local_id, peer.id, connection.side());
-            if existing <= candidate {
+            if same_generation && existing < candidate {
                 connection.close(CLOSE_REPLACED.into(), b"");
                 return DialResult::Replaced;
             }
             active.connection.close(CLOSE_REPLACED.into(), b"");
         }
         let old_path = state.path();
+        state.remote_generation = Some(remote_generation);
         let path = selected_path(connection);
         state.active = Some(Active {
             connection: connection.clone(),
@@ -491,6 +525,8 @@ struct PeerState {
     incoming: Option<Connection>,
     outgoing: Option<Connection>,
     active: Option<Active>,
+    // A connection can close while another generation's handshake is in flight.
+    remote_generation: Option<[u8; 16]>,
     dial: Option<Arc<Dial>>,
 }
 
@@ -548,25 +584,29 @@ async fn run_dial(endpoint: iroh::Endpoint, shared: Arc<Shared>, peer: Arc<Peer>
             .connect(peer.id, LINK_ALPN)
             .await
             .map_err(connection_failure)?;
-        {
+        let observed_generation = {
             let mut state = peer.state();
             if state.revoked {
                 connection.close(CLOSE_LINK.into(), b"");
                 return Err(DialResult::Failed(SendError::Closed));
             }
             state.outgoing = Some(connection.clone());
-        }
-        if let Err(error) = exchange_hello(&connection, budget).await {
-            let result = dial_failure(&connection, error);
-            let code = if error == SendError::Timeout {
-                CLOSE_LINK
-            } else {
-                CLOSE_BAD_HELLO
-            };
-            connection.close(code.into(), b"");
-            return Err(result);
-        }
-        Ok(connection)
+            state.remote_generation
+        };
+        let remote_generation = match exchange_hello(&connection, shared.hello(), budget).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let result = dial_failure(&connection, error);
+                let code = if error == SendError::Timeout {
+                    CLOSE_LINK
+                } else {
+                    CLOSE_BAD_HELLO
+                };
+                connection.close(code.into(), b"");
+                return Err(result);
+            }
+        };
+        Ok((connection, observed_generation, remote_generation))
     };
     let result = tokio::select! {
         _ = peer.revoked() => return,
@@ -582,8 +622,14 @@ async fn run_dial(endpoint: iroh::Endpoint, shared: Arc<Shared>, peer: Arc<Peer>
         let pending = state.outgoing.take();
         state.dial.take();
         let (outcome, active) = match result {
-            Ok(connection) => {
-                let outcome = shared.admit(&peer, &mut state, &connection);
+            Ok((connection, observed_generation, remote_generation)) => {
+                let outcome = shared.admit(
+                    &peer,
+                    &mut state,
+                    &connection,
+                    observed_generation,
+                    remote_generation,
+                );
                 (
                     outcome,
                     (outcome == DialResult::Ready).then_some(connection),
@@ -674,7 +720,7 @@ impl ProtocolHandler for IncomingLinks {
                 return Ok(());
             }
         };
-        {
+        let observed_generation = {
             let mut state = peer.state();
             if state.revoked {
                 connection.close(CLOSE_LINK.into(), b"");
@@ -686,17 +732,25 @@ impl ProtocolHandler for IncomingLinks {
                 return Ok(());
             }
             state.incoming = Some(connection.clone());
-        }
+            state.remote_generation
+        };
         let budget = shared.config.connect_timeout;
-        let hello = timeout(budget, exchange_hello(&connection, budget)).await;
+        let hello = timeout(budget, exchange_hello(&connection, shared.hello(), budget)).await;
         let admitted = {
             let mut state = peer.state();
             state.incoming.take();
-            let result = if matches!(hello, Ok(Ok(()))) {
-                shared.admit(&peer, &mut state, &connection)
-            } else {
-                connection.close(CLOSE_BAD_HELLO.into(), b"");
-                DialResult::Failed(SendError::BadHello)
+            let result = match hello {
+                Ok(Ok(remote_generation)) => shared.admit(
+                    &peer,
+                    &mut state,
+                    &connection,
+                    observed_generation,
+                    remote_generation,
+                ),
+                _ => {
+                    connection.close(CLOSE_BAD_HELLO.into(), b"");
+                    DialResult::Failed(SendError::BadHello)
+                }
             };
             peer.changed.send_replace(());
             result == DialResult::Ready
@@ -753,6 +807,18 @@ fn initiator(local: NodeId, remote: NodeId, side: Side) -> NodeId {
     match side {
         Side::Client => local,
         Side::Server => remote,
+    }
+}
+
+fn fresh_nonce() -> [u8; 16] {
+    // The node-key generator supplies OS randomness. These bytes are never used as a key.
+    loop {
+        let random = generate_node_key();
+        let mut nonce = [0; 16];
+        nonce.copy_from_slice(&random[..16]);
+        if nonce != [0; 16] {
+            return nonce;
+        }
     }
 }
 
@@ -855,13 +921,16 @@ mod tests {
                     let peer = shared.peer(remote.iroh().id()).unwrap();
                     {
                         let mut state = peer.state();
-                        assert!(shared.admit(&peer, &mut state, early) == DialResult::Ready);
+                        assert!(
+                            shared.admit(&peer, &mut state, early, None, [1; 16])
+                                == DialResult::Ready
+                        );
                         let expected = if winner_first {
                             DialResult::Replaced
                         } else {
                             DialResult::Ready
                         };
-                        assert!(shared.admit(&peer, &mut state, late) == expected);
+                        assert!(shared.admit(&peer, &mut state, late, None, [1; 16]) == expected);
                         assert!(state.is_current(winner));
                         assert!(loser.close_reason().is_some());
                     }
@@ -878,5 +947,58 @@ mod tests {
         })
         .await
         .expect("resolve duplicate links before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn delayed_hello_cannot_restore_the_previous_generation() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let local = loopback_endpoint().await;
+            let remote = loopback_endpoint().await;
+            local
+                .authorizer()
+                .replace_peers([(remote.iroh().id(), "peer".into())]);
+            remote
+                .authorizer()
+                .replace_peers([(local.iroh().id(), "peer".into())]);
+            let (shared, _inbox) = Shared::new(
+                &local,
+                LinkConfig {
+                    connect_timeout: budget,
+                    send_deadline: budget,
+                },
+            );
+            let peer = shared.peer(remote.iroh().id()).unwrap();
+            let (original, _original_remote) = connect(&local, &remote).await;
+            let (_delayed_remote, delayed) = connect(&remote, &local).await;
+            let (new, _new_remote) = connect(&local, &remote).await;
+            {
+                let mut state = peer.state();
+                let old = [1; 16];
+                let restarted = [2; 16];
+                assert!(shared.admit(&peer, &mut state, &original, None, old) == DialResult::Ready);
+                assert!(
+                    shared.admit(&peer, &mut state, &new, Some(old), restarted)
+                        == DialResult::Ready
+                );
+                assert!(state.is_current(&new));
+            }
+
+            new.close(CLOSE_LINK.into(), b"");
+            drive(Arc::clone(&shared), Arc::clone(&peer), new).await;
+            {
+                let mut state = peer.state();
+                assert!(state.active.is_none());
+                assert!(
+                    shared.admit(&peer, &mut state, &delayed, Some([1; 16]), [1; 16])
+                        == DialResult::Replaced
+                );
+                assert!(state.active.is_none());
+            }
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("reject a delayed generation before the test deadline");
     }
 }

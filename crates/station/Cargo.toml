@@ -9,6 +9,16 @@ publish.workspace = true
 numbers.workspace = true
 numbers-base.workspace = true
 chief.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+chief = { workspace = true, features = ["fake"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

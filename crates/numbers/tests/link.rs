@@ -8,21 +8,21 @@ use std::time::Duration;
 use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
-    ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream,
+    ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, Side,
 };
 use numbers::link::{IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, SendError};
 use numbers::proto::chat::{CHAT_BODY_MAX, ChatMessage, ChatReply, NackReason, ReceiptWindow};
-use numbers::proto::{CHAT_PROTOCOL, CHAT_VERSION, Hello, StreamHeader};
+use numbers::proto::{CHAT_PROTOCOL, CHAT_VERSION, Hello, HelloEcho, StreamHeader};
 use numbers::{
-    Authorizer, Endpoint, EndpointConfig, IpTransport, NodeId, TowerSet, generate_node_key,
+    Authorizer, Endpoint, EndpointConfig, IpTransport, NodeId, TowerSet, generate_node_key, node_id,
 };
 use numbers_base::{FrameError, WIRE_FRAME_MAX, read_frame, write_frame};
 use numbers_tower::{Tower, TowerConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, error::TryRecvError};
+use tokio::sync::{broadcast, oneshot};
 use tokio::time::{sleep, timeout};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -31,6 +31,7 @@ const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_DEADLINE: Duration = Duration::from_secs(4);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const RAW_GENERATION: [u8; 16] = [1; 16];
 
 fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
     result.unwrap_or_else(|_| panic!("{operation}"))
@@ -52,20 +53,42 @@ fn message(id: &str, body: &str) -> ChatMessage {
 }
 
 async fn bind(config: EndpointConfig) -> (Endpoint, Arc<Authorizer>) {
+    bind_with_key(&generate_node_key(), config).await
+}
+
+async fn bind_with_key(key: &[u8; 32], config: EndpointConfig) -> (Endpoint, Arc<Authorizer>) {
     let auth = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
     let endpoint = checked(
-        Endpoint::bind(&generate_node_key(), config, Arc::clone(&auth)).await,
+        Endpoint::bind(key, config, Arc::clone(&auth)).await,
         "bind test endpoint",
     );
     (endpoint, auth)
 }
 
 async fn bind_direct() -> (Endpoint, Arc<Authorizer>) {
-    bind(EndpointConfig {
-        towers: TowerSet::default(),
-        ip_transport: IpTransport::LoopbackOnly,
-    })
+    bind_direct_with_key(&generate_node_key()).await
+}
+
+async fn bind_direct_with_key(key: &[u8; 32]) -> (Endpoint, Arc<Authorizer>) {
+    bind_with_key(
+        key,
+        EndpointConfig {
+            towers: TowerSet::default(),
+            ip_transport: IpTransport::LoopbackOnly,
+        },
+    )
     .await
+}
+
+fn ordered_keys() -> ([u8; 32], [u8; 32]) {
+    let first = generate_node_key();
+    let second = generate_node_key();
+    assert!(node_id(&first) != node_id(&second));
+    if node_id(&first) < node_id(&second) {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 fn loopback_socket(endpoint: &Endpoint) -> SocketAddr {
@@ -73,6 +96,18 @@ fn loopback_socket(endpoint: &Endpoint) -> SocketAddr {
     assert_eq!(sockets.len(), 1);
     assert_eq!(sockets[0].ip(), Ipv4Addr::LOCALHOST);
     sockets[0]
+}
+
+fn loopback_address(endpoint: &Endpoint) -> EndpointAddr {
+    EndpointAddr::new(endpoint.iroh().id()).with_ip_addr(loopback_socket(endpoint))
+}
+
+fn add_lookup(endpoint: &Endpoint, lookup: MemoryLookup) {
+    checked(endpoint.iroh().address_lookup(), "read address lookup").add(lookup);
+}
+
+fn add_address(endpoint: &Endpoint, addr: EndpointAddr) {
+    add_lookup(endpoint, MemoryLookup::from_endpoint_info([addr]));
 }
 
 fn allow_peers(
@@ -167,14 +202,19 @@ async fn dial(endpoint: &Endpoint, addr: &EndpointAddr) -> Connection {
 }
 
 async fn reply_to_chat(conn: &Connection, expected: &ChatMessage) {
-    let (mut send, mut recv) = checked(conn.accept_bi().await, "accept chat stream");
+    let (mut send, _) = accept_chat(conn, expected).await;
+    write(&mut send, &ChatReply::Ack).await;
+    checked(send.finish(), "finish chat reply");
+}
+
+async fn accept_chat(conn: &Connection, expected: &ChatMessage) -> (SendStream, serde_json::Value) {
+    let (send, mut recv) = checked(conn.accept_bi().await, "accept chat stream");
     let header: StreamHeader = read(&mut recv).await;
     assert_eq!(header.proto, CHAT_PROTOCOL);
     assert_eq!(header.v, CHAT_VERSION);
     let message: serde_json::Value = read(&mut recv).await;
     assert!(message == checked(serde_json::to_value(expected), "serialize expected chat"));
-    write(&mut send, &ChatReply::Ack).await;
-    checked(send.finish(), "finish chat reply");
+    (send, message)
 }
 
 async fn request<T: Serialize>(
@@ -225,7 +265,32 @@ async fn rebind_after_shutdown(socket: SocketAddr) {
     );
 }
 
-async fn accept_hello(endpoint: &Endpoint) -> (Connection, SendStream) {
+struct HeldHello {
+    send: SendStream,
+    recv: RecvStream,
+    hello: Hello,
+}
+
+impl HeldHello {
+    fn response(&self, generation: [u8; 16], challenge: [u8; 16]) -> Hello {
+        let mut reply = Hello::local(generation, challenge);
+        reply.echo = Some(self.hello.challenge);
+        reply
+    }
+
+    async fn reply(&mut self, generation: [u8; 16], challenge: [u8; 16]) {
+        let reply = self.response(generation, challenge);
+        write(&mut self.send, &reply).await;
+        checked(self.send.finish(), "finish delayed hello");
+    }
+
+    async fn confirm(&mut self, challenge: [u8; 16]) {
+        let confirmation: HelloEcho = read(&mut self.recv).await;
+        assert!(confirmation.echo == challenge);
+    }
+}
+
+async fn accept_hello(endpoint: &Endpoint) -> (Connection, HeldHello) {
     // Accept directly to control when the peer replies to the outgoing hello.
     let incoming = checked(
         timeout(PROBE_TIMEOUT, endpoint.iroh().accept()).await,
@@ -236,9 +301,291 @@ async fn accept_hello(endpoint: &Endpoint) -> (Connection, SendStream) {
     let conn = checked(accepting.await, "complete outgoing handshake");
     let (send, mut recv) = checked(conn.accept_bi().await, "accept hello stream");
     let hello: Hello = read(&mut recv).await;
-    assert_eq!(hello.v, Hello::local().v);
-    assert!(hello.network.is_empty() && hello.head.is_empty());
-    (conn, send)
+    assert_eq!(hello.validate(), Ok(()));
+    assert!(hello.echo.is_none());
+    (conn, HeldHello { send, recv, hello })
+}
+
+async fn begin_hello(conn: &Connection, local: &Hello) -> (SendStream, Hello) {
+    let (mut send, mut recv) = checked(conn.open_bi().await, "open hello stream");
+    write(&mut send, local).await;
+    let remote: Hello = read(&mut recv).await;
+    assert_eq!(remote.validate(), Ok(()));
+    assert!(remote.echo == Some(local.challenge));
+    (send, remote)
+}
+
+async fn finish_hello(send: &mut SendStream, remote: &Hello) {
+    write(
+        send,
+        &HelloEcho {
+            echo: remote.challenge,
+        },
+    )
+    .await;
+    checked(send.finish(), "finish client hello");
+}
+
+async fn restart_without_close(original_dials: bool, restarted_sends_first: bool) {
+    let (survivor_key, restarting_key) = ordered_keys();
+    let (survivor_endpoint, survivor_auth) = bind_direct_with_key(&survivor_key).await;
+    let survivor_id = survivor_endpoint.iroh().id();
+    let restarting_id = node_id(&restarting_key);
+    survivor_auth.replace_peers([(restarting_id, "restarting".into())]);
+    let survivor_addr = loopback_address(&survivor_endpoint);
+    let original_peer_addr = survivor_addr.clone();
+    let initial = message("initial", "before restarting");
+    let original_initial = initial.clone();
+    let (ready, original_addr) = oneshot::channel();
+    let (crash, stop) = oneshot::channel();
+
+    let original = tokio::task::spawn_blocking(move || {
+        let runtime = checked(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            "create the original station's separate runtime",
+        );
+        let link = runtime.block_on(async move {
+            let (endpoint, auth) = bind_direct_with_key(&restarting_key).await;
+            auth.replace_peers([(survivor_id, "survivor".into())]);
+            add_address(&endpoint, original_peer_addr);
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            checked(ready.send(address), "share the original station's address");
+            if original_dials {
+                assert_eq!(
+                    link.handle().send(survivor_id, original_initial).await,
+                    Ok(ChatReply::Ack),
+                );
+            } else {
+                acknowledge(&mut inbox, survivor_id, "survivor", &original_initial).await;
+            }
+            let _ = stop.await;
+            link
+        });
+        // Stop the QUIC drivers before the link can send CONNECTION_CLOSE from Drop.
+        runtime.shutdown_background();
+        drop(link);
+    });
+
+    let original_addr = checked(
+        original_addr.await,
+        "receive the original station's address",
+    );
+    let lookup = MemoryLookup::from_endpoint_info([original_addr]);
+    add_lookup(&survivor_endpoint, lookup.clone());
+    let (survivor, mut survivor_inbox) = Link::start(survivor_endpoint, config());
+    let survivor_handle = survivor.handle();
+    if original_dials {
+        acknowledge(&mut survivor_inbox, restarting_id, "restarting", &initial).await;
+    } else {
+        assert_eq!(
+            survivor_handle.send(restarting_id, initial).await,
+            Ok(ChatReply::Ack),
+        );
+    }
+    wait_for_path(&survivor_handle, restarting_id, LinkPath::Direct).await;
+    checked(crash.send(()), "stop the original station's runtime");
+    checked(original.await, "join the original station's runtime");
+    assert_eq!(survivor_handle.path(restarting_id), LinkPath::Direct);
+
+    let (restarted, mut restarted_inbox) = checked(
+        timeout(PROBE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct_with_key(&restarting_key).await;
+            assert!(endpoint.iroh().id() == restarting_id);
+            auth.replace_peers([(survivor_id, "survivor".into())]);
+            add_address(&endpoint, survivor_addr);
+            lookup.set_endpoint_info(loopback_address(&endpoint));
+            Link::start(endpoint, config())
+        })
+        .await,
+        "restart the station with the original key",
+    );
+    let restarted_handle = restarted.handle();
+
+    let after = message("after-restart", "sent by the restarted station");
+    let reverse = message("reverse", "sent by the surviving station");
+    let from_restarted = async {
+        let (reply, ()) = tokio::join!(
+            restarted_handle.send(survivor_id, after.clone()),
+            acknowledge(&mut survivor_inbox, restarting_id, "restarting", &after),
+        );
+        assert_eq!(reply, Ok(ChatReply::Ack));
+    };
+    let from_survivor = async {
+        let (reply, ()) = tokio::join!(
+            survivor_handle.send(restarting_id, reverse.clone()),
+            acknowledge(&mut restarted_inbox, survivor_id, "survivor", &reverse),
+        );
+        assert_eq!(reply, Ok(ChatReply::Ack));
+    };
+    checked(
+        timeout(PROBE_TIMEOUT, async {
+            if restarted_sends_first {
+                from_restarted.await;
+                from_survivor.await;
+            } else {
+                from_survivor.await;
+                from_restarted.await;
+            }
+        })
+        .await,
+        "exchange chat before the stale connection's idle timeout",
+    );
+
+    let (survivor_result, restarted_result) =
+        tokio::join!(survivor.shutdown(), restarted.shutdown());
+    checked(survivor_result, "stop surviving link");
+    checked(restarted_result, "stop restarted link");
+}
+
+#[tokio::test]
+async fn restart_recovers_when_the_original_link_was_dialed_by_the_restarted_station() {
+    checked(
+        timeout(CASE_TIMEOUT, restart_without_close(true, true)).await,
+        "restart test timed out",
+    );
+}
+
+#[tokio::test]
+async fn restart_recovers_when_the_original_link_was_dialed_by_the_lower_id_survivor() {
+    checked(
+        timeout(CASE_TIMEOUT, restart_without_close(false, true)).await,
+        "restart test timed out",
+    );
+}
+
+#[tokio::test]
+async fn survivor_can_send_first_after_the_other_station_restarts() {
+    checked(
+        timeout(CASE_TIMEOUT, restart_without_close(false, false)).await,
+        "restart test timed out",
+    );
+}
+
+async fn crossed_hellos(
+    local_is_lower: bool,
+    first_side: Side,
+    outgoing_generation: [u8; 16],
+    winner_side: Side,
+) {
+    let (lower, higher) = ordered_keys();
+    let (local_key, raw_key) = if local_is_lower {
+        (lower, higher)
+    } else {
+        (higher, lower)
+    };
+    let (endpoint, auth) = bind_direct_with_key(&local_key).await;
+    let (peer, peer_auth) = bind_direct_with_key(&raw_key).await;
+    let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+    let address = loopback_address(&endpoint);
+    add_address(&endpoint, loopback_address(&peer));
+    peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+    let (link, mut inbox) = Link::start(
+        endpoint,
+        LinkConfig {
+            connect_timeout: PROBE_TIMEOUT,
+            send_deadline: PROBE_TIMEOUT * 2,
+        },
+    );
+    let handle = link.handle();
+    let probe = message("probe", "send during crossed hellos");
+    let outgoing_handle = handle.clone();
+    let sent = probe.clone();
+    let send = tokio::spawn(async move { outgoing_handle.send(peer_id, sent).await });
+    let (outgoing, mut held) = accept_hello(&peer).await;
+    let incoming = dial(&peer, &address).await;
+    let (mut incoming_hello, remote) =
+        begin_hello(&incoming, &Hello::local(RAW_GENERATION, [2; 16])).await;
+    assert!(remote.generation == held.hello.generation);
+
+    // Both hellos are pending. A chat stream proves the first connection was admitted
+    // before the second handshake completes. Hold the chat ACK across the tie-break.
+    let first = match first_side {
+        Side::Client => {
+            held.reply(outgoing_generation, [1; 16]).await;
+            held.confirm([1; 16]).await;
+            &outgoing
+        }
+        Side::Server => {
+            finish_hello(&mut incoming_hello, &remote).await;
+            &incoming
+        }
+    };
+    let (mut first_reply, _) = accept_chat(first, &probe).await;
+    match first_side {
+        Side::Client => finish_hello(&mut incoming_hello, &remote).await,
+        Side::Server => held.reply(outgoing_generation, [1; 16]).await,
+    }
+    let (winner, loser) = match winner_side {
+        Side::Client => (&outgoing, &incoming),
+        Side::Server => (&incoming, &outgoing),
+    };
+    let reason = checked(
+        timeout(PROBE_TIMEOUT, loser.closed()).await,
+        "close losing link",
+    );
+    assert!(
+        matches!(reason, ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 409)
+    );
+    assert!(winner.close_reason().is_none());
+
+    if winner.stable_id() == first.stable_id() {
+        write(&mut first_reply, &ChatReply::Ack).await;
+        checked(
+            first_reply.finish(),
+            "finish chat reply on the winning link",
+        );
+    } else {
+        reply_to_chat(winner, &probe).await;
+    }
+    assert_eq!(
+        checked(send.await, "join send during crossed hellos"),
+        Ok(ChatReply::Ack)
+    );
+
+    let reverse = message("reverse", "use the surviving connection in both directions");
+    let header = StreamHeader::chat();
+    let (reply, ()) = tokio::join!(
+        request(winner, &header, &reverse),
+        acknowledge(&mut inbox, peer_id, "second", &reverse),
+    );
+    assert_eq!(
+        checked(reply, "read reply on the winning link"),
+        ChatReply::Ack
+    );
+
+    checked(link.shutdown().await, "stop crossed link");
+    peer.iroh().close().await;
+}
+
+#[tokio::test]
+async fn crossed_hellos_keep_the_lower_id_dialer_in_either_completion_order() {
+    for (local_is_lower, winner) in [(true, Side::Client), (false, Side::Server)] {
+        for first in [Side::Client, Side::Server] {
+            checked(
+                timeout(
+                    CASE_TIMEOUT,
+                    crossed_hellos(local_is_lower, first, RAW_GENERATION, winner),
+                )
+                .await,
+                "crossed hello test timed out",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_old_generation_hello_cannot_replace_the_new_generation() {
+    checked(
+        timeout(
+            CASE_TIMEOUT,
+            crossed_hellos(true, Side::Server, [2; 16], Side::Server),
+        )
+        .await,
+        "delayed hello test timed out",
+    );
 }
 
 #[tokio::test]
@@ -270,7 +617,7 @@ async fn simultaneous_sends_finish_in_both_directions_over_the_relay() {
 
             // The body at the exact UTF-8 byte limit contains characters that need escaping in JSON.
             let first_message = message("first", &"\u{1}".repeat(CHAT_BODY_MAX));
-            let second_message = message("second", "return message");
+            let second_message = message("second", &"é".repeat(CHAT_BODY_MAX / 2));
             let followup = message("followup", "after simultaneous dial");
             let first_expected = [&second_message, &followup];
             let second_expected = [&first_message];
@@ -349,13 +696,20 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
             wait_for_close(&malformed).await;
             assert_eq!(handle.path(peer_id), LinkPath::Down);
 
+            let wrong_echo = dial(&peer, &address).await;
+            let (mut send, remote) =
+                begin_hello(&wrong_echo, &Hello::local(RAW_GENERATION, [2; 16])).await;
+            let mut echo = remote.challenge;
+            echo[0] ^= 1;
+            write(&mut send, &HelloEcho { echo }).await;
+            checked(send.finish(), "finish wrong hello echo");
+            wait_for_close(&wrong_echo).await;
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+
             let conn = dial(&peer, &address).await;
-            let (mut send, mut recv) = checked(conn.open_bi().await, "open valid hello");
-            write(&mut send, &Hello::local()).await;
-            checked(send.finish(), "finish valid hello");
-            let hello: Hello = read(&mut recv).await;
-            assert_eq!(hello.v, Hello::local().v);
-            assert!(hello.network.is_empty() && hello.head.is_empty());
+            let (mut send, remote) =
+                begin_hello(&conn, &Hello::local(RAW_GENERATION, [3; 16])).await;
+            finish_hello(&mut send, &remote).await;
             wait_for_path(&handle, peer_id, LinkPath::Direct).await;
 
             let probe = message("probe", "must not be delivered");
@@ -371,12 +725,10 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
                 (unknown, NackReason::UnknownProtocol),
                 (unsupported, NackReason::UnsupportedVersion),
             ] {
-                let result = request(&conn, &header, &probe).await;
-                assert!(match result {
-                    Ok(ChatReply::Nack(actual)) => actual == reason,
-                    Err(FrameError::Closed | FrameError::Io(_)) => true,
-                    _ => false,
-                });
+                assert_eq!(
+                    checked(request(&conn, &header, &probe).await, "read typed NACK"),
+                    ChatReply::Nack(reason),
+                );
             }
 
             // Each base64 group decodes to three bytes, so this exceeds the chat limit
@@ -391,19 +743,28 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
                 Ok(ChatReply::Nack(NackReason::BodyTooLarge))
             ));
 
-            let (mut send, mut recv) = checked(conn.open_bi().await, "open oversize frame stream");
             let oversize_length = u32::try_from(WIRE_FRAME_MAX + 1).expect("wire cap fits u32");
-            let mut prefix = Vec::new();
+            let oversized = oversize_length.to_be_bytes();
+            let truncated = [0, 0, 0, 4, b'{'];
+            let malformed = [0, 0, 0, 1, b'{'];
+            let mut header = Vec::new();
             checked(
-                write_frame(&mut prefix, &StreamHeader::chat(), WIRE_FRAME_MAX).await,
+                write_frame(&mut header, &StreamHeader::chat(), WIRE_FRAME_MAX).await,
                 "encode chat header",
             );
-            prefix.extend_from_slice(&oversize_length.to_be_bytes());
-            checked(send.write_all(&prefix).await, "announce oversize frame");
-            assert!(matches!(
-                read_frame::<_, ChatReply>(&mut recv, WIRE_FRAME_MAX, Some(PROBE_TIMEOUT)).await,
-                Err(FrameError::Closed | FrameError::Io(_)),
-            ));
+            for frame in [oversized.as_slice(), &truncated, &malformed] {
+                let mut request = header.clone();
+                request.extend_from_slice(frame);
+                let (mut send, mut recv) =
+                    checked(conn.open_bi().await, "open invalid chat stream");
+                checked(send.write_all(&request).await, "write invalid chat frame");
+                let _ = send.finish();
+                assert!(matches!(
+                    read_frame::<_, ChatReply>(&mut recv, WIRE_FRAME_MAX, Some(PROBE_TIMEOUT))
+                        .await,
+                    Err(FrameError::Closed | FrameError::Io(_)),
+                ));
+            }
             assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
 
             let valid = message("valid", "same connection");
@@ -459,8 +820,8 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
 
             let valid = message("continued", "reuse ongoing dial");
             let (reply, ()) = tokio::join!(handle.send(peer_id, valid.clone()), async {
-                write(&mut hello, &Hello::local()).await;
-                checked(hello.finish(), "finish delayed hello");
+                hello.reply(RAW_GENERATION, [1; 16]).await;
+                hello.confirm([1; 16]).await;
                 reply_to_chat(&conn, &valid).await;
             });
             assert!(matches!(reply, Ok(ChatReply::Ack)));
@@ -495,9 +856,17 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
             let mut changes = handle.subscribe_paths();
             auth.replace_peers([]);
             handle.close_peer(peer_id);
+            assert!(matches!(
+                handle
+                    .send(peer_id, message("removed", "cannot reconnect"))
+                    .await,
+                Err(SendError::NotAllowed)
+            ));
+            auth.replace_peers([(peer_id, "re-added".into())]);
             // The remote may already have seen the close before this delayed reply.
-            let _ = write_frame(&mut hello, &Hello::local(), WIRE_FRAME_MAX).await;
-            let _ = hello.finish();
+            let delayed = hello.response(RAW_GENERATION, [2; 16]);
+            let _ = write_frame(&mut hello.send, &delayed, WIRE_FRAME_MAX).await;
+            let _ = hello.send.finish();
             let send_result = checked(pending.await, "join revoked send");
             assert!(matches!(
                 send_result,
@@ -505,12 +874,6 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
             ));
             wait_for_close(&retired).await;
             assert_eq!(handle.path(peer_id), LinkPath::Down);
-            assert!(matches!(
-                handle
-                    .send(peer_id, message("removed", "cannot reconnect"))
-                    .await,
-                Err(SendError::NotAllowed)
-            ));
             loop {
                 match changes.try_recv() {
                     Ok(update) => assert_eq!(update.path, LinkPath::Down),
@@ -519,6 +882,17 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
                 }
             }
 
+            let restored = message("restored", "use a new connection after re-adding");
+            let (reply, fresh) = tokio::join!(handle.send(peer_id, restored.clone()), async {
+                let (fresh, mut hello) = accept_hello(&peer).await;
+                hello.reply(RAW_GENERATION, [3; 16]).await;
+                hello.confirm([3; 16]).await;
+                reply_to_chat(&fresh, &restored).await;
+                fresh
+            });
+            assert_eq!(reply, Ok(ChatReply::Ack));
+            assert!(fresh.close_reason().is_none());
+
             checked(link.shutdown().await, "stop link with a surviving handle");
             assert_eq!(handle.path(peer_id), LinkPath::Down);
             rebind_after_shutdown(local_socket).await;
@@ -526,6 +900,65 @@ async fn dial_recovers_after_cancellation_and_timeout_then_stops_on_revocation()
         })
         .await,
         "cancellation and revocation test timed out",
+    );
+}
+
+#[tokio::test]
+async fn chat_committed_before_a_stalled_ack_is_delivered_once_after_retry() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            add_address(&endpoint, loopback_address(&peer));
+            peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+            let (link, _inbox) = Link::start(endpoint, config());
+            let handle = link.handle();
+            let chat = message("slow-ack", "commit before acknowledging");
+
+            let (reply, retry) = checked(
+                timeout(SEND_DEADLINE, async {
+                    tokio::join!(handle.send(peer_id, chat.clone()), async {
+                        let (initial, mut hello) = accept_hello(&peer).await;
+                        hello.reply(RAW_GENERATION, [1; 16]).await;
+                        hello.confirm([1; 16]).await;
+                        let (held_ack, received) = accept_chat(&initial, &chat).await;
+                        let initial_id = received["id"].as_str().expect("initial chat ID");
+                        let mut receipts = ReceiptWindow::new(3);
+                        let mut deliveries = usize::from(receipts.record("first", initial_id));
+
+                        // Keep the reply stream open until the sender closes the stalled link.
+                        assert!(matches!(
+                            initial.closed().await,
+                            ConnectionError::ApplicationClosed(_)
+                        ));
+                        drop(held_ack);
+
+                        let (retry, mut hello) = accept_hello(&peer).await;
+                        assert!(retry.stable_id() != initial.stable_id());
+                        hello.reply(RAW_GENERATION, [2; 16]).await;
+                        hello.confirm([2; 16]).await;
+                        let (mut send, received) = accept_chat(&retry, &chat).await;
+                        let retry_id = received["id"].as_str().expect("retried chat ID");
+                        assert!(retry_id == initial_id);
+                        deliveries += usize::from(receipts.record("first", retry_id));
+                        assert_eq!(deliveries, 1);
+                        write(&mut send, &ChatReply::Ack).await;
+                        checked(send.finish(), "finish ACK on retried chat");
+                        retry
+                    })
+                })
+                .await,
+                "acknowledge the retry within the original send deadline",
+            );
+            assert_eq!(reply, Ok(ChatReply::Ack));
+            assert!(retry.close_reason().is_none());
+
+            checked(link.shutdown().await, "stop link after retry");
+            peer.iroh().close().await;
+        })
+        .await,
+        "stalled ACK retry test timed out",
     );
 }
 

@@ -23,25 +23,38 @@ pub struct Hello {
     pub network: String,
     /// Reserved for a roster head. Empty in M1.
     pub head: String,
+    /// Random generation of the running link instance.
+    pub generation: [u8; 16],
+    /// Fresh challenge for this handshake.
+    pub challenge: [u8; 16],
+    /// The client challenge, echoed by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo: Option<[u8; 16]>,
 }
 
 impl Hello {
     /// A hello for the current link version.
-    pub fn local() -> Self {
+    pub fn local(generation: [u8; 16], challenge: [u8; 16]) -> Self {
         Self {
             v: LINK_VERSION,
             network: String::new(),
             head: String::new(),
+            generation,
+            challenge,
+            echo: None,
         }
     }
 
-    /// Checks the version and the M1 requirement for empty reserved fields.
+    /// Checks the version, reserved fields, and nonzero generation and challenge.
     pub fn validate(&self) -> Result<(), HelloError> {
         if self.v != LINK_VERSION {
             return Err(HelloError::UnsupportedVersion);
         }
         if !self.network.is_empty() || !self.head.is_empty() {
             return Err(HelloError::ReservedFields);
+        }
+        if self.generation == [0; 16] || self.challenge == [0; 16] {
+            return Err(HelloError::InvalidNonce);
         }
         Ok(())
     }
@@ -62,6 +75,14 @@ pub enum HelloError {
     UnsupportedVersion,
     #[error("link hello has nonempty reserved fields")]
     ReservedFields,
+    #[error("link hello has a zero generation or challenge")]
+    InvalidNonce,
+}
+
+/// The client echoes the server challenge to complete the link hello.
+#[derive(Serialize, Deserialize)]
+pub struct HelloEcho {
+    pub echo: [u8; 16],
 }
 
 /// The first frame on a typed stream opened after the link hello.
@@ -108,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn hello_and_stream_header_use_versioned_json_frames() {
         let mut frames = Vec::new();
-        write_frame(&mut frames, &Hello::local(), WIRE_FRAME_MAX)
+        write_frame(&mut frames, &Hello::local([1; 16], [2; 16]), WIRE_FRAME_MAX)
             .await
             .unwrap();
         write_frame(&mut frames, &StreamHeader::chat(), WIRE_FRAME_MAX)
@@ -118,7 +139,7 @@ mod tests {
         let mut reader = frames.as_slice();
         let hello: Hello = read_frame(&mut reader, WIRE_FRAME_MAX, None).await.unwrap();
         let header: StreamHeader = read_frame(&mut reader, WIRE_FRAME_MAX, None).await.unwrap();
-        assert_eq!(hello, Hello::local());
+        assert_eq!(hello, Hello::local([1; 16], [2; 16]));
         assert_eq!(header, StreamHeader::chat());
         assert_eq!(hello.validate(), Ok(()));
         assert_eq!(header.validate_chat(), Ok(()));
@@ -127,8 +148,18 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_values_and_accepts_additional_fields() {
-        let mut hello: Hello =
-            serde_json::from_str(r#"{"v":1,"network":"","head":"","extra":true}"#).unwrap();
+        let mut json = serde_json::to_value(Hello::local([1; 16], [2; 16])).unwrap();
+        json["extra"] = true.into();
+        let mut malformed = json.clone();
+        malformed["generation"] = serde_json::to_value([1; 15]).unwrap();
+        assert!(serde_json::from_value::<Hello>(malformed).is_err());
+        let mut hello: Hello = serde_json::from_value(json).unwrap();
+        hello.generation = [0; 16];
+        assert_eq!(hello.validate(), Err(HelloError::InvalidNonce));
+        hello.generation = [1; 16];
+        hello.challenge = [0; 16];
+        assert_eq!(hello.validate(), Err(HelloError::InvalidNonce));
+        hello.challenge = [2; 16];
         assert_eq!(hello.validate(), Ok(()));
         hello.v = LINK_VERSION + 1;
         assert_eq!(hello.validate(), Err(HelloError::UnsupportedVersion));
