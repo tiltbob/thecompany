@@ -21,6 +21,6 @@ mod tests {
     fn banner_names_the_binary_and_api() {
         let b = super::banner();
         assert!(b.starts_with("chief "));
-        assert!(b.contains("station API 1"));
+        assert!(b.contains(&format!("station API {}", chief::API_VERSION)));
     }
 }
