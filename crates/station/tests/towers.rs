@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 use std::future::{Future, ready};
 use std::net::{Ipv4Addr, TcpListener};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,13 @@ const TOWER_FILE: &str = "towers.json";
 
 type Chief = Client<StationHandle>;
 type LocateReply = Result<Vec<TowerEntry>, LocateError>;
+
+fn create_seed_directory(path: &Path) {
+    checked(
+        fs::DirBuilder::new().mode(0o700).create(path),
+        "create private seeded station directory",
+    );
+}
 
 fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
     // Station errors and replies can carry generated identities.
@@ -160,13 +167,14 @@ fn write_private(path: &Path, bytes: &[u8]) {
 #[tokio::test]
 async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
-        let peer_dir = tempfile::tempdir().expect("create peer directory");
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
+        let peer_data_dir = scratch.path().join("peer");
         let tower = loopback_tower().await;
         let entry = checked(TowerEntry::from_url(tower.url()), "build locator result");
         let url = entry.url().to_owned();
         let (settings, mut lookups) = config(
-            dir.path(),
+            &data_dir,
             TowerInput::Domain("Team.SYNTHETIC.Invalid.".into()),
         );
         let (station, chief) = start(settings).await;
@@ -183,7 +191,7 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
         assert!(lookup.reply.send(Ok(vec![entry])).is_ok());
         wait_online(&chief, &url, TowerSource::Srv).await;
 
-        let (peer_settings, mut peer_lookups) = config(peer_dir.path(), pins(&tower));
+        let (peer_settings, mut peer_lookups) = config(&peer_data_dir, pins(&tower));
         let (peer_station, peer) = start(peer_settings).await;
         wait_online(&peer, &url, TowerSource::Configured).await;
         let chief_id = checked(chief.status().await, "read chief identity").station_id;
@@ -202,7 +210,7 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
         assert!(peer_lookups.try_recv().is_err(), "pins skip discovery");
         stop(station).await;
 
-        let saved = read_record(dir.path());
+        let saved = read_record(&data_dir);
         assert_eq!(
             decode(&saved),
             disk_record(
@@ -214,7 +222,7 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
             TowerInput::Remembered,
             TowerInput::Domain("TEAM.synthetic.invalid.".into()),
         ] {
-            let (settings, mut lookups) = config(dir.path(), input);
+            let (settings, mut lookups) = config(&data_dir, input);
             let (station, chief) = start(settings).await;
             wait_online(&chief, &url, TowerSource::Remembered).await;
             let status = checked(chief.status().await, "read remembered tower status");
@@ -224,12 +232,12 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
                 lookups.try_recv().is_err(),
                 "remembered startup skips discovery"
             );
-            assert_eq!(read_record(dir.path()), saved);
+            assert_eq!(read_record(&data_dir), saved);
         }
 
         let pin = loopback_tower().await;
         let pin_url = checked(numbers::canonical_tower_url(pin.url()), "canonicalize pin");
-        let (settings, mut lookups) = config(dir.path(), pins(&pin));
+        let (settings, mut lookups) = config(&data_dir, pins(&pin));
         let (station, chief) = start(settings).await;
         wait_online(&chief, &pin_url, TowerSource::Configured).await;
         let status = checked(chief.status().await, "read pinned tower status");
@@ -237,7 +245,7 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
         assert_eq!(status.towers.len(), 1);
         stop(station).await;
         assert!(lookups.try_recv().is_err(), "pin override skips discovery");
-        assert_eq!(read_record(dir.path()), saved);
+        assert_eq!(read_record(&data_dir), saved);
         checked(pin.shutdown().await, "shut down pinned tower");
         checked(tower.shutdown().await, "shut down discovered tower");
     })
@@ -247,20 +255,22 @@ async fn discovery_runs_after_start_and_a_remembered_set_skips_it() {
 #[tokio::test]
 async fn a_real_domain_change_replaces_the_record_before_lookup_and_shutdown_cancels_it() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
         let tower = loopback_tower().await;
         let entry = checked(TowerEntry::from_url(tower.url()), "build fixture tower");
         let old = disk_record(
             "old.synthetic.invalid",
             json!([{"url": entry.url(), "qad_port": null, "source": "srv"}]),
         );
+        create_seed_directory(&data_dir);
         write_private(
-            &dir.path().join(TOWER_FILE),
+            &data_dir.join(TOWER_FILE),
             &serde_json::to_vec(&old).unwrap(),
         );
 
         let (settings, mut lookups) = config(
-            dir.path(),
+            &data_dir,
             TowerInput::Domain("Team.SYNTHETIC.Invalid.".into()),
         );
         let (station, chief) = start(settings).await;
@@ -268,16 +278,16 @@ async fn a_real_domain_change_replaces_the_record_before_lookup_and_shutdown_can
         let status = checked(chief.status().await, "read changed-domain status");
         assert_eq!(status.bootstrap_domain.as_deref(), Some(DOMAIN));
         assert!(status.towers.is_empty());
-        let empty = read_record(dir.path());
+        let empty = read_record(&data_dir);
         assert_eq!(decode(&empty), disk_record(DOMAIN, json!([])));
         stop(station).await;
         assert!(
             lookup.reply.send(Ok(vec![entry])).is_err(),
             "shutdown drops the locator"
         );
-        assert_eq!(read_record(dir.path()), empty);
+        assert_eq!(read_record(&data_dir), empty);
 
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Remembered);
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Remembered);
         let (station, chief) = start(settings).await;
         let lookup = next_lookup(&mut lookups, DOMAIN).await;
         assert!(
@@ -288,7 +298,7 @@ async fn a_real_domain_change_replaces_the_record_before_lookup_and_shutdown_can
         assert!(lookups.try_recv().is_err());
         stop(station).await;
         assert!(lookup.reply.is_closed());
-        assert_eq!(read_record(dir.path()), empty);
+        assert_eq!(read_record(&data_dir), empty);
         checked(tower.shutdown().await, "shut down loopback tower");
     })
     .await;
@@ -297,9 +307,10 @@ async fn a_real_domain_change_replaces_the_record_before_lookup_and_shutdown_can
 #[tokio::test]
 async fn missing_or_invalid_configuration_preserves_the_file_and_explicit_domain_recovers_it() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
-        let file = dir.path().join(TOWER_FILE);
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Remembered);
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
+        let file = data_dir.join(TOWER_FILE);
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Remembered);
         assert!(matches!(
             Station::start(settings).await,
             Err(StartError::MissingTowerConfig)
@@ -309,16 +320,16 @@ async fn missing_or_invalid_configuration_preserves_the_file_and_explicit_domain
 
         let corrupt = b"damaged tower record";
         write_private(&file, corrupt);
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Remembered);
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Remembered);
         assert!(matches!(
             Station::start(settings).await,
             Err(StartError::MissingTowerConfig)
         ));
         assert!(lookups.try_recv().is_err());
-        assert_eq!(read_record(dir.path()), corrupt);
+        assert_eq!(read_record(&data_dir), corrupt);
 
         let (settings, mut lookups) = config(
-            dir.path(),
+            &data_dir,
             TowerInput::Domain("https://team.synthetic.invalid/".into()),
         );
         assert!(matches!(
@@ -326,9 +337,9 @@ async fn missing_or_invalid_configuration_preserves_the_file_and_explicit_domain
             Err(StartError::InvalidBootstrapDomain)
         ));
         assert!(lookups.try_recv().is_err());
-        assert_eq!(read_record(dir.path()), corrupt);
+        assert_eq!(read_record(&data_dir), corrupt);
 
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Domain(DOMAIN.into()));
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Domain(DOMAIN.into()));
         let (station, chief) = start(settings).await;
         let lookup = next_lookup(&mut lookups, DOMAIN).await;
         let status = checked(chief.status().await, "read recovered tower status");
@@ -337,7 +348,7 @@ async fn missing_or_invalid_configuration_preserves_the_file_and_explicit_domain
         stop(station).await;
         assert!(lookup.reply.is_closed());
         assert_eq!(
-            decode(&read_record(dir.path())),
+            decode(&read_record(&data_dir)),
             disk_record(DOMAIN, json!([]))
         );
     })
@@ -347,10 +358,12 @@ async fn missing_or_invalid_configuration_preserves_the_file_and_explicit_domain
 #[tokio::test]
 async fn pins_ignore_an_unsafe_tower_file_that_a_domain_run_cannot_replace() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
-        let target = dir.path().join("outside-record");
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
+        create_seed_directory(&data_dir);
+        let target = scratch.path().join("outside-record");
         write_private(&target, b"untouched");
-        let file = dir.path().join(TOWER_FILE);
+        let file = data_dir.join(TOWER_FILE);
         checked(symlink(&target, &file), "link unsafe tower fixture");
         let assert_link_untouched = || {
             assert!(
@@ -368,7 +381,7 @@ async fn pins_ignore_an_unsafe_tower_file_that_a_domain_run_cannot_replace() {
             numbers::canonical_tower_url(tower.url()),
             "canonicalize pin",
         );
-        let (settings, mut lookups) = config(dir.path(), pins(&tower));
+        let (settings, mut lookups) = config(&data_dir, pins(&tower));
         let (station, chief) = start(settings).await;
         wait_online(&chief, &url, TowerSource::Configured).await;
         let status = checked(chief.status().await, "read pinned tower status");
@@ -378,7 +391,7 @@ async fn pins_ignore_an_unsafe_tower_file_that_a_domain_run_cannot_replace() {
         assert!(lookups.try_recv().is_err());
         assert_link_untouched();
 
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Domain(DOMAIN.into()));
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Domain(DOMAIN.into()));
         assert!(matches!(
             Station::start(settings).await,
             Err(StartError::Storage { .. })
@@ -393,11 +406,12 @@ async fn pins_ignore_an_unsafe_tower_file_that_a_domain_run_cannot_replace() {
 #[tokio::test]
 async fn explicit_changes_persist_and_cancel_an_older_lookup() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
         let tower = loopback_tower().await;
         let url = checked(numbers::canonical_tower_url(tower.url()), "canonicalize loopback tower");
         let typed = tower.url().replacen("http://", "HTTP://", 1);
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Domain(DOMAIN.into()));
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Domain(DOMAIN.into()));
         let (station, chief) = start(settings).await;
         let lookup = next_lookup(&mut lookups, DOMAIN).await;
 
@@ -407,12 +421,12 @@ async fn explicit_changes_persist_and_cancel_an_older_lookup() {
         assert_eq!(added.tower.source, Some(TowerSource::Configured));
         assert!(lookup.reply.is_closed(), "explicit add cancels the older lookup");
         wait_online(&chief, &url, TowerSource::Configured).await;
-        let saved = read_record(dir.path());
+        let saved = read_record(&data_dir);
         assert_eq!(
             decode(&saved),
             disk_record(DOMAIN, json!([{"url": url, "qad_port": null, "source": "configured"}])),
         );
-        let file = dir.path().join(TOWER_FILE);
+        let file = data_dir.join(TOWER_FILE);
         let inode = checked(fs::metadata(&file), "read record inode").ino();
 
         let mut events = checked(chief.subscribe().await, "subscribe before no-op mutations");
@@ -429,22 +443,22 @@ async fn explicit_changes_persist_and_cancel_an_older_lookup() {
         let status = checked(chief.status().await, "read tower status after no-op mutations");
         assert_eq!(status.towers, vec![duplicate.tower]);
         assert_no_queued_event(&mut events).await;
-        assert_eq!(read_record(dir.path()), saved);
+        assert_eq!(read_record(&data_dir), saved);
         assert_eq!(checked(fs::metadata(&file), "read unchanged record inode").ino(), inode);
         stop(station).await;
 
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Remembered);
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Remembered);
         let (station, chief) = start(settings).await;
         wait_online(&chief, &url, TowerSource::Remembered).await;
         assert!(lookups.try_recv().is_err());
-        assert_eq!(read_record(dir.path()), saved);
+        assert_eq!(read_record(&data_dir), saved);
         let mut events = checked(chief.subscribe().await, "subscribe before removing last tower");
         let removed = checked(chief.tower_remove(&typed).await, "remove last tower");
         assert_eq!(removed.outcome, TowerRemoveOutcome::Removed);
         assert_eq!(removed.url, url);
         assert!(matches!(events.next().await, Some(Event::Status { status }) if status.towers.is_empty()));
         assert!(checked(chief.status().await, "read empty installed set").towers.is_empty());
-        assert_eq!(decode(&read_record(dir.path())), disk_record(DOMAIN, json!([])));
+        assert_eq!(decode(&read_record(&data_dir)), disk_record(DOMAIN, json!([])));
         stop(station).await;
         checked(tower.shutdown().await, "shut down loopback tower");
     })
@@ -454,19 +468,20 @@ async fn explicit_changes_persist_and_cancel_an_older_lookup() {
 #[tokio::test]
 async fn the_first_no_op_after_restart_confirms_the_remembered_tower_record() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
         let tower = loopback_tower().await;
         let entry = checked(TowerEntry::from_url(tower.url()), "build locator result");
         let url = entry.url().to_owned();
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Domain(DOMAIN.into()));
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Domain(DOMAIN.into()));
         let (station, chief) = start(settings).await;
         let lookup = next_lookup(&mut lookups, DOMAIN).await;
         assert!(lookup.reply.send(Ok(vec![entry])).is_ok());
         wait_online(&chief, &url, TowerSource::Srv).await;
         stop(station).await;
 
-        let file = dir.path().join(TOWER_FILE);
-        let saved = read_record(dir.path());
+        let file = data_dir.join(TOWER_FILE);
+        let saved = read_record(&data_dir);
         assert_eq!(
             decode(&saved),
             disk_record(DOMAIN, json!([{"url": url, "qad_port": null, "source": "srv"}])),
@@ -479,7 +494,7 @@ async fn the_first_no_op_after_restart_confirms_the_remembered_tower_record() {
         let on_disk = || identity(checked(fs::metadata(&file), "stat the current record"));
         let original = identity(published_metadata);
 
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Remembered);
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Remembered);
         let (station, chief) = start(settings).await;
         wait_online(&chief, &url, TowerSource::Remembered).await;
         assert_eq!(on_disk(), original, "startup leaves the record in place");
@@ -495,7 +510,7 @@ async fn the_first_no_op_after_restart_confirms_the_remembered_tower_record() {
                 if detail == "could not use towers.json; it must be a regular file owned by this user with mode 0600"
         ), "the restarted actor cannot acknowledge a failed rewrite");
         assert_eq!(on_disk(), original);
-        assert_eq!(read_record(dir.path()), saved);
+        assert_eq!(read_record(&data_dir), saved);
         checked(
             fs::set_permissions(&file, fs::Permissions::from_mode(0o600)),
             "restore safe destination permissions",
@@ -507,7 +522,7 @@ async fn the_first_no_op_after_restart_confirms_the_remembered_tower_record() {
         let confirmed = checked(File::open(&file), "hold the confirmed record open");
         let rewritten = identity(checked(confirmed.metadata(), "stat the confirmed record"));
         assert_ne!(rewritten.0, original.0, "confirmation uses a checked replacement");
-        assert_eq!(read_record(dir.path()), saved);
+        assert_eq!(read_record(&data_dir), saved);
 
         let absent = checked(
             chief.tower_remove("https://absent.synthetic.invalid/").await,
@@ -526,8 +541,9 @@ async fn the_first_no_op_after_restart_confirms_the_remembered_tower_record() {
 #[tokio::test]
 async fn at_capacity_a_duplicate_succeeds_and_a_distinct_add_is_refused() {
     bounded(async {
-        let dir = tempfile::tempdir().expect("create station directory");
-        let (settings, mut lookups) = config(dir.path(), TowerInput::Domain(DOMAIN.into()));
+        let scratch = tempfile::tempdir().expect("create fixture directory");
+        let data_dir = scratch.path().join("station");
+        let (settings, mut lookups) = config(&data_dir, TowerInput::Domain(DOMAIN.into()));
         let (station, chief) = start(settings).await;
         let lookup = next_lookup(&mut lookups, DOMAIN).await;
         let listeners: Vec<_> = (0..=MAX_TOWERS)
