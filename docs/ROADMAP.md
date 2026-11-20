@@ -39,9 +39,9 @@ the sections on M1 and M2 below keep their original wording.
 The order after M3 is open to change: M4 comes early because chat history, offline delivery, git and
 agent workspaces all build on it. Measured against the goal, the order has a weakness: the first
 point at which two agents on different safehouses coordinate through the network is M9 (chat
-tools), with shared repos at M7 and locks at M12, after M8. Whether to pull a thin slice of
-that forward — two agents on two safehouses exchanging messages, right after M5 — is
-**decision 21**. Network management grows one view per milestone: `chief network`
+tools), with shared repos at M7 and locks at M12, after M8. So a thin slice follows M5 directly (**decision 21**, decided by both agents on #165): a
+session on one safehouse exchanges live messages with a session on another safehouse, on a
+different linked tower, and with the chief's station. M6 to M9 keep their content. Network management grows one view per milestone: `chief network`
 (M3: every node, its chief, who admitted it, online, relayed or direct, tower health),
 `chief airspace` (M4: spaces, durability, tower usage), `chief safehouses` (M5), `chief sessions` and
 `chief harness` (M8). Towers are observed from a station, never administered.
@@ -558,11 +558,15 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     member or addressed by its hash, so a tower verifies what it takes). Also: full mesh
     (planned, the set is capped at eight) or less; whether a tower forwards for a node the
     roster lists but its own allowlist has not caught up with.
-21. **Agent coordination earlier (order of milestones).** The goal is agents on disparate nodes
-    working together, and the plan first shows that at M9. Options: keep the order; add a thin
-    slice after M5 in which a session on one safehouse sends a message to a session on another
-    and to the chief, through the MCP bridge, without history or channels (planned); or move M8
-    and M9 ahead of M6 and M7.
+21. **Agent coordination earlier (order of milestones).** Decided by both agents on #165: a
+    thin slice right after M5. Two safehouses on different linked towers and a station; a
+    session on one sends bounded live messages to a session on the other and to the chief,
+    through the MCP bridge; the node is authenticated and the session attributed; the receiving
+    safehouse authorizes, under an explicit admin-signed grant between the two safehouses and
+    their workspaces, and refuses a peer or session without one; no station executes agent
+    code. No history, channels or offline delivery (M9), no projects (M6). CI uses fake
+    harnesses. Still open: authorization by project, and files and locks between safehouses.
+    The alternatives were to keep the order, or to move M8 and M9 ahead of M6 and M7.
 
 **Needs from the owner:** a public host and DNS zone (M2 demo; nothing else waits on it); a ruling
 on hard rule 10 for `crates/chief-ffi`, whose generated bindings use `unsafe` (M2 FFI smoke check,

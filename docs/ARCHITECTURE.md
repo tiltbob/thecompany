@@ -124,12 +124,13 @@ two networks do not meet.
   rule. One token plus a spare is the plan (**decision 1**).
 - **The HSM key outranks every admin key** (settled by the owner). The key on the token is
   recorded in genesis as the network's root key. A statement it signs wins over any conflicting
-  statement by an admin key, whatever order the two arrived in. Two uses, and no others:
+  statement by an admin key, whatever order the two arrived in. That overriding authority has two uses, and no others
+  (the same key also gives the ordinary second signature on an enrollment, above):
   *dispute* — when a stolen device and the chief's other device revoke each other, the
   revocation the root key signs stands; an ordinary revocation that nobody contests needs no
   token. *Recovery* — when the chief has lost every admin key, a statement signed by the root
-  key alone adds a new one; it is the only statement in the roster that carries no admin
-  signature. Recovery restores who may administer. It does not decrypt anything: see what a
+  key alone adds a new one. These two, the dispute-settling revocation and the recovery, are
+  the only statements in the roster that carry no admin signature. Recovery restores who may administer. It does not decrypt anything: see what a
   lost last station means for secrets, below. What a network created without a token does in these two
   cases is open (**decision 2**).
 
@@ -286,7 +287,7 @@ this protocol:
 | station → safehouse | everything the chief may do there: terminals, sessions, files, secrets for a start; configuration only as admin-signed statements |
 | station → station | chat, roster sync, airspace blocks and names |
 | safehouse → station | chat, roster sync, airspace blocks and names, answers on streams the station opened, file offers into quarantine |
-| safehouse → safehouse | airspace blocks and names, and what agents coordinate with through the MCP bridge: chat, locks, file transfers between workspaces of the same project (proposed, **decision 21**: the receiving safehouse must itself establish the session's project and rights; a caller naming a project is not a grant); anything else only under an admin-signed grant naming both |
+| safehouse → safehouse | airspace blocks and names, and what agents coordinate with through the MCP bridge: chat, locks, file transfers between workspaces of the same project (live messages between two sessions under an explicit admin-signed grant are decided, **decision 21**; the rest is proposed: the receiving safehouse must itself establish the session's project and rights, and a caller naming a project is not a grant); anything else only under an admin-signed grant naming both |
 | member → tower | relay; on the tower's own endpoint: roster feed, block storage, leases |
 | tower → tower | with towers in the signed set only: routing (which node ids each holds), forwarding relayed traffic, replication of the roster, blocks, names and leases |
 
