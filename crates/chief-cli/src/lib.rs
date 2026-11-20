@@ -257,12 +257,12 @@ pub enum Command {
     Id,
     /// Show the bootstrap domain, each tower's state and source, then each peer station's link
     ///
-    /// The first line is "domain <domain>" when the station knows the DNS domain it finds its
-    /// towers through. Then one line per tower: "tower <url> <state>", the source in parentheses
+    /// The first line is `domain <domain>` when the station knows the DNS domain it finds its
+    /// towers through. Then one line per tower: `tower <url> <state>`, the source in parentheses
     /// when the station reports it (configured, remembered, srv or peer), and, after a colon, the
     /// error of a failing tower, or "this station is not on this tower's list" for a denied one,
-    /// with the tower's reason in parentheses. Then one line per peer station: "peer <name>
-    /// <station-id> <link>".
+    /// with the tower's reason in parentheses. Then one line per peer station:
+    /// `peer <name> <station-id> <link>`.
     Status,
     /// Manage the peer book
     Peer {

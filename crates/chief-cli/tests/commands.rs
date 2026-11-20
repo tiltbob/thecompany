@@ -705,11 +705,11 @@ fn status_help_describes_its_lines() {
     let help = cli(&["status", "--help"]).unwrap_err().to_string();
     for text in [
         "Show the bootstrap domain, each tower's state and source, then each peer station's link",
-        "\"domain <domain>\"",
-        "\"tower <url> <state>\"",
+        "domain <domain>",
+        "tower <url> <state>",
         "(configured, remembered, srv or peer)",
         "\"this station is not on this tower's list\"",
-        "\"peer <name>",
+        "peer <name> <station-id> <link>",
     ] {
         assert!(help.contains(text), "{text:?} not in {help}");
     }
