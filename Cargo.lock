@@ -2107,7 +2107,16 @@ dependencies = [
 name = "numbers-station-daemon"
 version = "0.0.0"
 dependencies = [
+ "chief",
+ "clap",
  "numbers-station",
+ "numbers-tower",
+ "rustls",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
