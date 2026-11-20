@@ -39,8 +39,9 @@ const fn all_ipv4(port: u16) -> SocketAddr {
 /// Build it with [`TlsTower::new`] and pass it to [`TowerConfig::tls`](crate::TowerConfig::tls).
 /// The struct is `#[non_exhaustive]`; adjust it with the builder-style setters.
 ///
-/// Its `Debug` output shows the bind addresses and the reload interval, never the host name or
-/// the file paths, which often contain it.
+/// Its `Debug` output never shows the host name or the file paths, which often contain it. It
+/// shows the bind addresses and the reload interval; for a tower reached by an IP literal, a
+/// bind address can be that same address.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TlsTower {
@@ -50,7 +51,9 @@ pub struct TlsTower {
     /// labels separated by single dots, each label 1 to 63 ASCII letters, digits or hyphens,
     /// neither starting nor ending with a hyphen. An IP literal is IPv4 or IPv6, the latter
     /// with or without brackets. The name goes into [`Tower::url`](crate::Tower::url) in lower
-    /// case, or written canonically, and should match a name in the certificate.
+    /// case; an IP literal is written the way the URL parser writes it (an IPv4-mapped IPv6
+    /// address `::ffff:1.2.3.4` becomes `[::ffff:102:304]`), as the station's canonical tower
+    /// URL writes it. The name should match a name in the certificate.
     pub hostname: String,
     /// Where the relay listens for HTTPS. Port zero lets the operating system choose a port.
     pub https_bind: SocketAddr,
@@ -61,20 +64,31 @@ pub struct TlsTower {
     pub qad_bind: Option<SocketAddr>,
     /// The certificate chain, a PEM file that starts with the tower's own certificate.
     ///
-    /// The tower reads it at spawn and at every reload. It must hold at least one certificate,
-    /// every certificate in it must parse as X.509, and the first must belong to the private
-    /// key. Trust, expiry and names are not checked. The file may be at most 64 KiB.
+    /// The tower reads it at spawn and at every reload. It must be a regular file (a symbolic
+    /// link to one is followed) of at most 64 KiB. It must hold at least one certificate; every
+    /// certificate in it must be an X.509 version 3 certificate that webpki can parse, which
+    /// excludes version 1 certificates and unknown critical extensions; and the first must
+    /// belong to the private key. Chains from the public CAs are all of that kind; a private CA
+    /// whose root is a version 1 certificate must leave that root out of the file. Trust, expiry
+    /// and names are not checked. The file may also hold the private key: one combined file can
+    /// serve as both paths.
     pub cert_path: PathBuf,
     /// The private key of the certificate, a PEM file with exactly one unencrypted key (PKCS#8,
     /// PKCS#1 or SEC1; RSA, ECDSA P-256 or P-384, or Ed25519).
     ///
-    /// The tower reads it at spawn and at every reload, into one fixed buffer that is zeroed
-    /// afterwards, and hands it to rustls, which keeps it only inside its signing key. The
-    /// tower never logs it, never puts any byte of it into an error, and keeps no other live
-    /// copy. Freed memory may still hold copies made by two dependencies, which the tower cannot
-    /// zero: the PEM decoder's scratch buffers (rustls-pki-types), and, for a SEC1 key, the
-    /// PKCS#8 wrapping rustls's ring provider builds before ring loads it. The file may be at
-    /// most 64 KiB.
+    /// The tower reads it at spawn and at every reload. It must be a regular file (a symbolic
+    /// link to one is followed) of at most 64 KiB, and may be the certificate file itself.
+    ///
+    /// What the tower does with the key: it reads the file into one buffer of fixed size, zeroed
+    /// when dropped; it decodes every PEM section into a buffer zeroed when dropped; it hands
+    /// the key's encoding to rustls, which zeroes it after loading. It never logs the key, never
+    /// puts any byte of it into an error, and keeps no other copy of its own. What it cannot
+    /// zero: the PEM decoder's scratch buffers (rustls-pki-types); the PKCS#8 wrapping rustls's
+    /// ring provider builds for a SEC1 key, two vectors per curve tried (four for P-384); and
+    /// ring's key pair itself, which ring frees without zeroing whenever a pair is dropped (the
+    /// pair a reload replaces, a pair that fails the match, and the pair in use when the tower
+    /// stops). The tower limits how long the encoded key stays in memory it controls; it does
+    /// not and cannot keep key material out of freed memory.
     pub key_path: PathBuf,
     /// How often the tower reads both files again.
     ///
@@ -178,27 +192,57 @@ pub(crate) fn tower_url(hostname: &str, port: u16) -> Result<String, TowerError>
     } else {
         format!("https://{host}:{port}/")
     };
-    // A second guard: the URL parser must read back exactly what we wrote. It refuses, for
-    // example, a numeric name that WHATWG URL parsing would turn into an IPv4 address.
     let url: RelayUrl = text.parse().map_err(|_| TowerError::InvalidHostname)?;
+    if let Some(address) = ip_literal(&host) {
+        // An IP literal is written the URL parser's way (it spells some IPv6 addresses
+        // differently from std, `::ffff:1.2.3.4` as `::ffff:102:304`): accept the parsed URL
+        // when its host is the same address, and use its text.
+        let parsed = url.host_str().and_then(ip_literal);
+        if parsed != Some(address) || url.port_or_known_default() != Some(port) {
+            return Err(TowerError::InvalidHostname);
+        }
+        return Ok(url.as_str().to_owned());
+    }
+    // A DNS name: the URL parser must read back exactly what we wrote. It refuses, for
+    // example, a numeric name that WHATWG URL parsing would turn into an IPv4 address.
     if url.host_str() != Some(host.as_str()) || url.as_str() != text {
         return Err(TowerError::InvalidHostname);
     }
     Ok(text)
 }
 
+/// The address of an IP literal as `canonical_host` and the URL parser write it: IPv4 bare,
+/// IPv6 in brackets.
+fn ip_literal(host: &str) -> Option<IpAddr> {
+    match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        None => host.parse::<Ipv4Addr>().ok().map(IpAddr::V4),
+    }
+}
+
 /// The relay's certificate configuration and the task that reloads it.
 ///
 /// rustls gets the ring provider explicitly; nothing is installed process-wide. The pair is
 /// loaded and checked here, before anything is bound.
-pub(crate) fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Reloader), TowerError> {
+pub(crate) async fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Reloader), TowerError> {
     let every = tls.reload_interval;
     let first_reload = (!every.is_zero() && every <= MAX_RELOAD_INTERVAL)
         .then(|| tokio::time::Instant::now().checked_add(every))
         .flatten()
         .ok_or(TowerError::InvalidReloadInterval)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let pair = load_pair(&provider, &tls.cert_path, &tls.key_path)
+    // On the blocking pool, so that a slow file system cannot stall the runtime's worker.
+    let (loader, cert_path, key_path) = (
+        Arc::clone(&provider),
+        tls.cert_path.clone(),
+        tls.key_path.clone(),
+    );
+    let pair = tokio::task::spawn_blocking(move || load_pair(&loader, &cert_path, &key_path))
+        .await
+        .map_err(|error| TowerError::Start(Box::new(error)))?
         .map_err(|failure| failure.into_error())?;
     let current = Arc::new(CurrentPair::new(pair));
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -320,6 +364,23 @@ mod tests {
         assert_eq!(
             tower_url("1.example.com", 443).unwrap(),
             "https://1.example.com/"
+        );
+    }
+
+    /// An IPv4-mapped IPv6 address comes out the way the URL parser writes it, in every
+    /// spelling; the station's canonical tower URL writes it the same way.
+    #[test]
+    fn writes_an_ipv4_mapped_address_as_the_url_parser_does() {
+        for spelling in ["::ffff:1.2.3.4", "[::ffff:1.2.3.4]", "::ffff:102:304"] {
+            assert_eq!(
+                tower_url(spelling, 443).unwrap(),
+                "https://[::ffff:102:304]/",
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            tower_url("::ffff:1.2.3.4", 8443).unwrap(),
+            "https://[::ffff:102:304]:8443/"
         );
     }
 

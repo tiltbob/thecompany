@@ -347,7 +347,7 @@ fn assert_no_key_material(texts: &[String], cert: &Cert) {
 
 /// Expects a certificate file error with `problem`, no source, and no path in its text.
 fn expect_certificate_problem(error: &TowerError, path: &Path, problem: TlsFileProblem) {
-    let TowerError::CertificateFile { problem: found } = error else {
+    let TowerError::CertificateFile { problem: found, .. } = error else {
         panic!("expected a certificate file error, got: {error}");
     };
     assert!(*found == problem, "{error}");
@@ -361,7 +361,7 @@ fn expect_certificate_problem(error: &TowerError, path: &Path, problem: TlsFileP
 
 /// Expects a key file error with `problem`, no source, and no path in its text.
 fn expect_key_problem(error: &TowerError, path: &Path, problem: TlsFileProblem) {
-    let TowerError::KeyFile { problem: found } = error else {
+    let TowerError::KeyFile { problem: found, .. } = error else {
         panic!("expected a key file error, got: {error}");
     };
     assert!(*found == problem, "{error}");
@@ -592,6 +592,9 @@ async fn https_answers_a_client_that_trusts_the_certificate_and_fails_one_that_d
         let addr = https_addr(&url);
 
         let healthz = https(addr, &[&cert.der], "/healthz").await;
+        // Hard rule 6: serving HTTPS installed no process-wide crypto provider. Nothing in this
+        // test binary installs one; every rustls configuration gets its provider explicitly.
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
         assert_eq!(healthz.as_deref(), Ok("HTTP/1.1 200 OK"));
         let ping = https(addr, &[&cert.der], "/ping").await;
         assert_eq!(ping.as_deref(), Ok("HTTP/1.1 200 OK"));
@@ -718,11 +721,15 @@ async fn a_two_certificate_chain_is_accepted_and_served() {
 
 /// A reload interval that the clock cannot schedule fails spawn before anything is bound.
 #[tokio::test]
-async fn an_unschedulable_reload_interval_fails_spawn_before_binding() {
+async fn a_zero_or_unschedulable_reload_interval_fails_spawn_before_binding() {
     bounded(async {
         let cert = cert();
         let year = MAX_RELOAD_INTERVAL;
-        for every in [Duration::MAX, year + Duration::from_nanos(1)] {
+        for every in [
+            Duration::ZERO,
+            Duration::MAX,
+            year + Duration::from_nanos(1),
+        ] {
             let (http, https) = (free_tcp_port(), free_tcp_port());
             let tls = TlsTower::new("127.0.0.1", &cert.cert, &cert.key)
                 .https_bind((Ipv4Addr::LOCALHOST, https).into())
@@ -742,6 +749,76 @@ async fn an_unschedulable_reload_interval_fails_spawn_before_binding() {
         let tls = tls_tower(&cert.cert, &cert.key).reload_interval(year);
         let (tower, _url) = spawn(config(tls)).await;
         assert!(tower.shutdown().await.is_ok());
+    })
+    .await;
+}
+
+/// A path that names a directory or a device is refused before it is opened, as the
+/// certificate file and as the key file, and nothing is bound.
+#[tokio::test]
+async fn a_path_that_is_not_a_regular_file_fails_spawn_before_binding() {
+    bounded(async {
+        let cert = cert();
+        let directory = cert.dir.path().to_owned();
+        let mut paths = vec![directory];
+        if cfg!(unix) {
+            paths.push(PathBuf::from("/dev/null"));
+        }
+        for path in &paths {
+            let error = spawn_fails(path, &cert.key).await;
+            expect_certificate_problem(&error, path, TlsFileProblem::NotAFile);
+            let error = spawn_fails(&cert.cert, path).await;
+            expect_key_problem(&error, path, TlsFileProblem::NotAFile);
+        }
+    })
+    .await;
+}
+
+/// A symbolic link to a good file is followed, as a certbot `live/` directory needs.
+#[cfg(unix)]
+#[tokio::test]
+async fn symbolic_links_to_good_files_are_followed() {
+    bounded(async {
+        let cert = cert();
+        let (cert_link, key_link) = (
+            cert.dir.path().join("live-cert.pem"),
+            cert.dir.path().join("live-key.pem"),
+        );
+        std::os::unix::fs::symlink(&cert.cert, &cert_link).unwrap();
+        std::os::unix::fs::symlink(&cert.key, &key_link).unwrap();
+        let (tower, url) = spawn(config(tls_tower(&cert_link, &key_link))).await;
+        assert_eq!(
+            https(https_addr(&url), &[&cert.der], "/healthz")
+                .await
+                .as_deref(),
+            Ok("HTTP/1.1 200 OK")
+        );
+        assert!(tower.shutdown().await.is_ok());
+    })
+    .await;
+}
+
+/// One file holding the chain and the key serves as both, and the swapped-path cases still
+/// give what they gave.
+#[tokio::test]
+async fn a_combined_file_serves_as_certificate_and_key() {
+    bounded(async {
+        let cert = cert();
+        let combined = cert.dir.path().join("combined.pem");
+        std::fs::write(&combined, format!("{}{}", cert.cert_pem, cert.key_pem)).unwrap();
+        let (tower, url) = spawn(config(tls_tower(&combined, &combined))).await;
+        assert_eq!(
+            https(https_addr(&url), &[&cert.der], "/healthz")
+                .await
+                .as_deref(),
+            Ok("HTTP/1.1 200 OK")
+        );
+        assert!(tower.shutdown().await.is_ok());
+
+        let error = spawn_fails(&cert.key, &cert.key).await;
+        expect_certificate_problem(&error, &cert.key, TlsFileProblem::NoCertificate);
+        let error = spawn_fails(&cert.cert, &cert.cert).await;
+        expect_key_problem(&error, &cert.cert, TlsFileProblem::NoPrivateKey);
     })
     .await;
 }

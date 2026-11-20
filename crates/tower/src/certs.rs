@@ -1,23 +1,45 @@
 //! The TLS tower's certificate and private key: loaded, checked, served and reloaded by the tower.
 //!
-//! The tower reads both PEM files itself, at spawn and then at every reload interval. The bytes
-//! of the key file live in a buffer that is zeroed when it is dropped; the decoded key goes to
-//! rustls (with the ring provider), which zeroes its copy of the encoding and afterwards holds
-//! the key only inside its signing key. Each file is read into one buffer of fixed size,
-//! allocated before the read and never grown, so reading leaves no copy behind.
-//!
-//! Two dependencies make copies the tower cannot zero. The PEM decoder (rustls-pki-types) keeps
-//! scratch buffers of its own while it decodes, including the base64 text of the key, and frees
-//! them without zeroing them. And when rustls's ring provider loads a SEC1 (`EC PRIVATE KEY`)
-//! key, it wraps the key in a PKCS#8 structure first, in two ordinary vectors that are freed
-//! without zeroing; for a PKCS#1 or PKCS#8 key it passes the bytes to ring without a copy of its
-//! own. So this is no promise that no copy of the key ever remains in freed memory; it is a
-//! promise about the memory the tower itself keeps.
+//! The tower reads both PEM files itself, at spawn and then at every reload interval, on
+//! tokio's blocking pool. A path must name a regular file (symbolic links are followed); a
+//! directory, a device or a FIFO is refused before it is opened, because opening or reading one
+//! can block. A regular file on a mount that stops answering still blocks the read: at spawn,
+//! `Tower::spawn` then does not return; at reload, reloading stops until the read returns.
 //!
 //! A pair is checked before it is used: the chain holds a certificate, every certificate in it
-//! parses as X.509, the key is of a kind ring can sign with, and the key belongs to the first
-//! certificate. There is no check of trust, expiry or names; clients do that. A reload
-//! publishes a new pair only if it passes the same checks; otherwise the pair in use stays.
+//! is an X.509 version 3 certificate that webpki can parse, the key is of a kind ring can sign
+//! with, and the key belongs to the first certificate. webpki's parse is strict: it refuses a
+//! version 1 certificate, issuer or subject unique ids, and an unknown critical extension, for
+//! every member of the chain. Chains from the public CAs are all of the accepted kind; a private
+//! CA whose root is a version 1 certificate must leave that root out of the file. There is no
+//! check of trust, expiry or names; clients do that. A reload publishes a new pair only if it
+//! passes the same checks; otherwise the pair in use stays.
+//!
+//! # Key material in memory
+//!
+//! What the tower itself does: it reads each file into one buffer of fixed size, allocated
+//! before the read, never grown and zeroed when dropped. It decodes the PEM sections one by one
+//! and wraps every decoded section in a buffer that is zeroed when dropped, keeping only
+//! certificates (from the certificate file) and the one private key (from the key file); so a
+//! private key in the certificate file, as in a combined file, is decoded and zeroed too. The
+//! key's encoding goes to rustls, which zeroes it after loading. The tower keeps no other copy
+//! of its own.
+//!
+//! What it cannot zero, because the copies are made and freed inside its dependencies:
+//!
+//! - The PEM decoder (rustls-pki-types) keeps scratch buffers of its own while it decodes,
+//!   including the base64 text of every section, and frees them without zeroing them.
+//! - rustls's ring provider wraps a SEC1 (`EC PRIVATE KEY`) key in a PKCS#8 structure before
+//!   ring loads it: two ordinary vectors per curve it tries, freed without zeroing. It tries
+//!   P-256 first, so a P-384 key is wrapped twice: four such vectors. A PKCS#1 or PKCS#8 key is
+//!   passed to ring without a copy of rustls's own.
+//! - ring (0.17) does not zero its key pairs (`RsaKeyPair`, `EcdsaKeyPair`, `Ed25519KeyPair`
+//!   have no zeroing `Drop`). Every key pair the tower drops leaves its key in freed memory: the
+//!   pair a reload replaces, at every interval, also when the files did not change; a pair that
+//!   fails the match with the certificate; and the pair in use when the tower stops.
+//!
+//! So the tower limits how long the encoded key stays in memory that it controls. It does not,
+//! and cannot, keep key material out of freed memory.
 //!
 //! No error and no log line carries any byte of either file: every failure is one of the fixed
 //! categories of [`TlsFileProblem`], and upstream errors are dropped, never formatted.
@@ -30,7 +52,7 @@ use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -60,6 +82,10 @@ pub enum TlsFileProblem {
     /// The file cannot be opened or read; the kind of I/O error says why.
     #[error("it cannot be read ({0})")]
     Unreadable(std::io::ErrorKind),
+    /// The path names something that is not a regular file, such as a directory, a device or a
+    /// FIFO. The tower refuses it before opening it: opening or reading such a path can block.
+    #[error("it is not a regular file")]
+    NotAFile,
     /// The file is larger than a certificate chain or key can reasonably be (64 KiB).
     #[error("it is larger than 64 KiB")]
     TooLarge,
@@ -69,7 +95,12 @@ pub enum TlsFileProblem {
     /// The certificate file holds no `CERTIFICATE` section.
     #[error("it holds no certificate")]
     NoCertificate,
-    /// A certificate in the chain is not a parsable X.509 certificate; which one is not said.
+    /// A certificate in the chain is not an X.509 version 3 certificate that webpki can parse;
+    /// which one is not said.
+    ///
+    /// webpki's parse is strict: it refuses a version 1 certificate, issuer or subject unique
+    /// ids, and an unknown critical extension. A private CA whose root is a version 1
+    /// certificate must leave that root out of the file.
     #[error("a certificate in it cannot be parsed")]
     UnparsableCertificate,
     /// The key file holds no unencrypted private key section (PKCS#8, PKCS#1 or SEC1).
@@ -131,8 +162,15 @@ impl Failure {
 /// is never reallocated and no unzeroed copy is left behind, whatever happens to the file while
 /// it is read; on return it is only shortened, which does not reallocate either. A file that
 /// fills the last byte is larger than the cap.
+///
+/// Before opening, the path must name a regular file. `std::fs::metadata` follows symbolic
+/// links and does not block on a FIFO; anything but a regular file is refused, since opening a
+/// FIFO without a writer, or reading a terminal or a device, can block.
 fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, TlsFileProblem> {
     let unreadable = |error: std::io::Error| TlsFileProblem::Unreadable(error.kind());
+    if !std::fs::metadata(path).map_err(unreadable)?.is_file() {
+        return Err(TlsFileProblem::NotAFile);
+    }
     let mut file = File::open(path).map_err(unreadable)?;
     let mut bytes = Zeroizing::new(vec![0; MAX_FILE_SIZE + 1]);
     let mut filled = 0;
@@ -151,12 +189,29 @@ fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, TlsFileProblem> {
     Ok(bytes)
 }
 
-/// The certificate chain in a PEM file, in file order.
+/// Every PEM section of a file, in file order, each decoded into a buffer that is zeroed when
+/// dropped, so that a section the caller does not keep (a private key in the certificate file,
+/// for example) leaves no decoded copy. A malformed section is an error; the PEM error can quote
+/// a line of the file, so it is dropped unread.
+fn sections(
+    pem: &[u8],
+) -> impl Iterator<Item = Result<(SectionKind, Zeroizing<Vec<u8>>), TlsFileProblem>> + '_ {
+    <(SectionKind, Vec<u8>)>::pem_slice_iter(pem).map(|section| {
+        section
+            .map(|(kind, der)| (kind, Zeroizing::new(der)))
+            .map_err(|_| TlsFileProblem::MalformedPem)
+    })
+}
+
+/// The certificate chain in a PEM file, in file order. Other sections are skipped.
 fn certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsFileProblem> {
     let mut chain = Vec::new();
-    for certificate in CertificateDer::pem_slice_iter(pem) {
-        // The PEM error can quote a line of the file, so it is dropped unread.
-        chain.push(certificate.map_err(|_| TlsFileProblem::MalformedPem)?);
+    for section in sections(pem) {
+        let (kind, mut der) = section?;
+        if kind == SectionKind::Certificate {
+            // A certificate is public; the buffer moves out and its empty shell is zeroed.
+            chain.push(CertificateDer::from(std::mem::take(&mut *der)));
+        }
     }
     if chain.is_empty() {
         return Err(TlsFileProblem::NoCertificate);
@@ -164,11 +219,24 @@ fn certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsFileProbl
     Ok(chain)
 }
 
-/// The one private key in a PEM file, in a buffer that is zeroed when dropped.
+/// The one private key in a PEM file (PKCS#1, SEC1 or PKCS#8), in a buffer that is zeroed when
+/// dropped. Other sections, an encrypted PKCS#8 key among them, are skipped.
 fn private_key(pem: &[u8]) -> Result<Zeroizing<PrivateKeyDer<'static>>, TlsFileProblem> {
     let mut found = None;
-    for key in PrivateKeyDer::pem_slice_iter(pem) {
-        let key = Zeroizing::new(key.map_err(|_| TlsFileProblem::MalformedPem)?);
+    for section in sections(pem) {
+        let (kind, mut der) = section?;
+        if !matches!(
+            kind,
+            SectionKind::RsaPrivateKey | SectionKind::EcPrivateKey | SectionKind::PrivateKey
+        ) {
+            continue;
+        }
+        // The buffer moves into the key, which is zeroed when dropped; `from_pem` gives a key
+        // for each of these three kinds.
+        let Some(key) = PrivateKeyDer::from_pem(kind, std::mem::take(&mut *der)) else {
+            continue;
+        };
+        let key = Zeroizing::new(key);
         if found.is_some() {
             return Err(TlsFileProblem::SeveralPrivateKeys);
         }

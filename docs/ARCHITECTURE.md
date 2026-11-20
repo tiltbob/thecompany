@@ -541,9 +541,11 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
   DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
   requires a literal loopback address.
-- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself and checks the
-  pair before it serves it: the chain holds a certificate, every one parses, the key file holds
-  exactly one key that ring can use, and the key belongs to the certificate. It hands the pair to
+- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files itself (regular files
+  only; a directory, device or FIFO could block) and checks the pair before it serves it: the
+  chain holds a certificate, every one is an X.509 version 3 certificate that webpki parses (no
+  version 1 root), the key file holds exactly one key that ring can use, and the key belongs to
+  the certificate. It hands the pair to
   rustls through its own certificate resolver, in
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
   explicitly and no process-wide default was installed or needed. It reads both files again once a
