@@ -44,11 +44,9 @@ async fn bind(config: EndpointConfig, authorizer: &Arc<Authorizer>) -> Endpoint 
 }
 
 async fn start_tower() -> (Tower, EndpointConfig) {
-    let tower = Tower::spawn(TowerConfig {
-        bind: (Ipv4Addr::LOCALHOST, 0).into(),
-    })
-    .await
-    .unwrap_or_else(|_| panic!("start loopback tower"));
+    let tower = Tower::spawn(TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into()))
+        .await
+        .unwrap_or_else(|_| panic!("start loopback tower"));
     let config = EndpointConfig {
         towers: TowerSet::from_url(tower.url()).unwrap_or_else(|_| panic!("parse tower URL")),
         ip_transport: IpTransport::RelayOnly,
