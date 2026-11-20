@@ -330,6 +330,9 @@ name = "chief"
 version = "0.0.0"
 dependencies = [
  "numbers-base",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
