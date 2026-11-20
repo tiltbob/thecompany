@@ -543,7 +543,15 @@ async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
             );
             assert_eq!(before[0].url, installed);
 
-            for (after, limit) in [(None, 32), (Some("not a peer name"), 1), (None, 0)] {
+            let long_boundary = "z".repeat(4096);
+            for (after, limit) in [
+                (None, 32),
+                (Some("not a peer name"), 1),
+                (None, 0),
+                (Some(""), 0),
+                (None, u32::MAX),
+                (Some(long_boundary.as_str()), 0),
+            ] {
                 let page = checked(
                     client.tower_candidates(after, limit).await,
                     "read the M1 tower candidate page",
@@ -560,7 +568,14 @@ async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
             };
             assert_eq!(client.tower_add(malformed).await, Err(invalid.clone()));
             assert_eq!(client.tower_remove(malformed).await, Err(invalid));
-            for url in [installed.as_str(), "https://tower.synthetic.invalid/"] {
+            // Valid URLs that are not in canonical form are refused as pinned too, not as invalid.
+            let unslashed = installed.trim_end_matches('/').to_owned();
+            for url in [
+                installed.as_str(),
+                "https://tower.synthetic.invalid/",
+                "HTTPS://Tower.SYNTHETIC.INVALID.:443",
+                unslashed.as_str(),
+            ] {
                 assert_eq!(client.tower_add(url).await, Err(ApiError::TowersPinned));
                 assert_eq!(client.tower_remove(url).await, Err(ApiError::TowersPinned));
             }
