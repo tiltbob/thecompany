@@ -217,37 +217,51 @@ unknown fields tolerated); bulk data is raw stream bytes. One link instead of on
 keeps authorization in one place and hides from the tower which feature is in use.
 
 In M1, the `numbers/0` dialer opens a bidirectional stream and each end sends a hello with
-`v: 1`, `network: ""` and `head: ""`. The `generation` stays the same for each running link
-instance, while the `challenge` is fresh for each hello. Both are nonzero arrays of 16 random
-bytes. The server includes the client's challenge as `echo` in its hello. The client verifies
-that echo, then returns the server's challenge in an `{"echo":[…]}` frame. The server checks
-the echo before admitting its connection.
+`v: 1`, `network: ""` and `head: ""`. Both reserved fields must be empty strings. The initial
+client hello omits `echo`, and receivers also accept `null` as absent. The `generation` stays
+the same for each running link instance, while the `challenge` is fresh for each hello. Both
+are nonzero arrays of 16 random bytes. The server includes the client's challenge as `echo`
+in its hello. The client verifies that echo, then returns the server's challenge in an
+`{"echo":[…]}` frame. The server checks the echo before admitting its connection.
 
 A new authenticated generation can replace a connection left open by a crash. A hello for a
 different generation is admitted only if the remembered generation has stayed the same since
 before the fresh challenge. When concurrent hellos present different generations, the first
 admission that changes the remembered generation takes precedence. A later handshake can start
-from the updated value. For the same generation, the lower node ID's dial wins crossed dials and
-a fresh connection replaces one from the same initiator. Either end can then open a bidirectional
-chat stream with the header `{"proto":"chat","v":1}`, followed by one message. Each JSON frame
-has a four-byte big-endian length and a payload limit of 64 KiB.
+from the updated value. For the same generation, crossed dials keep the connection initiated by
+the lower node ID in lexicographic order of the 32 public key bytes. A fresh connection replaces
+one from the same initiator. There is at most one pending incoming hello per peer. A second incoming
+connection while that hello is pending is refused immediately with code `0`. A sender whose
+outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
+
+Link application close codes are `400` for a bad hello, `403` for authorization refusal, `409`
+for replacement, and `0` for ordinary closure. Either end of an admitted link can open a
+bidirectional chat stream with the header `{"proto":"chat","v":1}`, followed by one message.
+Each JSON frame has a four-byte big-endian length and a payload limit of 64 KiB.
 
 A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
 letters, digits, underscores or hyphens and reports its own time in Unix milliseconds. The
 receiver treats both as peer input. The body is padded standard base64 on the wire and decodes
 to at most 16 KiB of UTF-8. The receiver replies with `{"type":"ack"}` or a
-`{"type":"nack","reason":"…"}` containing a fixed reason code. The receiving actor acknowledges
-the message after deciding whether it is a new message or a retry.
+`{"type":"nack","reason":"…"}` containing one of `unknown_protocol`, `unsupported_version`,
+`invalid_id`, `body_too_large`, `invalid_body` or `unavailable`. The sender reports `BadReply`
+for an unknown NACK reason. The receiving actor acknowledges the message after deciding whether it
+is a new message or a retry.
 
 `connect_timeout` bounds each dial and hello together. `send_deadline` bounds the send, including
 any shared dials, retries and waits for a reply. On the first attempt over an already established
 connection, the sender checks for transport progress a full `connect_timeout` after queuing the
 request, if the send budget allows. If the connection is still current and has received no
-authenticated QUIC frames since before the request was written, the sender closes it. The sender
-can retry once after an ordinary connection closure and once after observing a replacement. Each
-retry uses the same message ID and the original deadline. An `unavailable` reply to a retry leaves
-delivery uncertain because an earlier attempt can still be accepted. The receiver also applies a
-deadline to each incoming chat stream.
+authenticated QUIC frames since before the request was written, the sender closes it. If a chat
+stream disconnects before its connection reports a close reason, the sender waits for that
+connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
+before the original send deadline. The sender can retry once after an ordinary connection closure
+and once after observing a replacement. Each retry uses the same message ID and the original
+deadline. An `unavailable` reply to a retry leaves delivery uncertain because an earlier attempt
+can still be accepted. The receiver handles up to 16 concurrent incoming streams per link and
+applies `send_deadline` to each stream, including waiting for the actor's reply. It refuses
+unauthorized chat on an established link by resetting the stream with code `403`. A full or
+closed chat mailbox returns `unavailable`.
 
 ### Stations and the chief's frontends
 
@@ -268,10 +282,10 @@ The station is the node; frontends hold no network state.
 - **The admin key stays in the frontend.** The frontend builds the statement itself from the user's
   command and shows what will be signed; it never signs bytes or a description the station supplied.
   The key file never crosses the socket.
-- **A station takes input from peers, never orders.** It strips control characters from every
-  peer-supplied string before a frontend sees it, never opens a URL or file on a peer's say-so,
-  accepts files only as answers to its own pulls or as quarantined offers, and offers no reverse
-  forwards.
+- **A station takes input from peers, never orders.** It replaces control characters, line
+  separators and bidi controls (API rule 9) in every peer-supplied string before a frontend sees
+  it, never opens a URL or file on a peer's say-so, accepts files only as answers to its own pulls
+  or as quarantined offers, and offers no reverse forwards.
 - **iOS.** There are no daemons, so the app embeds the station core and is a foreground-only station
   that stops before the app is suspended. Messages for a phone wait in airspace.
 

@@ -2,6 +2,9 @@
 
 mod streams;
 
+#[cfg(test)]
+mod close_wait_tests;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::pin;
@@ -229,6 +232,7 @@ impl LinkHandle {
         message: &ChatMessage,
     ) -> Result<ChatReply, SendError> {
         let start = Instant::now();
+        let config = self.shared.config;
         let mut first_attempt = true;
         let mut stale_retry_available = true;
         let mut replacement_retry_available = true;
@@ -239,7 +243,7 @@ impl LinkHandle {
                 peer,
                 connection,
                 message,
-                self.shared.config,
+                config,
                 start,
                 first_attempt && lease.admitted_at < start,
             )
@@ -252,6 +256,16 @@ impl LinkHandle {
                 Ok(reply) => return Ok(reply),
                 Err(error) => error,
             };
+            if error == SendError::Disconnected && connection.close_reason().is_none() {
+                // A stream can end before this connection's close becomes visible.
+                let remaining = config.send_deadline.saturating_sub(start.elapsed());
+                wait_for_close(
+                    peer,
+                    connection.closed(),
+                    config.connect_timeout.min(remaining),
+                )
+                .await?;
+            }
             let state = peer.state();
             if state.revoked {
                 return Err(SendError::Closed);
@@ -606,6 +620,17 @@ struct EstablishedConnection {
     admitted_at: Instant,
     // Read and written under the peer lock, including after removal from the active slot.
     replaced_locally: AtomicBool,
+}
+
+async fn wait_for_close(
+    peer: &Peer,
+    closed: impl Future<Output = ConnectionError>,
+    budget: Duration,
+) -> Result<(), SendError> {
+    tokio::select! {
+        _ = peer.revoked() => Err(SendError::Closed),
+        _ = timeout(budget, closed) => Ok(()),
+    }
 }
 
 async fn send_chat(
@@ -1092,5 +1117,74 @@ mod tests {
         })
         .await
         .expect("reject a delayed generation before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn full_chat_mailbox_replies_unavailable() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let local = loopback_endpoint().await;
+            let remote = loopback_endpoint().await;
+            let remote_id = remote.iroh().id();
+            local
+                .authorizer()
+                .replace_peers([(remote_id, "peer".into())]);
+            remote
+                .authorizer()
+                .replace_peers([(local.iroh().id(), "peer".into())]);
+            let (shared, inbox) = Shared::new(
+                &local,
+                LinkConfig {
+                    connect_timeout: budget,
+                    send_deadline: budget,
+                },
+            );
+            let peer = shared.peer(remote_id).unwrap();
+            let (client, server) = connect(&remote, &local).await;
+            assert!(
+                shared.admit(&peer, &mut peer.state(), &server, None, [1; 16]) == DialResult::Ready
+            );
+
+            let chat = ChatMessage {
+                id: "probe".into(),
+                sent_at_ms: 0,
+                body: "chat".into(),
+            };
+            {
+                let mailbox = lock(&shared.incoming);
+                let incoming = mailbox.as_ref().expect("chat mailbox is open");
+                for _ in 0..inbox.max_capacity() {
+                    let (reply, _) = oneshot::channel();
+                    assert!(
+                        incoming
+                            .try_send(IncomingChat {
+                                station_id: remote_id,
+                                peer: "peer".into(),
+                                message: chat.clone(),
+                                reply,
+                            })
+                            .is_ok()
+                    );
+                }
+            }
+
+            let (reply, ()) = tokio::join!(
+                async {
+                    let (send, mut recv) = client.open_bi().await.unwrap();
+                    write_chat_request(send, &chat).await.unwrap();
+                    read_chat_reply(&mut recv, budget).await
+                },
+                async {
+                    let (send, recv) = server.accept_bi().await.unwrap();
+                    receive_chat(&shared, &peer, &server, send, recv).await;
+                }
+            );
+            assert_eq!(reply, Ok(ChatReply::Nack(NackReason::Unavailable)));
+            assert_eq!(inbox.len(), inbox.max_capacity());
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("reply before the test deadline with a full mailbox");
     }
 }

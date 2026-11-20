@@ -10,7 +10,8 @@ use std::time::Duration;
 use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
-    ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, Side,
+    ConnectError, ConnectingError, Connection, ConnectionError, ReadError, RecvStream, SendStream,
+    Side,
 };
 use numbers::link::{IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, SendError};
 use numbers::proto::chat::{CHAT_BODY_MAX, ChatMessage, ChatReply, NackReason, ReceiptWindow};
@@ -696,7 +697,24 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
             let (mut send, _recv) = checked(malformed.open_bi().await, "open malformed hello");
             write(&mut send, &json!({"v":"invalid","network":"","head":""})).await;
             checked(send.finish(), "finish malformed hello");
-            wait_for_close(&malformed).await;
+            expect_close(&malformed, 400).await;
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+
+            let premature_echo = dial(&peer, &address).await;
+            let (mut send, mut recv) =
+                checked(premature_echo.open_bi().await, "open initial hello");
+            let mut initial = Hello::local(RAW_GENERATION, [2; 16]);
+            initial.echo = Some([3; 16]);
+            write(&mut send, &initial).await;
+            let response = checked(
+                timeout(PROBE_TIMEOUT, recv.read(&mut [0])).await,
+                "reject the first hello before replying",
+            );
+            assert!(matches!(
+                response,
+                Ok(None) | Err(ReadError::ConnectionLost(_))
+            ));
+            expect_close(&premature_echo, 400).await;
             assert_eq!(handle.path(peer_id), LinkPath::Down);
 
             let wrong_echo = dial(&peer, &address).await;
@@ -706,7 +724,7 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
             echo[0] ^= 1;
             write(&mut send, &HelloEcho { echo }).await;
             checked(send.finish(), "finish wrong hello echo");
-            wait_for_close(&wrong_echo).await;
+            expect_close(&wrong_echo, 400).await;
             assert_eq!(handle.path(peer_id), LinkPath::Down);
 
             let conn = dial(&peer, &address).await;
@@ -772,11 +790,19 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
 
             let valid = message("valid", "same connection");
             let chat_header = StreamHeader::chat();
+            let (mut stalled_send, mut stalled_recv) =
+                checked(conn.open_bi().await, "open stalled chat");
+            write(&mut stalled_send, &chat_header).await;
             let (reply, ()) = tokio::join!(
                 request(&conn, &chat_header, &valid),
                 acknowledge(&mut inbox, peer_id, "second", &valid),
             );
             assert!(matches!(reply, Ok(ChatReply::Ack)));
+            let stalled_reply = checked(
+                timeout(PROBE_TIMEOUT, stalled_recv.read(&mut [0])).await,
+                "receive reset after the stream deadline",
+            );
+            assert!(matches!(stalled_reply, Err(ReadError::Reset(code)) if code.into_inner() == 0));
 
             // The raw peer has neither a router nor a tower address for a new dial.
             let reverse = message("reverse", "reuse accepted link");
@@ -786,11 +812,60 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
             );
             assert!(matches!(reply, Ok(ChatReply::Ack)));
 
+            // An established connection still checks authorization on each chat stream.
+            auth.replace_peers([]);
+            assert!(matches!(
+                request(&conn, &chat_header, &probe).await,
+                Err(FrameError::Io(error)) if matches!(
+                    error.get_ref().and_then(|source| source.downcast_ref::<ReadError>()),
+                    Some(ReadError::Reset(code)) if code.into_inner() == 403
+                )
+            ));
+            assert!(conn.close_reason().is_none());
+            assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+
             checked(link.shutdown().await, "stop direct link");
             peer.iroh().close().await;
         })
         .await,
         "stream validation test timed out",
+    );
+}
+
+#[tokio::test]
+async fn outgoing_hello_rejects_missing_and_wrong_server_echoes() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            add_address(&endpoint, loopback_address(&peer));
+            peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let handle = link.handle();
+            let chat = message("bad-echo", "hello must complete before chat");
+
+            for missing in [true, false] {
+                let (result, ()) = tokio::join!(handle.send(peer_id, chat.clone()), async {
+                    let (conn, mut held) = accept_hello(&peer).await;
+                    let mut response = held.response(RAW_GENERATION, [1; 16]);
+                    let mut wrong = held.hello.challenge;
+                    wrong[0] ^= 1;
+                    response.echo = (!missing).then_some(wrong);
+                    write(&mut held.send, &response).await;
+                    checked(held.send.finish(), "finish a server hello with a bad echo");
+                    expect_close(&conn, 400).await;
+                });
+                assert_eq!(result, Err(SendError::BadHello));
+                assert_eq!(handle.path(peer_id), LinkPath::Down);
+                assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+            }
+
+            checked(link.shutdown().await, "stop link after hello rejection");
+            peer.iroh().close().await;
+        })
+        .await,
+        "server echo rejection test timed out",
     );
 }
 
@@ -1160,8 +1235,14 @@ async fn crossed_redial(install_before_polling: bool, action: WinnerAction) {
                 begin_hello(&replacement, &Hello::local(RAW_GENERATION, [4; 16])).await;
             finish_hello(&mut hello, &remote).await;
             expect_close(&winner, 409).await;
-            assert!(replacement.close_reason().is_none());
             assert_eq!(send.await, Err(SendError::Disconnected));
+
+            let fresh = message("fresh", "the same-initiator replacement is active");
+            let (reply, ()) = tokio::join!(
+                handle.send(peer_id, fresh.clone()),
+                reply_to_chat(&replacement, &fresh),
+            );
+            assert_eq!(reply, Ok(ChatReply::Ack));
         }
         WinnerAction::Stall => {
             // The send must still expire at one deadline after its first poll.
@@ -1248,6 +1329,83 @@ async fn unavailable_after_retry_reports_uncertain_delivery() {
     );
 }
 
+async fn lose_outgoing_dial(peer: &Endpoint, address: &EndpointAddr, outgoing: &Connection) {
+    // Reading the server hello proves the winning incoming dial is pending locally.
+    let winner = dial(peer, address).await;
+    let (mut hello, _) = begin_hello(&winner, &Hello::local(RAW_GENERATION, [2; 16])).await;
+    outgoing.close(409u32.into(), b"");
+    // The winning peer ends the hello stream before confirming the challenge.
+    checked(hello.finish(), "end the winning hello before confirmation");
+    expect_close(&winner, 400).await;
+}
+
+async fn redial_after_lost_hello(lose_second_dial: bool) {
+    let (lower, higher) = ordered_keys();
+    let (endpoint, auth) = bind_direct_with_key(&higher).await;
+    let (peer, peer_auth) = bind_direct_with_key(&lower).await;
+    let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+    let address = loopback_address(&endpoint);
+    add_address(&endpoint, loopback_address(&peer));
+    peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+    let (link, _inbox) = Link::start(
+        endpoint,
+        LinkConfig {
+            connect_timeout: PROBE_TIMEOUT,
+            send_deadline: PROBE_TIMEOUT * 3,
+        },
+    );
+    let handle = link.handle();
+    let chat = message("redial", "keep the queued chat across a lost dial");
+    let mut send = pin!(handle.send(peer_id, chat.clone()));
+    let (first, first_hello) = while_sending(send.as_mut(), accept_hello(&peer)).await;
+    while_sending(send.as_mut(), lose_outgoing_dial(&peer, &address, &first)).await;
+
+    let (second, mut second_hello) = while_sending(send.as_mut(), accept_hello(&peer)).await;
+    assert!(
+        first_hello.hello.generation == second_hello.hello.generation,
+        "the running link keeps its generation"
+    );
+    assert!(
+        first_hello.hello.challenge != second_hello.hello.challenge,
+        "each outgoing hello uses a fresh challenge"
+    );
+    if lose_second_dial {
+        // Let the test observe the winner's failure before polling the send again.
+        lose_outgoing_dial(&peer, &address, &second).await;
+        tokio::select! {
+            result = send => assert_eq!(result, Err(SendError::Disconnected)),
+            _ = peer.iroh().accept() => panic!("a third dial followed the second loss"),
+        }
+        assert_eq!(handle.path(peer_id), LinkPath::Down);
+    } else {
+        let (reply, ()) = tokio::join!(send, async {
+            second_hello.reply(RAW_GENERATION, [3; 16]).await;
+            second_hello.confirm([3; 16]).await;
+            reply_to_chat(&second, &chat).await;
+        });
+        assert_eq!(reply, Ok(ChatReply::Ack));
+    }
+
+    checked(link.shutdown().await, "stop link after lost dial");
+    peer.iroh().close().await;
+}
+
+#[tokio::test]
+async fn lost_dial_retries_after_the_pending_winner_fails_its_hello() {
+    checked(
+        timeout(CASE_TIMEOUT, redial_after_lost_hello(false)).await,
+        "retry after lost dial timed out",
+    );
+}
+
+#[tokio::test]
+async fn lost_dial_stops_after_a_second_loss() {
+    checked(
+        timeout(CASE_TIMEOUT, redial_after_lost_hello(true)).await,
+        "second dial loss test timed out",
+    );
+}
+
 #[tokio::test]
 async fn duplicate_pending_hello_returns_without_waiting_for_a_winner() {
     checked(
@@ -1283,7 +1441,10 @@ async fn duplicate_pending_hello_returns_without_waiting_for_a_winner() {
                 | Err(ConnectError::Connection { source, .. }) => (first, source),
                 Err(_) => panic!("expected the receiver to refuse a duplicate connection"),
             };
-            assert!(matches!(refusal, ConnectionError::ApplicationClosed(_)));
+            assert!(matches!(
+                refusal,
+                ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 0
+            ));
             assert!(held.close_reason().is_none());
 
             let (caller, _inbox) = Link::start(caller, config());

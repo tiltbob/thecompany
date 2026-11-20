@@ -97,7 +97,7 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/chief/src/paths.rs` | the default data dir and the socket path as pure functions of `XDG_DATA_HOME`, `XDG_RUNTIME_DIR` and `HOME`; the socket-path length check |
 | `crates/chief/src/follow.rs` | `Client::follow_log`: the attach order (subscribe, page the log, drop live events already seen), re-reading after `Resync`, ending with the subscription or the station instance |
 | `crates/chief/src/fake.rs` | `FakeStation` (feature `fake`, tests only): an in-memory station that follows the API rules, for tests of transports, the socket server and frontends |
-| `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; strips control characters from peer text; usable in-process as a `Transport` |
+| `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; replaces the characters of API rule 9 in peer text; usable in-process as a `Transport` |
 | `crates/station/src/ipc.rs` | the socket server (rules below), generic over any `Transport`; hello `{api: 1}` always answered with the station's API version, the station id and a per-start instance id, also on a version mismatch, and then the connection is closed; one connection per call or subscription; frames capped at 1 MiB both ways; both ends check the uid; a deadline on every frame of a call, never on an open subscription; an exclusive lock on `<socket>.lock` while it serves |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
 | `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
@@ -321,7 +321,7 @@ the tower's own endpoint (M3). Router port mapping stays off; whether stations u
     returned by the log; subscribe-then-page yields no duplicate; a subscriber that does not read
     gets `Resync`; dropping a pending `next()` loses nothing; a leftover socket file is replaced; a
     0755 socket directory is refused; two stations with different data dirs serve two sockets
-  - frame codec (round trip, oversize rejected) and control-character stripping
+  - frame codec (round trip, oversize rejected) and control-character replacement (API rule 9)
 - `scripts/walkthrough.sh`, run by CI with the real binaries: one `tower`, two `station run` in temp
   dirs, `chief peer add` both ways, `chief send`, assert on `chief log` on the other side, stop both
   stations and assert the sockets are gone. The README carries the same steps for a person.
