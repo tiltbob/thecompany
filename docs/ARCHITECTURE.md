@@ -293,8 +293,8 @@ across short sends and resets when new authenticated frames arrive. A caller che
 its original send deadline. If the observed connection is still current and has made
 no progress for the full interval, the sender closes it and can redial. QUIC replenishes
 credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
-An opt-in tower announcement uses one bidirectional stream until the attempt ends, so 13
-unanswered chat sends can exhaust the available credit while that stream is open.
+An opt-in tower announcement takes one of those credits, so 13 unanswered chat sends can
+exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that

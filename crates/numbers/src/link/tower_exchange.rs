@@ -275,6 +275,29 @@ mod tests {
     use super::super::tests::{connect, endpoint_with_streams};
     use super::super::{DialResult, LinkConfig};
     use super::*;
+    use crate::Endpoint;
+
+    async fn authorized_peer(budget: Duration) -> (Endpoint, Endpoint, Arc<Shared>, Arc<Peer>) {
+        let local = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
+        let remote = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
+        local
+            .authorizer()
+            .replace_peers([(remote.iroh().id(), "peer".into())]);
+        remote
+            .authorizer()
+            .replace_peers([(local.iroh().id(), "local".into())]);
+        let (towers, _exchange) = TowerProtocol::new(&TowerSet::default());
+        let (shared, _inbox) = Shared::with_towers(
+            &local,
+            LinkConfig {
+                connect_timeout: budget,
+                send_deadline: budget,
+            },
+            Some(towers),
+        );
+        let peer = shared.peer(remote.iroh().id()).expect("peer is authorized");
+        (local, remote, shared, peer)
+    }
 
     fn envelope(
         shared: &Shared,
@@ -287,7 +310,10 @@ mod tests {
                 peer: Arc::downgrade(peer),
                 connection: Arc::downgrade(connection),
                 authorizer: Arc::downgrade(&shared.authorizer),
-                name: Arc::from("peer"),
+                name: shared
+                    .authorizer
+                    .authorize(&peer.id, Protocol::Stream(TOWERS_PROTOCOL))
+                    .expect("peer may announce towers"),
                 announcement: TowerAnnouncement::from_working_set(&TowerSet::default()),
                 reply,
             },
@@ -299,24 +325,7 @@ mod tests {
     async fn replaced_envelope_cannot_commit_while_old_transport_is_held() {
         let budget = Duration::from_secs(10);
         timeout(budget, async {
-            let local = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
-            let remote = endpoint_with_streams(&[TOWERS_PROTOCOL]).await;
-            local
-                .authorizer()
-                .replace_peers([(remote.iroh().id(), "peer".into())]);
-            remote
-                .authorizer()
-                .replace_peers([(local.iroh().id(), "local".into())]);
-            let (towers, _exchange) = TowerProtocol::new(&TowerSet::default());
-            let (shared, _inbox) = Shared::with_towers(
-                &local,
-                LinkConfig {
-                    connect_timeout: budget,
-                    send_deadline: budget,
-                },
-                Some(towers),
-            );
-            let peer = shared.peer(remote.iroh().id()).unwrap();
+            let (local, remote, shared, peer) = authorized_peer(budget).await;
             let (old, _old_remote) = connect(&local, &remote).await;
             let held = {
                 let mut state = peer.state();
@@ -362,5 +371,46 @@ mod tests {
         })
         .await
         .expect("check the replaced envelope before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn envelope_cannot_commit_after_the_authorized_peer_is_renamed() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let (local, remote, shared, peer) = authorized_peer(budget).await;
+            let (transport, _remote_transport) = connect(&local, &remote).await;
+            let connection = {
+                let mut state = peer.state();
+                assert!(
+                    shared.admit(&peer, &mut state, &transport, None, [1; 16]) == DialResult::Ready
+                );
+                Arc::clone(&state.active.as_ref().unwrap().connection)
+            };
+            let (obsolete, mut obsolete_reply) = envelope(&shared, &peer, &connection);
+
+            local
+                .authorizer()
+                .replace_peers([(peer.id, "renamed".into())]);
+            assert!(is_current(&peer.state(), &connection));
+            assert!(!obsolete.accept_if_current(|_, _, _| panic!("renamed item must not commit")));
+            assert!(matches!(
+                obsolete_reply.try_recv(),
+                Ok(TowerReply::Nack {
+                    reason: TowerNackReason::Unavailable
+                })
+            ));
+
+            let (current, mut current_reply) = envelope(&shared, &peer, &connection);
+            assert!(current.accept_if_current(|_, name, _| {
+                assert_eq!(name, "renamed");
+                true
+            }));
+            assert!(matches!(current_reply.try_recv(), Ok(TowerReply::Ack)));
+
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("check the renamed peer before the test deadline");
     }
 }
