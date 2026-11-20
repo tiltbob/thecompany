@@ -5,7 +5,7 @@ use std::time::Duration;
 use chief::api::{FailReason, MessageStatus};
 use iroh::EndpointAddr;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use numbers::link::{LINK_ALPN, Link, LinkConfig, LinkPath};
+use numbers::link::{LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath};
 use numbers::proto::chat::{ChatMessage, ChatReply, NackReason};
 use numbers::proto::{CHAT_PROTOCOL, Hello, HelloEcho, StreamHeader};
 use numbers::{
@@ -21,11 +21,11 @@ use super::super::deliver;
 const SEND_BUDGET: Duration = Duration::from_secs(3);
 const CASE_BUDGET: Duration = Duration::from_secs(15);
 
-fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
+pub(super) fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
     result.unwrap_or_else(|_| panic!("{operation}"))
 }
 
-async fn bind(key: &[u8; 32], peer: NodeId) -> Endpoint {
+pub(super) async fn bind(key: &[u8; 32], peer: NodeId) -> Endpoint {
     let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
     authorizer.replace_peers([(peer, "peer".into())]);
     checked(
@@ -42,14 +42,14 @@ async fn bind(key: &[u8; 32], peer: NodeId) -> Endpoint {
     )
 }
 
-async fn write(send: &mut SendStream, value: &impl Serialize) {
+pub(super) async fn write(send: &mut SendStream, value: &impl Serialize) {
     checked(
         write_frame(send, value, WIRE_FRAME_MAX).await,
         "write frame",
     );
 }
 
-async fn read<T: DeserializeOwned>(recv: &mut RecvStream) -> T {
+pub(super) async fn read<T: DeserializeOwned>(recv: &mut RecvStream) -> T {
     checked(read_frame(recv, WIRE_FRAME_MAX, None).await, "read frame")
 }
 
@@ -68,8 +68,19 @@ async fn connect() -> (Link, Endpoint, Connection) {
             connect_timeout: SEND_BUDGET,
         },
     );
-    let handle = link.handle();
-    let mut paths = handle.subscribe_paths();
+    let connection = dial_admitted(&peer, address, &link.handle()).await;
+    (link, peer, connection)
+}
+
+/// Dials the station from a raw peer endpoint, completes the hello by hand and waits until the
+/// station's link has admitted the connection.
+pub(super) async fn dial_admitted(
+    peer: &Endpoint,
+    address: EndpointAddr,
+    station: &LinkHandle,
+) -> Connection {
+    let peer_id = peer.iroh().id();
+    let mut paths = station.subscribe_paths();
     let connection = checked(
         peer.iroh().connect(address, LINK_ALPN).await,
         "dial station",
@@ -88,10 +99,10 @@ async fn connect() -> (Link, Endpoint, Connection) {
     )
     .await;
     checked(send.finish(), "finish hello");
-    while handle.path(peer_id) != LinkPath::Direct {
+    while station.path(peer_id) != LinkPath::Direct {
         checked(paths.recv().await, "observe admitted direct link");
     }
-    (link, peer, connection)
+    connection
 }
 
 async fn ready_reply_survives_deadline(reply: ChatReply, expected: MessageStatus) {
