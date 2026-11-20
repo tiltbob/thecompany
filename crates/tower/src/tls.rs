@@ -429,8 +429,10 @@ pub(crate) async fn cert_config(
     }
 }
 
-/// Whether `contact` is `mailto:` (lower case) followed by one address: no white space, no
-/// comma, no `?`, and exactly one `@` with something on both sides.
+/// Whether `contact` is `mailto:` (lower case) followed by one address: printable ASCII with no
+/// comma and no `?`, exactly one `@` with something before it, and after it a DNS name of at
+/// least two labels that does not end in a dot (the contact is sent to the ACME server as it is
+/// written, and Let's Encrypt refuses a domain that ends in a dot).
 fn is_acme_contact(contact: &str) -> bool {
     let Some(address) = contact.strip_prefix("mailto:") else {
         return false;
@@ -445,7 +447,7 @@ fn is_acme_contact(contact: &str) -> bool {
     let Some((local, domain)) = address.split_once('@') else {
         return false;
     };
-    !local.is_empty() && !domain.contains('@') && is_acme_domain(domain)
+    !local.is_empty() && !domain.contains('@') && !domain.ends_with('.') && is_acme_domain(domain)
 }
 
 /// Whether `name` is a DNS name an ACME certificate or contact can use: a valid host name of
@@ -640,6 +642,8 @@ mod tests {
             "mailto:<ops@example.com>",
             "mailto:ops@example.com#x",
             "mailto:ops@-example.com",
+            // Sent as written, and Let's Encrypt refuses a domain that ends in a dot.
+            "mailto:ops@example.com.",
         ] {
             let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
             let Err(error) = cert_config(&tls).await else {
@@ -658,7 +662,7 @@ mod tests {
         for contact in [
             "mailto:ops@example.com",
             "mailto:first.last+tower@mail.example.com",
-            "mailto:ops@Example.COM.",
+            "mailto:ops@Example.COM",
         ] {
             let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
             assert!(cert_config(&tls).await.is_ok(), "{contact}");

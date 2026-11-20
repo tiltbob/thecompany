@@ -578,8 +578,8 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   cache error is reported once and sets no wait: a failed load is not tried again (`:398`,
   `:409`) and a failed store is not repeated (`:259`, `:449`). Its cache writes use
   `fs::create_dir_all` and `fs::write` with the process's default modes
-  (`src/caches/dir.rs:36-38`), so the tower creates the directory with mode 0700 itself. tracing-subscriber 0.3.23's fmt layer writes to standard output
-  (`src/fmt/fmt_layer.rs:749`).
+  (`src/caches/dir.rs:36-38`), so the tower creates the directory with mode 0700 itself.
+  tracing-subscriber 0.3.23's fmt layer writes to standard output (`src/fmt/fmt_layer.rs:749`).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
