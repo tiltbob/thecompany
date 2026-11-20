@@ -359,39 +359,146 @@ fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
 }
 
 #[test]
-fn staging_name_collisions_preserve_every_preexisting_entry() {
+fn all_legacy_staging_names_can_be_occupied_without_blocking_a_save() {
     let (_temp, path) = scratch();
     let storage = Storage::lock(&path).expect("lock fixture");
     let own = new_id();
     let book = single_peer("alice", new_id());
-    let stale = path.join(staging_name(RecordFile::Peers, 0));
-    write_file(&stale, b"stale", 0o600);
-    storage
-        .save_peers(&book, own)
-        .expect("skip stale stage name");
-    assert!(fs::read(&stale).expect("read stale fixture") == b"stale");
-    assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 3);
+    let legacy_path = |index| path.join(format!(".{PEER_FILE}.{}.{index}.tmp", std::process::id()));
+    for index in 0..STAGING_ATTEMPTS {
+        write_file(&legacy_path(index), &[index], 0o600);
+    }
 
-    for index in 1..STAGING_ATTEMPTS {
+    assert_eq!(
+        storage
+            .save_peers(&book, own)
+            .expect("save with legacy stages present"),
+        SaveOutcome::Durable
+    );
+    assert!(storage.load_peers(own).expect("load committed peer book") == book);
+    for index in 0..STAGING_ATTEMPTS {
+        assert!(fs::read(legacy_path(index)).expect("read the legacy stage") == [index]);
+    }
+    assert_eq!(
+        fs::read_dir(path).expect("list fixtures").count(),
+        usize::from(STAGING_ATTEMPTS) + 2
+    );
+}
+
+#[test]
+fn a_colliding_name_is_preserved_and_the_next_draw_commits() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let own = new_id();
+    let book = single_peer("alice", new_id());
+    let bytes = serde_json::to_vec(&DiskBook::from_book(&book)).expect("encode fixture book");
+    let collision = path.join(staging_name(RecordFile::Peers, 1));
+    write_file(&collision, b"keep", 0o644);
+    let mut suffixes = [1, 2].into_iter();
+
+    assert_eq!(
+        storage
+            .replace_record_with_suffixes(
+                RecordFile::Peers,
+                &bytes,
+                || Ok(suffixes.next().expect("exactly two draws")),
+                File::sync_all,
+            )
+            .expect("commit under a fresh staging name"),
+        SaveOutcome::Durable
+    );
+    assert!(suffixes.next().is_none());
+    assert!(storage.load_peers(own).expect("load replacement peer book") == book);
+    assert!(fs::read(&collision).expect("read the original entry") == b"keep");
+    assert_eq!(file_mode(&collision), 0o644);
+    assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 3);
+}
+
+#[test]
+fn sixteen_collisions_leave_the_book_and_all_stages_unchanged() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let own = new_id();
+    let old = single_peer("alice", new_id());
+    storage.save_peers(&old, own).expect("save old peer book");
+    let peer_path = path.join(PEER_FILE);
+    let committed = File::open(&peer_path).expect("hold committed peer book");
+    let committed_inode = committed.metadata().expect("read committed inode").ino();
+    let next = single_peer("bob", new_id());
+    let bytes = serde_json::to_vec(&DiskBook::from_book(&next)).expect("encode replacement book");
+
+    for index in 0..STAGING_ATTEMPTS {
         write_file(
-            &path.join(staging_name(RecordFile::Peers, index)),
-            b"stale",
+            &path.join(staging_name(RecordFile::Peers, u128::from(index))),
+            &[index],
             0o600,
         );
     }
-    let next = single_peer("bob", new_id());
+    let mut suffixes = 0..u128::from(STAGING_ATTEMPTS);
     assert!(matches!(
-        storage.save_peers(&next, own),
+        storage.replace_record_with_suffixes(
+            RecordFile::Peers,
+            &bytes,
+            || Ok(suffixes.next().expect("draw no more than sixteen names")),
+            |_| panic!("an exhausted save cannot reach directory sync"),
+        ),
         Err(StorageError::StagingNamesTaken(RecordFile::Peers))
     ));
-    assert!(storage.load_peers(own).expect("load old book") == book);
+    assert!(suffixes.next().is_none());
+    assert!(storage.load_peers(own).expect("load old book") == old);
+    assert_eq!(
+        fs::metadata(peer_path).expect("read unchanged inode").ino(),
+        committed_inode
+    );
     for index in 0..STAGING_ATTEMPTS {
         assert!(
-            fs::read(path.join(staging_name(RecordFile::Peers, index)))
-                .expect("read existing stage fixture")
-                == b"stale"
+            fs::read(path.join(staging_name(RecordFile::Peers, u128::from(index))))
+                .expect("read the original stage")
+                == [index]
         );
     }
+    assert_eq!(
+        fs::read_dir(path).expect("list fixtures").count(),
+        usize::from(STAGING_ATTEMPTS) + 2
+    );
+}
+
+#[test]
+fn entropy_failure_after_a_collision_preserves_the_existing_files() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock fixture");
+    let own = new_id();
+    let old = single_peer("alice", new_id());
+    storage.save_peers(&old, own).expect("save old peer book");
+    let peer_path = path.join(PEER_FILE);
+    let committed = File::open(&peer_path).expect("hold committed peer book");
+    let committed_inode = committed.metadata().expect("read committed inode").ino();
+    let next = single_peer("bob", new_id());
+    let bytes = serde_json::to_vec(&DiskBook::from_book(&next)).expect("encode replacement book");
+
+    let target = path.join("target");
+    write_file(&target, b"keep", 0o600);
+    let collision = path.join(staging_name(RecordFile::Peers, 1));
+    symlink(&target, &collision).expect("link an existing stage name");
+    let mut suffixes = [Ok(1), Err(getrandom::Error::UNSUPPORTED)].into_iter();
+    assert!(matches!(
+        storage.replace_record_with_suffixes(
+            RecordFile::Peers,
+            &bytes,
+            || suffixes.next().expect("stop drawing after entropy failure"),
+            |_| panic!("entropy failure cannot reach directory sync"),
+        ),
+        Err(StorageError::StageRecord(RecordFile::Peers))
+    ));
+    assert!(suffixes.next().is_none());
+    assert!(storage.load_peers(own).expect("load old book") == old);
+    assert_eq!(
+        fs::metadata(peer_path).expect("read unchanged inode").ino(),
+        committed_inode
+    );
+    assert!(collision.is_symlink());
+    assert!(fs::read(target).expect("read the symlink target") == b"keep");
+    assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 4);
 }
 
 #[test]
