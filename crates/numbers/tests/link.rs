@@ -904,16 +904,71 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
     );
 }
 
+/// Sends `count` chats one after another, each acknowledged by the application.
+async fn exchange_chats(
+    conn: &Connection,
+    inbox: &mut Receiver<IncomingChat>,
+    peer: NodeId,
+    prefix: &str,
+    count: usize,
+) {
+    let header = StreamHeader::chat();
+    for index in 0..count {
+        let chat = message(&format!("{prefix}-{index}"), "return stream credit");
+        let (reply, ()) = tokio::join!(
+            request(conn, &header, &chat),
+            acknowledge(inbox, peer, "second", &chat),
+        );
+        assert_eq!(checked(reply, "read a credit chat's ACK"), ChatReply::Ack);
+    }
+}
+
+/// Opens `count` complete chats and takes each from the inbox before opening the next. The
+/// returned chats are held by the application, so each keeps one receiver stream slot.
+async fn fill_stream_slots(
+    conn: &Connection,
+    inbox: &mut Receiver<IncomingChat>,
+    peer: NodeId,
+    prefix: &str,
+    count: usize,
+) -> (Vec<RecvStream>, Vec<IncomingChat>) {
+    let header = StreamHeader::chat();
+    let mut replies = Vec::new();
+    let mut held = Vec::new();
+    for index in 0..count {
+        let chat = message(&format!("{prefix}-{index}"), "occupy one stream slot");
+        replies.push(open_chat(conn, &header, &chat).await);
+        let incoming = checked(
+            timeout(PROBE_TIMEOUT, inbox.recv()).await,
+            "deliver a chat that fills a stream slot",
+        )
+        .expect("link inbox remains open");
+        assert_delivery(&incoming, peer, "second", &chat);
+        held.push(incoming);
+    }
+    (replies, held)
+}
+
 /// Every chat stream slot of the receiver holds a chat that the application does not answer.
-/// When they all reach the receiver's deadline, their slots must be free again, so one more
-/// chat on the same connection is delivered after about one deadline, not sixteen.
+/// When they all reach the receiver's deadline, their slots must be released: the test then
+/// holds `REFILL` new chats at once, without waiting for another deadline.
 ///
 /// 16 is the link's stream limit (`STREAM_LIMIT` in `crates/numbers/src/link.rs`, which is
 /// also the endpoint's limit of concurrent bidirectional streams). This test must follow it
 /// if it changes.
+///
+/// The refill is 2 short of the limit. noq-proto 1.5.0 announces new stream credit only when
+/// more than 1/8 of the window (2 of 16) freed streams are pending (`queue_max_stream_id` in
+/// `src/connection/streams/state.rs`). The 16 resets free their streams over several packets,
+/// and up to 2 frees that come after the last announcement stay unannounced while the refill
+/// holds its streams, so the peer can rely on only 14 concurrent streams. The test therefore
+/// catches a receiver that keeps 3 or more slots after the deadline; a leak of 1 or 2 slots
+/// cannot be told apart from the credit noq may legitimately withhold with this limit.
 #[tokio::test]
-async fn chats_reset_at_the_receiver_deadline_release_every_stream_slot() {
+async fn chats_reset_at_the_receiver_deadline_release_their_stream_slots() {
     const LINK_STREAM_LIMIT: usize = 16;
+    // See the doc comment: up to 2 freed streams can stay unannounced.
+    const REFILL: usize = LINK_STREAM_LIMIT - 2;
     checked(
         timeout(CASE_TIMEOUT, async {
             let (endpoint, auth) = bind_direct().await;
@@ -927,36 +982,18 @@ async fn chats_reset_at_the_receiver_deadline_release_every_stream_slot() {
             finish_hello(&mut send, &remote).await;
             wait_for_path(&link.handle(), peer_id, LinkPath::Direct).await;
 
-            let header = StreamHeader::chat();
             // noq announces new stream credit only once more than 1/8 of the window (2 of
             // 16 streams) is free again. Free two more streams after the hello so that the
             // peer can open as many concurrent streams as the link has slots.
-            for index in 0..2 {
-                let warmup = message(&format!("warmup-{index}"), "return stream credit");
-                let (reply, ()) = tokio::join!(
-                    request(&conn, &header, &warmup),
-                    acknowledge(&mut inbox, peer_id, "second", &warmup),
-                );
-                assert_eq!(checked(reply, "read a warmup ACK"), ChatReply::Ack);
-            }
+            exchange_chats(&conn, &mut inbox, peer_id, "warmup", 2).await;
             // The inbox holds more chats than the link has slots, so every slot can hold a
             // delivered chat whose reply sender the application keeps. All of them reach the
-            // receiver's deadline together, so the next chat needs about one deadline.
-            let reply = checked(
+            // receiver's deadline together.
+            checked(
                 timeout(SEND_DEADLINE + Duration::from_secs(1), async {
-                    let mut replies = Vec::new();
-                    let mut held = Vec::new();
-                    for index in 0..LINK_STREAM_LIMIT {
-                        let chat = message(&format!("held-{index}"), "occupy one stream slot");
-                        replies.push(open_chat(&conn, &header, &chat).await);
-                        let incoming = checked(
-                            timeout(PROBE_TIMEOUT, inbox.recv()).await,
-                            "deliver a chat that fills a stream slot",
-                        )
-                        .expect("link inbox remains open");
-                        assert_delivery(&incoming, peer_id, "second", &chat);
-                        held.push(incoming);
-                    }
+                    let (mut replies, held) =
+                        fill_stream_slots(&conn, &mut inbox, peer_id, "held", LINK_STREAM_LIMIT)
+                            .await;
                     for recv in &mut replies {
                         let reset = recv.read(&mut [0]).await;
                         assert!(
@@ -964,20 +1001,27 @@ async fn chats_reset_at_the_receiver_deadline_release_every_stream_slot() {
                         );
                     }
                     drop(held);
-
-                    let next = message("after-full-slots", "a freed slot accepts this chat");
-                    let (reply, ()) = tokio::join!(
-                        request(&conn, &header, &next),
-                        acknowledge(&mut inbox, peer_id, "second", &next),
-                    );
-                    reply
                 })
                 .await,
-                "a chat after a full set of deadline resets was not delivered",
+                "the held chats were not reset by the receiver deadline",
             );
-            assert_eq!(
-                checked(reply, "read ACK after the deadline resets"),
-                ChatReply::Ack
+
+            // Refill as many slots as the stream credit allows at once, without waiting for
+            // another deadline. Each refill chat needs a slot that a reset chat released.
+            checked(
+                timeout(Duration::from_secs(1), async {
+                    let (replies, held) =
+                        fill_stream_slots(&conn, &mut inbox, peer_id, "refill", REFILL).await;
+                    // Answer them so that each slot is seen to carry a working chat.
+                    for incoming in held {
+                        incoming.respond(ChatReply::Ack);
+                    }
+                    for mut recv in replies {
+                        assert_eq!(read::<ChatReply>(&mut recv).await, ChatReply::Ack);
+                    }
+                })
+                .await,
+                "the released stream slots could not be filled again at once",
             );
             assert!(conn.close_reason().is_none());
             checked(link.shutdown().await, "stop link after the deadline resets");
