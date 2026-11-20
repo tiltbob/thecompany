@@ -16,11 +16,10 @@ use tokio::sync::mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel}
 use tokio::task::coop::{consume_budget, has_budget_remaining};
 use tokio::time::{sleep, timeout};
 
-use super::{
-    DnsConfig, Endpoint, EndpointBindError, EndpointConfig, IpTransport, TlsRoots, TowerSnapshot,
-    TowerStatus,
-};
+use super::{DnsConfig, Endpoint, EndpointConfig, IpTransport, TowerSnapshot, TowerStatus};
 use crate::{Authorizer, MAX_TOWERS, TowerEntry, TowerSet, generate_node_key};
+
+mod tls;
 
 const ALPN: &[u8] = b"test/endpoint/0";
 
@@ -38,6 +37,26 @@ impl ProtocolHandler for ObserveAccept {
 fn dns_config_debug_hides_the_nameserver() {
     let dns = DnsConfig::Nameserver((Ipv4Addr::LOCALHOST, 53).into());
     assert_eq!(format!("{dns:?}"), "Nameserver(..)");
+}
+
+#[test]
+fn dns_config_disables_public_fallback_for_both_modes() {
+    // iroh-dns 1.5's `dns.rs` exposes these settings through the builder's Debug.
+    // Inspecting the builder avoids resolving anything or depending on the host's DNS.
+    let system = DnsConfig::System.resolver_builder();
+    let system = format!("{system:?}");
+    assert!(system.contains("fallback_mode: Never"), "{system}");
+    assert!(system.contains("use_system_defaults: true"), "{system}");
+
+    let addr = (Ipv4Addr::LOCALHOST, 5353).into();
+    let nameserver = DnsConfig::Nameserver(addr).resolver_builder();
+    let nameserver = format!("{nameserver:?}");
+    assert!(nameserver.contains("fallback_mode: Never"), "{nameserver}");
+    assert!(
+        nameserver.contains("use_system_defaults: false"),
+        "{nameserver}"
+    );
+    assert!(nameserver.contains(&addr.to_string()), "{nameserver}");
 }
 
 #[test]
@@ -572,30 +591,6 @@ fn a_home_keeps_its_last_failure_only_until_a_new_observation_supersedes_it() {
         snapshot.observe(first, TowerStatus::Unknown),
         TowerStatus::Unknown
     );
-}
-
-#[tokio::test]
-async fn bind_rejects_unsupported_tls_and_dns_settings() {
-    let key = generate_node_key();
-    let policy = Arc::new(Authorizer::new(&[ALPN], &[]));
-    for tls_roots in [TlsRoots::WebPkiPlus(vec![]), TlsRoots::CustomOnly(vec![])] {
-        let config = EndpointConfig {
-            tls_roots,
-            ..EndpointConfig::default()
-        };
-        assert!(matches!(
-            Endpoint::bind(&key, config, policy.clone()).await,
-            Err(EndpointBindError::UnsupportedTlsRoots)
-        ));
-    }
-    let config = EndpointConfig {
-        dns: DnsConfig::Nameserver((Ipv4Addr::LOCALHOST, 53).into()),
-        ..EndpointConfig::default()
-    };
-    assert!(matches!(
-        Endpoint::bind(&key, config, policy).await,
-        Err(EndpointBindError::UnsupportedDns)
-    ));
 }
 
 #[tokio::test]
