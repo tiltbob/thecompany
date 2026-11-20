@@ -244,14 +244,46 @@ async fn restart_keeps_the_towers_their_sources_and_the_domain() {
         status.bootstrap_domain.as_deref(),
         Some("team.example.invalid")
     );
+    // The first tower is the fake's home tower; every other one is not observed.
     let expected: Vec<TowerStatus> = three_towers_clean()
         .into_iter()
-        .map(|t| TowerStatus {
-            state: TowerState::Connecting,
+        .enumerate()
+        .map(|(i, t)| TowerStatus {
+            state: if i == 0 {
+                TowerState::Connecting
+            } else {
+                TowerState::Standby
+            },
             ..t
         })
         .collect();
     assert_eq!(status.towers, expected);
+}
+
+#[tokio::test]
+async fn set_bootstrap_domain_stores_the_domain_as_given() {
+    let fake = station();
+    fake.set_bootstrap_domain(Some("team.example.invalid\u{1b}".into()));
+    assert_eq!(
+        fake.status().bootstrap_domain.as_deref(),
+        Some("team.example.invalid\u{1b}")
+    );
+}
+
+#[tokio::test]
+async fn set_towers_leaves_the_bootstrap_domain_alone() {
+    let fake = station();
+    fake.set_bootstrap_domain(Some("team.example.invalid".into()));
+    fake.set_towers(three_towers());
+    assert_eq!(
+        fake.status().bootstrap_domain.as_deref(),
+        Some("team.example.invalid")
+    );
+    fake.set_towers(Vec::new());
+    assert_eq!(
+        fake.status().bootstrap_domain.as_deref(),
+        Some("team.example.invalid")
+    );
 }
 
 // Peer book (rule 10).

@@ -242,8 +242,11 @@ impl FakeStation {
     /// space ([`crate::api::clean`]) before it is stored and before the event is pushed. The
     /// sources are stored as given.
     ///
-    /// A [`FakeStation::restart`] puts every tower of the list back in [`TowerState::Connecting`]
-    /// and keeps the list itself: its order, its urls and its sources.
+    /// The bootstrap domain is left as it is. The fake treats the first tower of the list as the
+    /// home tower: a [`FakeStation::restart`] puts it back in [`TowerState::Connecting`] and every
+    /// other tower in [`TowerState::Standby`], and keeps the list itself (its order, urls and
+    /// sources). Keeping them is the fake's choice; what a real station reports after a restart
+    /// is not settled here, and a test that needs something else calls `set_towers` again.
     pub fn set_towers(&self, towers: Vec<TowerStatus>) {
         let towers = towers
             .into_iter()
@@ -274,7 +277,8 @@ impl FakeStation {
     /// The domain is the chief's own input to its station, not text from a peer or a tower, so it
     /// is stored as given, without [`crate::api::clean`]; a frontend still cleans what it prints.
     ///
-    /// A [`FakeStation::restart`] keeps it.
+    /// A [`FakeStation::restart`] keeps it: the fake's choice, as for the list of towers; a test
+    /// that needs something else calls `set_bootstrap_domain` again.
     pub fn set_bootstrap_domain(&self, domain: Option<String>) {
         let mut state = self.state();
         state.status.bootstrap_domain = domain;
@@ -395,14 +399,18 @@ impl FakeStation {
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, every tower is back in [`TowerState::Connecting`] as in a new fake (no event
-    /// is pushed: the subscriptions have ended), and calls are answered again after a
+    /// link is down, the first tower of the list (the fake's home tower) is back in
+    /// [`TowerState::Connecting`] and every other one in [`TowerState::Standby`], as the API
+    /// reports a set whose home tower is not connected yet (no event is pushed: the subscriptions
+    /// have ended), and calls are answered again after a
     /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
     /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
     /// to the new one. The peer book, the send outcome and the other test settings, the hold of
-    /// subscribes included, stay, as a station's peer book survives a restart. So do the list of
-    /// towers ([`FakeStation::set_towers`]: its order, urls and sources) and the bootstrap domain
-    /// ([`FakeStation::set_bootstrap_domain`]); only the towers' states change.
+    /// subscribes included, stay, as a station's peer book survives a restart. So do, by the fake's
+    /// choice, the list of towers ([`FakeStation::set_towers`]: its order, urls and sources) and
+    /// the bootstrap domain ([`FakeStation::set_bootstrap_domain`]); only the towers' states
+    /// change. What a real station reports after a restart is not settled here: a test that
+    /// needs something else sets the towers or the domain again.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();
@@ -414,8 +422,12 @@ impl FakeStation {
             state.next_seq = 1;
             state.stopped = false;
             state.generation += 1;
-            for tower in &mut state.status.towers {
-                tower.state = TowerState::Connecting;
+            for (i, tower) in state.status.towers.iter_mut().enumerate() {
+                tower.state = if i == 0 {
+                    TowerState::Connecting
+                } else {
+                    TowerState::Standby
+                };
             }
             for stations in state.peers.values_mut() {
                 for station in stations {
