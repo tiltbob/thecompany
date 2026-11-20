@@ -1,9 +1,12 @@
-//! Authenticated, bidirectional links and chat stream dispatch.
+//! Authenticated, bidirectional links and typed stream dispatch.
 
 mod streams;
+mod tower_exchange;
 
 #[cfg(test)]
 mod close_wait_tests;
+#[cfg(test)]
+mod hello_proof_tests;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -16,18 +19,24 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, ConnectionError, FrameStats, RecvStream, SendStream, Side};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::endpoint::QUIC_KEEPALIVE;
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
+use crate::proto::towers::TowerAnnouncement;
 use crate::proto::{CHAT_PROTOCOL, Hello};
-use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
+use crate::{
+    Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, TowerSet, generate_node_key,
+};
 
 use self::streams::{
-    close_code, exchange_hello, read_chat_reply, receive_chat, write_chat_request,
+    close_code, exchange_hello, read_chat_reply, receive_stream, write_chat_request,
 };
+use self::tower_exchange::{TowerProtocol, announce};
+
+pub use self::tower_exchange::{IncomingTowers, TowerExchange};
 
 /// The ALPN of the numbers link.
 pub const LINK_ALPN: &[u8] = b"numbers/0";
@@ -39,15 +48,17 @@ const STREAM_LIMIT: usize = 16;
 const MAILBOX_CAPACITY: usize = 32;
 const STREAM_CREDIT_MARGIN: Duration = Duration::from_secs(1);
 
-/// Time budgets for a link and its chat operations.
+/// Time budgets for a link and its stream operations.
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
     ///
     /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
     /// The progress check after writing a message needs a positive interval shorter
-    /// than the remaining send budget. A wait for stream credit also allows time for
-    /// a transport keepalive, and its progress observation can span several sends.
+    /// than the remaining send budget. The stream-credit progress window is the
+    /// larger of this timeout and 6 seconds. A send that first observes a stall can
+    /// close the link only if its remaining budget exceeds that window. Otherwise
+    /// the observation carries over to a later send on the same connection.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
@@ -146,6 +157,25 @@ impl Link {
     /// This performs no network wait. Call from a Tokio runtime with time enabled.
     pub fn start(endpoint: Endpoint, config: LinkConfig) -> (Self, mpsc::Receiver<IncomingChat>) {
         let (shared, receive) = Shared::new(&endpoint, config);
+        (Self::spawn(endpoint, shared), receive)
+    }
+
+    /// Starts chat and the opt-in tower exchange, seeded before the router starts.
+    ///
+    /// Enable [`crate::proto::TOWERS_PROTOCOL`] in the endpoint's stream authorizer. Each
+    /// admitted transport makes one bounded announcement attempt, including replacements.
+    /// This performs no network wait. Call from a Tokio runtime with time enabled.
+    pub fn start_with_towers(
+        endpoint: Endpoint,
+        config: LinkConfig,
+        working_set: &TowerSet,
+    ) -> (Self, mpsc::Receiver<IncomingChat>, TowerExchange) {
+        let (towers, exchange) = TowerProtocol::new(working_set);
+        let (shared, receive) = Shared::with_towers(&endpoint, config, Some(towers));
+        (Self::spawn(endpoint, shared), receive, exchange)
+    }
+
+    fn spawn(endpoint: Endpoint, shared: Arc<Shared>) -> Self {
         let workers = Arc::new(Mutex::new(Some(Workers {
             endpoint: endpoint.iroh().clone(),
             tasks: JoinSet::new(),
@@ -155,14 +185,11 @@ impl Link {
             .router_builder()
             .accept(LINK_ALPN, IncomingLinks(Arc::clone(&shared)))
             .spawn();
-        (
-            Self {
-                shared,
-                workers,
-                router,
-            },
-            receive,
-        )
+        Self {
+            shared,
+            workers,
+            router,
+        }
     }
 
     /// Gets a handle for station operations.
@@ -173,7 +200,7 @@ impl Link {
         }
     }
 
-    /// Closes links and the incoming mailbox, then waits for the workers and router.
+    /// Closes links and incoming mailboxes, then waits for the workers and router.
     pub async fn shutdown(self) -> Result<(), ShutdownError> {
         self.shared.stop();
         let workers = lock(&self.workers).take();
@@ -244,8 +271,11 @@ impl LinkHandle {
         let mut first_attempt = true;
         let mut stale_retry_available = true;
         let mut replacement_retry_available = true;
+        let mut dial_retry_available = true;
         loop {
-            let lease = self.connection(peer).await?;
+            let lease = self
+                .connection(peer, start, &mut dial_retry_available)
+                .await?;
             let connection = &lease.transport;
             let result = send_chat(
                 peer,
@@ -308,7 +338,12 @@ impl LinkHandle {
         }
     }
 
-    async fn connection(&self, peer: &Arc<Peer>) -> Result<Arc<EstablishedConnection>, SendError> {
+    async fn connection(
+        &self,
+        peer: &Arc<Peer>,
+        start: Instant,
+        dial_retry_available: &mut bool,
+    ) -> Result<Arc<EstablishedConnection>, SendError> {
         // Subscribe before inspecting state. A later update stays visible across the await.
         let mut changes = peer.changed.subscribe();
         let mut attempt: Option<Arc<Dial>> = None;
@@ -325,12 +360,25 @@ impl LinkHandle {
                 if let Some(active) = state.active.as_ref().filter(|active| active.is_open()) {
                     return Ok(Arc::clone(&active.connection));
                 }
+                let result = attempt.as_ref().and_then(|dial| *lock(&dial.result));
+                // Count a failed dial before replacing the attempt, including when
+                // another caller has already reserved the next outgoing dial.
+                if let Some(DialResult::Failed(error)) = result
+                    && (state.dial.is_some() || state.incoming.is_none())
+                {
+                    if !matches!(error, SendError::Timeout | SendError::Disconnected)
+                        || !std::mem::take(dial_retry_available)
+                    {
+                        return Err(error);
+                    }
+                    if start.elapsed() >= self.shared.config.send_deadline {
+                        return Err(SendError::Timeout);
+                    }
+                }
                 if let Some(pending) = &state.dial {
                     attempt = Some(Arc::clone(pending));
                 } else if state.incoming.is_none() {
-                    let result = attempt.as_ref().and_then(|dial| *lock(&dial.result));
                     match result {
-                        Some(DialResult::Failed(error)) => return Err(error),
                         Some(DialResult::Replaced) if dialed_after_replacement => {
                             return Err(SendError::Disconnected);
                         }
@@ -402,12 +450,21 @@ struct Shared {
     config: LinkConfig,
     authorizer: Arc<Authorizer>,
     incoming: Mutex<Option<mpsc::Sender<IncomingChat>>>,
+    towers: Option<TowerProtocol>,
     paths: broadcast::Sender<PathUpdate>,
     registry: Mutex<Registry>,
 }
 
 impl Shared {
     fn new(endpoint: &Endpoint, config: LinkConfig) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
+        Self::with_towers(endpoint, config, None)
+    }
+
+    fn with_towers(
+        endpoint: &Endpoint,
+        config: LinkConfig,
+        towers: Option<TowerProtocol>,
+    ) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
         let (incoming, receive) = mpsc::channel(MAILBOX_CAPACITY);
         let (paths, _) = broadcast::channel(MAILBOX_CAPACITY);
         let shared = Arc::new(Self {
@@ -416,6 +473,7 @@ impl Shared {
             config,
             authorizer: endpoint.authorizer_handle(),
             incoming: Mutex::new(Some(incoming)),
+            towers,
             paths,
             registry: Mutex::default(),
         });
@@ -460,6 +518,9 @@ impl Shared {
             peer.revoke(&self.paths);
         }
         lock(&self.incoming).take();
+        if let Some(towers) = &self.towers {
+            towers.close();
+        }
     }
 
     fn hello(&self) -> Hello {
@@ -473,6 +534,7 @@ impl Shared {
         connection: &Connection,
         observed_generation: Option<[u8; 16]>,
         remote_generation: [u8; 16],
+        claimed_retired_link: Option<&Weak<EstablishedConnection>>,
     ) -> DialResult {
         if state.revoked {
             connection.close(CLOSE_LINK.into(), b"");
@@ -496,8 +558,14 @@ impl Shared {
             let existing = initiator(self.local_id, peer.id, active.connection.transport.side());
             let candidate = initiator(self.local_id, peer.id, connection.side());
             if same_generation && existing < candidate {
-                connection.close(CLOSE_REPLACED.into(), b"");
-                return DialResult::Replaced;
+                let exact_retired_link = connection.side() == Side::Server
+                    && claimed_retired_link.is_some_and(|captured| {
+                        captured.ptr_eq(&Arc::downgrade(&active.connection))
+                    });
+                if !exact_retired_link {
+                    connection.close(CLOSE_REPLACED.into(), b"");
+                    return DialResult::Replaced;
+                }
             }
             active
                 .connection
@@ -516,9 +584,11 @@ impl Shared {
                 transport: connection.clone(),
                 admitted_at: Instant::now(),
                 replaced_locally: AtomicBool::new(false),
+                tower_receive: Semaphore::new(1),
             }),
             path,
             stream_credit_wait: None,
+            tower_announcement: self.towers.as_ref().map(TowerProtocol::snapshot),
         });
         publish_path(&self.paths, peer.id, old_path, path);
         DialResult::Ready
@@ -630,7 +700,55 @@ struct PeerState {
     dial: Option<Arc<Dial>>,
 }
 
+struct IncomingHello {
+    observed_generation: Option<[u8; 16]>,
+    // Kept weak so a delayed hello cannot retain the old transport.
+    lower_link: Option<Weak<EstablishedConnection>>,
+}
+
 impl PeerState {
+    fn reserve_incoming(
+        &mut self,
+        connection: &Connection,
+        local_id: NodeId,
+        peer_id: NodeId,
+    ) -> Option<IncomingHello> {
+        // A pending hello may fail, so no winning connection can be promised.
+        if self.revoked || self.incoming.is_some() {
+            connection.close(CLOSE_LINK.into(), b"");
+            return None;
+        }
+        let lower_link = if local_id < peer_id {
+            self.open_lower_initiated_link(local_id, peer_id)
+                .map(|active| Arc::downgrade(&active.connection))
+        } else {
+            None
+        };
+        self.incoming = Some(connection.clone());
+        Some(IncomingHello {
+            observed_generation: self.remote_generation,
+            lower_link,
+        })
+    }
+
+    fn open_lower_initiated_link(&self, local_id: NodeId, peer_id: NodeId) -> Option<&Active> {
+        self.active.as_ref().filter(|active| {
+            active.is_open()
+                && initiator(local_id, peer_id, active.connection.transport.side())
+                    == local_id.min(peer_id)
+        })
+    }
+
+    fn can_claim_no_open_lower_link(&self, local_id: NodeId, peer_id: NodeId) -> bool {
+        local_id > peer_id
+            && !self.revoked
+            && self.open_lower_initiated_link(local_id, peer_id).is_none()
+            && self
+                .incoming
+                .as_ref()
+                .is_none_or(|connection| connection.close_reason().is_some())
+    }
+
     fn path(&self) -> LinkPath {
         self.active
             .as_ref()
@@ -648,6 +766,8 @@ struct Active {
     connection: Arc<EstablishedConnection>,
     path: LinkPath,
     stream_credit_wait: Option<StreamCreditWait>,
+    // This snapshot belongs to this admission even if the working set changes before drive.
+    tower_announcement: Option<Arc<TowerAnnouncement>>,
 }
 
 struct StreamCreditWait {
@@ -670,6 +790,7 @@ struct EstablishedConnection {
     admitted_at: Instant,
     // Read and written under the peer lock, including after removal from the active slot.
     replaced_locally: AtomicBool,
+    tower_receive: Semaphore,
 }
 
 async fn wait_for_close(
@@ -800,19 +921,24 @@ async fn run_dial(endpoint: iroh::Endpoint, shared: Arc<Shared>, peer: Arc<Peer>
             state.outgoing = Some(connection.clone());
             state.remote_generation
         };
-        let remote_generation = match exchange_hello(&connection, shared.hello(), budget).await {
-            Ok(generation) => generation,
-            Err(error) => {
-                let result = dial_failure(&connection, error);
-                let code = if error == SendError::Timeout {
-                    CLOSE_LINK
-                } else {
-                    CLOSE_BAD_HELLO
-                };
-                connection.close(code.into(), b"");
-                return Err(result);
-            }
+        let claim = || {
+            peer.state()
+                .can_claim_no_open_lower_link(shared.local_id, peer.id)
         };
+        let remote_generation =
+            match exchange_hello(&connection, shared.hello(), budget, claim).await {
+                Ok(remote) => remote.generation,
+                Err(error) => {
+                    let result = dial_failure(&connection, error);
+                    let code = if error == SendError::Timeout {
+                        CLOSE_LINK
+                    } else {
+                        CLOSE_BAD_HELLO
+                    };
+                    connection.close(code.into(), b"");
+                    return Err(result);
+                }
+            };
         Ok((connection, observed_generation, remote_generation))
     };
     let result = tokio::select! {
@@ -836,6 +962,7 @@ async fn run_dial(endpoint: iroh::Endpoint, shared: Arc<Shared>, peer: Arc<Peer>
                     &connection,
                     observed_generation,
                     remote_generation,
+                    None,
                 );
                 (
                     outcome,
@@ -931,33 +1058,38 @@ impl ProtocolHandler for IncomingLinks {
                 return Ok(());
             }
         };
-        let observed_generation = {
-            let mut state = peer.state();
-            if state.revoked {
-                connection.close(CLOSE_LINK.into(), b"");
-                return Ok(());
-            }
-            if state.incoming.is_some() {
-                // A pending hello may fail, so no winning connection can be promised.
-                connection.close(CLOSE_LINK.into(), b"");
-                return Ok(());
-            }
-            state.incoming = Some(connection.clone());
-            state.remote_generation
+        let Some(reservation) =
+            peer.state()
+                .reserve_incoming(&connection, shared.local_id, peer.id)
+        else {
+            return Ok(());
         };
         let budget = shared.config.connect_timeout;
-        let hello = timeout(budget, exchange_hello(&connection, shared.hello(), budget)).await;
+        let hello = timeout(
+            budget,
+            exchange_hello(&connection, shared.hello(), budget, || false),
+        )
+        .await;
         let admitted = {
+            // Removing the incoming slot and admitting it are one peer-state transition.
             let mut state = peer.state();
             state.incoming.take();
             let result = match hello {
-                Ok(Ok(remote_generation)) => shared.admit(
-                    &peer,
-                    &mut state,
-                    &connection,
-                    observed_generation,
-                    remote_generation,
-                ),
+                Ok(Ok(remote)) => {
+                    let claimed_retired_link = if remote.no_open_lower_initiated_link {
+                        reservation.lower_link.as_ref()
+                    } else {
+                        None
+                    };
+                    shared.admit(
+                        &peer,
+                        &mut state,
+                        &connection,
+                        reservation.observed_generation,
+                        remote.generation,
+                        claimed_retired_link,
+                    )
+                }
                 _ => {
                     connection.close(CLOSE_BAD_HELLO.into(), b"");
                     DialResult::Failed(SendError::BadHello)
@@ -966,6 +1098,7 @@ impl ProtocolHandler for IncomingLinks {
             peer.changed.send_replace(());
             result == DialResult::Ready
         };
+        drop(reservation);
         if admitted {
             drive(Arc::clone(shared), peer, connection).await;
         }
@@ -978,6 +1111,26 @@ impl ProtocolHandler for IncomingLinks {
 }
 
 async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
+    let (lease, snapshot) = {
+        let mut state = peer.state();
+        let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.matches(&connection))
+        else {
+            return;
+        };
+        (
+            Arc::clone(&active.connection),
+            active.tower_announcement.take(),
+        )
+    };
+    let mut announcing = snapshot.is_some();
+    let mut outgoing = pin!(async {
+        if let Some(snapshot) = snapshot {
+            announce(&shared, &peer, &lease, snapshot).await;
+        }
+    });
     let mut path_events = connection.path_events();
     let mut streams = FuturesUnordered::new();
     // The installed connection's path can change between admission and subscription.
@@ -986,6 +1139,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
         tokio::select! {
             biased;
             _ = connection.closed() => break,
+            () = &mut outgoing, if announcing => announcing = false,
             event = path_events.next() => {
                 if event.is_none() {
                     break;
@@ -995,7 +1149,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
             _ = streams.next(), if !streams.is_empty() => {}
             incoming = connection.accept_bi(), if streams.len() < STREAM_LIMIT => {
                 let Ok((send, recv)) = incoming else { break };
-                streams.push(receive_chat(&shared, &peer, &connection, send, recv));
+                streams.push(receive_stream(&shared, &peer, &lease, send, recv));
             },
         }
     }
@@ -1067,7 +1221,7 @@ mod tests {
     use super::*;
     use crate::{EndpointConfig, IpTransport, generate_node_key};
 
-    async fn loopback_endpoint() -> Endpoint {
+    pub(super) async fn loopback_endpoint() -> Endpoint {
         let endpoint = Endpoint::bind(
             &generate_node_key(),
             EndpointConfig {
@@ -1082,7 +1236,10 @@ mod tests {
         endpoint
     }
 
-    async fn connect(dialer: &Endpoint, listener: &Endpoint) -> (Connection, Connection) {
+    pub(super) async fn connect(
+        dialer: &Endpoint,
+        listener: &Endpoint,
+    ) -> (Connection, Connection) {
         let socket = listener.iroh().bound_sockets()[0];
         let address = iroh::EndpointAddr::new(listener.iroh().id()).with_ip_addr(socket);
         let (client, server) = tokio::join!(dialer.iroh().connect(address, LINK_ALPN), async {
@@ -1133,7 +1290,7 @@ mod tests {
                     {
                         let mut state = peer.state();
                         assert!(
-                            shared.admit(&peer, &mut state, early, None, [1; 16])
+                            shared.admit(&peer, &mut state, early, None, [1; 16], None)
                                 == DialResult::Ready
                         );
                         let expected = if winner_first {
@@ -1141,7 +1298,9 @@ mod tests {
                         } else {
                             DialResult::Ready
                         };
-                        assert!(shared.admit(&peer, &mut state, late, None, [1; 16]) == expected);
+                        assert!(
+                            shared.admit(&peer, &mut state, late, None, [1; 16], None) == expected
+                        );
                         assert!(state.is_current(winner));
                         assert!(loser.close_reason().is_some());
                     }
@@ -1183,17 +1342,22 @@ mod tests {
             let (original, _original_remote) = connect(&local, &remote).await;
             let (_delayed_remote, delayed) = connect(&remote, &local).await;
             let (new, _new_remote) = connect(&local, &remote).await;
-            {
+            let captured_original = {
                 let mut state = peer.state();
                 let old = [1; 16];
                 let restarted = [2; 16];
-                assert!(shared.admit(&peer, &mut state, &original, None, old) == DialResult::Ready);
                 assert!(
-                    shared.admit(&peer, &mut state, &new, Some(old), restarted)
+                    shared.admit(&peer, &mut state, &original, None, old, None)
+                        == DialResult::Ready
+                );
+                let captured = Arc::downgrade(&state.active.as_ref().unwrap().connection);
+                assert!(
+                    shared.admit(&peer, &mut state, &new, Some(old), restarted, None)
                         == DialResult::Ready
                 );
                 assert!(state.is_current(&new));
-            }
+                captured
+            };
 
             new.close(CLOSE_LINK.into(), b"");
             drive(Arc::clone(&shared), Arc::clone(&peer), new).await;
@@ -1201,8 +1365,14 @@ mod tests {
                 let mut state = peer.state();
                 assert!(state.active.is_none());
                 assert!(
-                    shared.admit(&peer, &mut state, &delayed, Some([1; 16]), [1; 16])
-                        == DialResult::Replaced
+                    shared.admit(
+                        &peer,
+                        &mut state,
+                        &delayed,
+                        Some([1; 16]),
+                        [1; 16],
+                        Some(&captured_original),
+                    ) == DialResult::Replaced
                 );
                 assert!(state.active.is_none());
             }
@@ -1211,6 +1381,62 @@ mod tests {
         })
         .await
         .expect("reject a delayed generation before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn stale_connection_cannot_change_active_stream_credit_observation() {
+        let budget = Duration::from_secs(10);
+        timeout(budget, async {
+            let local = loopback_endpoint().await;
+            let remote = loopback_endpoint().await;
+            let remote_id = remote.iroh().id();
+            local
+                .authorizer()
+                .replace_peers([(remote_id, "peer".into())]);
+            remote
+                .authorizer()
+                .replace_peers([(local.iroh().id(), "peer".into())]);
+            let (shared, _inbox) = Shared::new(
+                &local,
+                LinkConfig {
+                    connect_timeout: budget,
+                    send_deadline: budget,
+                },
+            );
+            let peer = shared.peer(remote_id).unwrap();
+            let (stale, _stale_remote) = connect(&local, &remote).await;
+            let (current, _current_remote) = connect(&local, &remote).await;
+            let window = Duration::from_secs(6);
+            let since = Instant::now() - window;
+            let received = current.stats().frame_rx;
+            {
+                let mut state = peer.state();
+                assert!(
+                    shared.admit(&peer, &mut state, &current, None, [1; 16], None)
+                        == DialResult::Ready
+                );
+                state.active.as_mut().unwrap().stream_credit_wait =
+                    Some(StreamCreditWait { since, received });
+            }
+            assert!(stale.close_reason().is_none());
+            assert!(peer.state().is_current(&current));
+
+            assert_eq!(peer.stream_credit_wait(&stale, window), Ok(None));
+
+            {
+                let state = peer.state();
+                assert!(state.is_current(&current));
+                let active = state.active.as_ref().unwrap();
+                let wait = active.stream_credit_wait.as_ref().unwrap();
+                assert_eq!(wait.since, since);
+                assert_eq!(wait.received, received);
+            }
+            assert!(stale.close_reason().is_none());
+            shared.stop();
+            tokio::join!(local.iroh().close(), remote.iroh().close());
+        })
+        .await
+        .expect("check a stale connection before the test deadline");
     }
 
     #[tokio::test]
@@ -1236,8 +1462,10 @@ mod tests {
             let peer = shared.peer(remote_id).unwrap();
             let (client, server) = connect(&remote, &local).await;
             assert!(
-                shared.admit(&peer, &mut peer.state(), &server, None, [1; 16]) == DialResult::Ready
+                shared.admit(&peer, &mut peer.state(), &server, None, [1; 16], None)
+                    == DialResult::Ready
             );
+            let lease = Arc::clone(&peer.state().active.as_ref().unwrap().connection);
 
             let chat = ChatMessage {
                 id: "probe".into(),
@@ -1270,7 +1498,7 @@ mod tests {
                 },
                 async {
                     let (send, recv) = server.accept_bi().await.unwrap();
-                    receive_chat(&shared, &peer, &server, send, recv).await;
+                    receive_stream(&shared, &peer, &lease, send, recv).await;
                 }
             );
             assert_eq!(reply, Ok(ChatReply::Nack(NackReason::Unavailable)));
