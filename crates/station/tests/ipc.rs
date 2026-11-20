@@ -519,18 +519,20 @@ async fn a_client_of_another_version_gets_the_hello_reply_and_is_closed() {
             ..IpcConfig::default()
         })
         .await;
-        let mut stream = raw_connect(rig.path()).await;
-        let hello = raw_hello(&mut stream, API_VERSION + 1).await;
-        assert_eq!(hello.api, API_VERSION);
-        assert_eq!(hello.station_id, "STATION-A");
-        // A call after the mismatched hello is never answered: the stream ends.
-        let open = Open::Call {
-            request: Request::Status,
-        };
-        let _ = write_frame(&mut stream, &open, LOCAL_FRAME_MAX).await;
-        match raw_read::<Reply>(&mut stream).await {
-            Err(FrameError::Closed | FrameError::Io(_)) => {}
-            other => panic!("expected the end of the stream, got {other:?}"),
+        for client_api in [API_VERSION - 1, API_VERSION + 1] {
+            let mut stream = raw_connect(rig.path()).await;
+            let hello = raw_hello(&mut stream, client_api).await;
+            assert_eq!(hello.api, API_VERSION);
+            assert_eq!(hello.station_id, "STATION-A");
+            // A call after the mismatched hello is never answered: the stream ends.
+            let open = Open::Call {
+                request: Request::Status,
+            };
+            let _ = write_frame(&mut stream, &open, LOCAL_FRAME_MAX).await;
+            match raw_read::<Reply>(&mut stream).await {
+                Err(FrameError::Closed | FrameError::Io(_)) => {}
+                other => panic!("expected client API {client_api} to close, got {other:?}"),
+            }
         }
         let status_calls = rig
             .fake
@@ -546,6 +548,7 @@ async fn a_client_of_another_version_gets_the_hello_reply_and_is_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_transport_reports_a_station_of_another_version() {
     bounded(async {
+        let previous_api = API_VERSION - 1;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("station.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -554,7 +557,7 @@ async fn socket_transport_reports_a_station_of_another_version() {
             let hello: Hello = raw_read(&mut stream).await.unwrap();
             assert_eq!(hello.api, API_VERSION);
             let reply = HelloReply {
-                api: API_VERSION + 1,
+                api: previous_api,
                 station_id: "STATION-A".into(),
                 instance_id: "INSTANCE-1".into(),
             };
@@ -566,7 +569,7 @@ async fn socket_transport_reports_a_station_of_another_version() {
         assert_eq!(
             c.status().await.unwrap_err(),
             ApiError::IncompatibleApi {
-                station: API_VERSION + 1,
+                station: previous_api,
                 client: API_VERSION
             }
         );

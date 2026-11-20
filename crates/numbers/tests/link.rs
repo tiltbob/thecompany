@@ -833,6 +833,63 @@ async fn malformed_hello_and_invalid_streams_are_rejected_without_blocking_chat(
 }
 
 #[tokio::test]
+async fn receiver_deadline_resets_a_chat_held_by_the_application() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let conn = dial(&peer, &address).await;
+            let (mut send, remote) =
+                begin_hello(&conn, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            finish_hello(&mut send, &remote).await;
+            wait_for_path(&link.handle(), peer_id, LinkPath::Direct).await;
+
+            let chat = message(
+                "held-reply",
+                "the application receives this chat without answering",
+            );
+            let header = StreamHeader::chat();
+            // Hold the application's reply sender while the raw peer waits for the reset.
+            let (response, held) = checked(
+                timeout(SEND_DEADLINE + Duration::from_secs(1), async {
+                    tokio::join!(request(&conn, &header, &chat), inbox.recv())
+                })
+                .await,
+                "reset the unanswered chat by the receiver deadline",
+            );
+            let held = held.expect("receive the complete chat before it times out");
+            assert_delivery(&held, peer_id, "second", &chat);
+            assert!(matches!(
+                response,
+                Err(FrameError::Io(error)) if matches!(
+                    error.get_ref().and_then(|source| source.downcast_ref::<ReadError>()),
+                    Some(ReadError::Reset(code)) if code.into_inner() == 0
+                )
+            ));
+            assert!(conn.close_reason().is_none());
+            drop(held);
+
+            let next = message("after-deadline", "another stream can still use this link");
+            let (reply, ()) = tokio::join!(
+                request(&conn, &header, &next),
+                acknowledge(&mut inbox, peer_id, "second", &next),
+            );
+            assert_eq!(
+                checked(reply, "read ACK after a receiver deadline"),
+                ChatReply::Ack
+            );
+            checked(link.shutdown().await, "stop link after receiver deadline");
+            peer.iroh().close().await;
+        })
+        .await,
+        "receiver reply deadline test timed out",
+    );
+}
+
+#[tokio::test]
 async fn outgoing_hello_rejects_missing_and_wrong_server_echoes() {
     checked(
         timeout(CASE_TIMEOUT, async {
@@ -1154,6 +1211,118 @@ async fn while_sending<T>(
 async fn expect_close(conn: &Connection, code: u64) {
     assert!(
         matches!(conn.closed().await, ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == code)
+    );
+}
+
+async fn start_link_for_close_wait() -> (Link, Endpoint, Arc<Authorizer>) {
+    let (endpoint, auth) = bind_direct().await;
+    let (peer, peer_auth) = bind_direct().await;
+    allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+    add_address(&endpoint, loopback_address(&peer));
+    peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+    let (link, _) = Link::start(
+        endpoint,
+        LinkConfig {
+            send_deadline: PROBE_TIMEOUT,
+            ..config()
+        },
+    );
+    (link, peer, auth)
+}
+
+async fn reset_first_chat(peer: &Endpoint, chat: &ChatMessage) -> Connection {
+    let (conn, mut hello) = accept_hello(peer).await;
+    hello.reply(RAW_GENERATION, [1; 16]).await;
+    hello.confirm([1; 16]).await;
+    let (mut ack, _) = accept_chat(&conn, chat).await;
+    checked(ack.reset(0u32.into()), "reset the chat reply stream");
+    conn
+}
+
+#[tokio::test]
+async fn chat_retry_waits_for_a_later_replacement_close() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (link, peer, _) = start_link_for_close_wait().await;
+            let handle = link.handle();
+            let chat = message("replacement-close", "retry after the replacement close");
+            let mut send = pin!(handle.send(peer.iroh().id(), chat.clone()));
+            let first = while_sending(send.as_mut(), reset_first_chat(&peer, &chat)).await;
+            // Leave the connection open while the sender processes the stream reset.
+            while_sending(send.as_mut(), sleep(Duration::from_millis(300))).await;
+            first.close(409u32.into(), b"");
+
+            let (reply, second) = tokio::join!(send, async {
+                let (second, mut hello) = accept_hello(&peer).await;
+                hello.reply(RAW_GENERATION, [2; 16]).await;
+                hello.confirm([2; 16]).await;
+                reply_to_chat(&second, &chat).await;
+                second
+            });
+            assert_eq!(reply, Ok(ChatReply::Ack));
+            assert!(second.close_reason().is_none());
+            checked(
+                link.shutdown().await,
+                "stop link after the replacement retry",
+            );
+            peer.iroh().close().await;
+        })
+        .await,
+        "late replacement close test timed out",
+    );
+}
+
+#[tokio::test]
+async fn chat_reset_on_an_open_connection_waits_only_its_connect_budget() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (link, peer, _) = start_link_for_close_wait().await;
+            let handle = link.handle();
+            let chat = message("reset", "the connection stays open after the reset");
+            let mut send = pin!(handle.send(peer.iroh().id(), chat.clone()));
+            let first = while_sending(send.as_mut(), reset_first_chat(&peer, &chat)).await;
+            let reset_at = Instant::now();
+            // Leave plenty of send budget beyond this outer test bound so a longer
+            // wait cannot pass merely because the send's own overall deadline fires.
+            let reply = checked(
+                timeout(CONNECT_TIMEOUT + Duration::from_secs(1), send).await,
+                "send remained pending past the close wait",
+            );
+            assert_eq!(reply, Err(SendError::Disconnected));
+            assert!(reset_at.elapsed() >= CONNECT_TIMEOUT - Duration::from_millis(250));
+            assert!(first.close_reason().is_none());
+            checked(link.shutdown().await, "stop link after the reset wait");
+            peer.iroh().close().await;
+        })
+        .await,
+        "open connection reset test timed out",
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_peer_ends_a_send_waiting_for_a_close() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (link, peer, auth) = start_link_for_close_wait().await;
+            let handle = link.handle();
+            let peer_id = peer.iroh().id();
+            let chat = message("revoked", "revoke while waiting for close");
+            let mut send = pin!(handle.send(peer_id, chat.clone()));
+            let _first = while_sending(send.as_mut(), reset_first_chat(&peer, &chat)).await;
+            while_sending(send.as_mut(), sleep(Duration::from_millis(300))).await;
+
+            auth.replace_peers([]);
+            handle.close_peer(peer_id);
+            let reply = checked(
+                timeout(Duration::from_secs(1), send).await,
+                "revocation did not wake the send",
+            );
+            assert_eq!(reply, Err(SendError::Closed));
+            checked(link.shutdown().await, "stop link after revocation");
+            peer.iroh().close().await;
+        })
+        .await,
+        "revocation during close wait test timed out",
     );
 }
 
