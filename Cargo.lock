@@ -2058,6 +2058,8 @@ dependencies = [
  "n0-future",
  "numbers-base",
  "numbers-tower",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "url",
