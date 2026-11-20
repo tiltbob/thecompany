@@ -490,7 +490,9 @@ impl AccessControl for Members {
   denied for 45 s (one moved after 44.8 s). `remove_relay(denying)` brought each online through the
   other in 215–301 ms; `insert_relay` of the admitting tower while homed on the denying one did not
   help (2 of 15 online in about 220 ms, 4 after 46–50 s, 9 not within 60 s) (observed, not
-  documented). What a station does on `auth_denied_reason()` is an open decision (#74).
+  documented). What a station does on `auth_denied_reason()` is decided in #74: it marks the
+  tower as denied and shows the reason, takes it out of the relay map when another tower of the
+  set is left, and otherwise changes nothing and does not nudge.
 - **Changing the list.** Removing an id does not end its open relay connection. The service handle
   does:
   ```rust
@@ -598,7 +600,7 @@ pub async fn lookup(
 - Priority and weight are ignored. SRV carries no QAD port, so SRV-located towers get QAD on UDP
   7842; a tower that does not serve it costs every station 3 s at each first report (above).
 - SRV only bootstraps. Tower sets passed on by peers are exchanged and shown, never used
-  automatically (#73). Recovering a lost tower is an open decision (#74).
+  automatically (#73). Recovering a lost tower is the station watchdog of #74.
 
 **Several towers.** One home tower at a time, chosen by latency (HTTPS probe, QAD if configured).
 ```rust
@@ -622,8 +624,8 @@ let removed = ep.remove_relay(&tower_url).await;
   `remove_relay` + `insert_relay` of the dead tower 1 s after the stop 1.22–1.44 s; with TLS towers
   and QAD (QAD probes run in every report) 22.0–27.5 s, and 44.9–46.5 s in a namespace where QAD
   does not run. Meanwhile the status shows the dead tower, not connected, `last_error` "Failed to
-  connect to relay server". Whether a station watches for this and nudges is an open decision
-  (#74).
+  connect to relay server". A station watches for this and nudges (decided in #74, built in
+  #78).
 - **Hysteresis.** A new home must measure under 2/3 of the old one's latency. After the stopped
   tower came back, home moved back to it within 50 s in 6 of 25 runs; on loopback this is noise.
 - **An open relayed connection does not move.** When the tower carrying its selected path stopped,

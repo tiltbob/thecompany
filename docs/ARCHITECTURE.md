@@ -144,7 +144,8 @@ A tower embeds an `iroh-relay` server. Every node keeps a connection to one towe
 by id through the towers, and iroh moves the connection to a direct path when it can. When that
 tower dies, iroh moves the node to another tower only after about two net reports (41–49 s), and a
 connection relayed through the dead tower does not move: it ends at the idle timeout and is dialed
-again. Whether a station watches for this and moves sooner is an open decision (#74).
+again. So a station watches its home tower and, when it has none or the tower is not connected,
+removes and re-inserts the tower, which makes iroh probe at once (decided in #74, built in #78).
 
 - **SRV only bootstraps.** A newcomer resolves `_numbers._tcp.<domain>` (SRV) to
   `https://target:port` to reach its first tower; `--tower <url>` does the same by hand for
