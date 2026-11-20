@@ -26,9 +26,9 @@
 //! the station, drops the call or subscription and closes without an answer. A client therefore
 //! keeps its write half open until it has read its [`wire::Reply`] (on a subscription, for as long
 //! as it wants events); one that shuts its write half down after `Open` may get no answer. A call
-//! whose answer never arrived may still have been carried out. [`SocketTransport`] never shuts
-//! down its write half: it closes the whole connection, by dropping it, only when it is done with
-//! it.
+//! whose answer never arrived may still have been carried out (rule 12 in [`crate::api`]).
+//! [`SocketTransport`] never shuts down its write half: it closes the whole connection, by
+//! dropping it, only when it is done with it.
 //!
 //! Unix only.
 

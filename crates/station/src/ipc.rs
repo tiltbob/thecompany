@@ -38,7 +38,8 @@
 //! Dropping the future means only that the server stops waiting for the answer. Whether the request
 //! was carried out is the transport's business: a station finishes a change it has already
 //! accepted, whether or not anyone still waits for its answer. The client never saw an answer and
-//! must treat the call as one that may have been carried out. A subscription that was being opened
+//! must treat the call as one that may have been carried out (rule 12 in [`chief::api`]). A
+//! subscription that was being opened
 //! leaves no registration behind: its [`Subscription`] is dropped with the future, or, if the
 //! station had already registered it, when writing `Reply::Subscribed` fails or as soon as the
 //! forwarding of its events sees the client gone.
