@@ -1094,11 +1094,14 @@ async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeo
             );
             assert_eq!(handle.path(peer_id), LinkPath::Down);
             assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
-            checked(link.shutdown().await, "stop link after a silent dialer");
+            checked(
+                link.shutdown().await,
+                "stop link after the silent and the stalled dialer",
+            );
             peer.iroh().close().await;
         })
         .await,
-        "silent dialer test timed out",
+        "silent and stalled dialer test timed out",
     );
 }
 
