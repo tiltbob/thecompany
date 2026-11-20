@@ -96,7 +96,7 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; strips control characters from peer text; usable in-process as a `Transport` |
 | `crates/station/src/ipc.rs` | the socket server (rules below); hello `{api: 1}` answered with the station's API version, the station id and a per-start instance id; one connection per call or subscription; read deadlines on calls, never on an open subscription |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
-| `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
+| `crates/chief-cli/src/lib.rs`, `main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log`; the whole CLI is a library generic over `Transport` (tested in-process), `main.rs` only wires it to the socket; exit 0 done, 1 refused or failed, 2 usage, 3 no station |
 
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when
