@@ -4,11 +4,12 @@
 //! `example.test` are used.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use numbers::bootstrap::{DEFAULT_LOCATE_TIMEOUT, SRV_SERVICE, srv_name, towers_from_srv};
 use numbers::testing::FakeDns;
-use numbers::{DnsLocator, LocateError, Locator, TowerSet};
+use numbers::{DnsLocator, LocateError, LocateFuture, Locator, TowerSet};
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -360,6 +361,70 @@ async fn system_locator_is_built_without_io() {
         // Constructed only: never queried, so no test reaches a real resolver.
         let locator = DnsLocator::system();
         assert_eq!(format!("{locator:?}"), "DnsLocator { .. }");
+    })
+    .await;
+}
+
+// The trait as the station holds it: `Arc<dyn Locator>`.
+
+// Compile-time: `dyn Locator` and `Arc<dyn Locator>` are `Send + Sync`, and so is what holds them;
+// the future `locate` returns is `Send`.
+const _: () = {
+    const fn send_sync<T: Send + Sync + ?Sized>() {}
+    const fn send<T: Send + ?Sized>() {}
+    send_sync::<dyn Locator>();
+    send_sync::<Arc<dyn Locator>>();
+    send::<LocateFuture<'static>>();
+};
+
+/// A locator that answers every domain with a fixed result, as the station's tests will use.
+struct FixedLocator(Result<Vec<String>, ()>);
+
+impl Locator for FixedLocator {
+    fn locate<'a>(&'a self, _domain: &'a str) -> LocateFuture<'a> {
+        let result = self.0.clone().map_err(|()| LocateError::NoTower);
+        Box::pin(async move { result })
+    }
+}
+
+/// Generic use, the other way a caller may hold a locator.
+async fn via_generic<L: Locator>(locator: &L, domain: &str) -> Result<Vec<String>, LocateError> {
+    locator.locate(domain).await
+}
+
+#[tokio::test]
+async fn dns_locator_through_arc_dyn() {
+    bounded(TEST_TIMEOUT, async {
+        let (dns, locator) = server().await;
+        dns.set_srv(SRV, &[("b.example.test", 3340), ("a.example.test", 443)]);
+        let shared: Arc<dyn Locator> = Arc::new(locator);
+        let expected = ["https://a.example.test/", "https://b.example.test:3340/"];
+        assert_eq!(shared.locate(DOMAIN).await.unwrap(), expected);
+        // `Arc<dyn Locator>` is itself a `Locator`, so it also goes where one is expected.
+        assert_eq!(via_generic(&shared, DOMAIN).await.unwrap(), expected);
+        // The future can move to another task.
+        let task = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.locate(DOMAIN).await }
+        });
+        assert_eq!(task.await.unwrap().unwrap(), expected);
+        assert_eq!(dns.query_count(), 3);
+        assert_only_srv_queries(&dns);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn hand_written_locator_as_arc_dyn() {
+    bounded(TEST_TIMEOUT, async {
+        let towers = vec!["https://a.example.test/".to_owned()];
+        let found: Arc<dyn Locator> = Arc::new(FixedLocator(Ok(towers.clone())));
+        let none: Arc<dyn Locator> = Arc::new(FixedLocator(Err(())));
+        assert_eq!(found.locate(DOMAIN).await.unwrap(), towers);
+        let err = none.locate(DOMAIN).await.unwrap_err();
+        assert!(matches!(err, LocateError::NoTower), "{err:?}");
+        let locators: Vec<Arc<dyn Locator>> = vec![found, none];
+        assert_eq!(locators.len(), 2);
     })
     .await;
 }

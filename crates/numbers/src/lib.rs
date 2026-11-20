@@ -14,7 +14,7 @@ pub mod identity;
 pub mod testing;
 pub mod towers;
 
-pub use bootstrap::{DnsLocator, LocateError, Locator};
+pub use bootstrap::{DnsLocator, LocateError, LocateFuture, Locator};
 pub use endpoint::{
     Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
 };

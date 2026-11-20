@@ -28,6 +28,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use n0_dns_resolver::{DnsProtocol, DnsResolver, Nameserver};
@@ -135,14 +137,28 @@ fn is_host_name(name: &str) -> bool {
         })
 }
 
+/// The future [`Locator::locate`] returns: boxed, `Send`, and borrowing the locator and the domain.
+pub type LocateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<String>, LocateError>> + Send + 'a>>;
+
 /// Finds the tower URLs a domain names.
 ///
-/// The station holds a `Locator`. [`DnsLocator`] is the real one; tests can supply their own.
+/// The station holds a `Locator` as `Arc<dyn Locator>`. [`DnsLocator`] is the real one; tests can
+/// supply their own. The trait is object-safe, so `locate` returns a boxed future
+/// ([`LocateFuture`]) rather than an `impl Future`. A lookup happens rarely, so the allocation does
+/// not matter.
 pub trait Locator: Send + Sync {
     /// Returns the canonical tower URLs for `domain`, as [`towers_from_srv`] makes them. The list
     /// is never empty: a domain that names no tower is [`LocateError::NoTower`].
-    fn locate(&self, domain: &str)
-    -> impl Future<Output = Result<Vec<String>, LocateError>> + Send;
+    fn locate<'a>(&'a self, domain: &'a str) -> LocateFuture<'a>;
+}
+
+/// A shared locator is a locator: an `Arc<DnsLocator>` or an `Arc<dyn Locator>` can be passed
+/// wherever a `Locator` is expected. It forwards to the locator inside.
+impl<L: Locator + ?Sized> Locator for Arc<L> {
+    fn locate<'a>(&'a self, domain: &'a str) -> LocateFuture<'a> {
+        (**self).locate(domain)
+    }
 }
 
 /// A [`Locator`] that asks DNS for the domain's SRV record, through n0-dns-resolver.
@@ -204,7 +220,14 @@ impl Locator for DnsLocator {
     /// (a TTL of 0 is not cached), with no minimum TTL; it serves no stale answers; and it caches no
     /// negative answers (NXDOMAIN, an empty answer), since negative caching is off unless the
     /// builder asks for it.
-    async fn locate(&self, domain: &str) -> Result<Vec<String>, LocateError> {
+    fn locate<'a>(&'a self, domain: &'a str) -> LocateFuture<'a> {
+        Box::pin(self.lookup(domain))
+    }
+}
+
+impl DnsLocator {
+    /// The body of [`Locator::locate`] for `DnsLocator`, before it is boxed.
+    async fn lookup(&self, domain: &str) -> Result<Vec<String>, LocateError> {
         let name = srv_name(domain)?;
         if self.timeout.is_zero() {
             return Err(LocateError::Timeout);
