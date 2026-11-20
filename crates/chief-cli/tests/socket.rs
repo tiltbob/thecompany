@@ -418,8 +418,17 @@ async fn a_chat_never_sends_to_another_instance_that_took_the_socket() {
     .await;
 }
 
+/// The end wins: a line typed as the instance ends is not sent, and the chat ends once.
+///
+/// The line and the end of the subscription are both ready when the chat is polled again. The
+/// biased `select!` takes the end of the live view first, and the chat drops the line's send
+/// before it has reached any station (in every run observed; the test accepts either way the
+/// chat may then describe the line). It does not prove that sends are bound: the line never
+/// reaches the next instance whether or not they are. That is
+/// `a_chat_never_sends_to_another_instance_that_took_the_socket`, which holds the end of the
+/// subscription back until the send has run.
 #[tokio::test]
-async fn a_typed_line_and_the_end_of_the_instance_ready_together_never_reach_the_next_one() {
+async fn the_end_of_the_instance_wins_over_a_line_typed_as_it_ends() {
     bounded(async {
         let rig = rig().await;
         let path = rig.server.path().to_path_buf();

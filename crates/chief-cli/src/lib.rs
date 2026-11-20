@@ -120,7 +120,8 @@
 //!   body. Its second field is an arrow, where a message line has a time.
 //! - `status`: `tower <url> <state>` per tower, with the state `connecting`, `connected`,
 //!   `failing: <error>` or `denied: <reason>`; then `peer <name> <station-id> <link>` per peer
-//!   station, with the link `down`, `relayed` or `direct`, or `no peers`.
+//!   station, with the link `down`, `relayed` or `direct`. `no towers` stands for an empty list of
+//!   towers, `no peers` for an empty peer book.
 //! - `peer ls` and `peer add`: `<name> <station-id> <link>` per peer station; `peer ls` says
 //!   `no peers` when the book is empty.
 //! - `peer rm`: `removed <name>`. `send`: `delivered to <peer>`. An empty `log`: `no messages`.
@@ -163,7 +164,7 @@ pub const CHAT_TAIL: u32 = 50;
 
 /// How many typed lines `chat` reads ahead while one is being sent. Further lines stay unread in
 /// the input until there is room.
-const CHAT_QUEUE_MAX: usize = 64;
+pub const CHAT_QUEUE_MAX: usize = 64;
 
 /// How many messages `log` reads at most, far above what a station keeps (M1 keeps 1,000): a
 /// station whose pages add up to more is answering nonsense ([`ApiError::BadReply`]).

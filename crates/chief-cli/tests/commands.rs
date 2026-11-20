@@ -11,8 +11,8 @@ use chief::client::{BindInstance, Client, SUBSCRIPTION_CAPACITY, Subscription, T
 use chief::fake::{FAKE_LOG_CAPACITY, FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
-    AFTER_HELP, Cli, Command, Exit, LOG_MAX_MESSAGES, PeerCommand, format_change, format_message,
-    format_time, run, say, socket_path,
+    AFTER_HELP, CHAT_QUEUE_MAX, Cli, Command, Exit, LOG_MAX_MESSAGES, PeerCommand, format_change,
+    format_message, format_time, run, say, socket_path,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -349,6 +349,59 @@ async fn status_shows_each_tower_state_and_each_link() {
                 )
             );
         }
+    })
+    .await;
+}
+
+/// A fake whose `Status` has no towers.
+#[derive(Clone)]
+struct NoTowers(FakeStation);
+
+impl Transport for NoTowers {
+    async fn call(&self, request: Request) -> Result<Response, ApiError> {
+        match self.0.call(request).await? {
+            Response::Status { status } => Ok(Response::Status {
+                status: Status {
+                    towers: Vec::new(),
+                    ..status
+                },
+            }),
+            other => Ok(other),
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        self.0.subscribe().await
+    }
+}
+
+impl BindInstance for NoTowers {
+    fn bound_to(&self, instance_id: &str) -> Self {
+        Self(self.0.bound_to(instance_id))
+    }
+}
+
+#[tokio::test]
+async fn status_without_towers_says_so() {
+    bounded(async {
+        let c = Client::new(NoTowers(fake_with_peers().await));
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (
+                Exit::Done,
+                "no towers\npeer alice STATION-AL down\npeer bob STATION-B down\n".to_owned(),
+                String::new()
+            )
+        );
+        let c = Client::new(NoTowers(FakeStation::new("STATION-A", "INSTANCE-1")));
+        assert_eq!(
+            exec(&c, &["status"]).await,
+            (
+                Exit::Done,
+                "no towers\nno peers\n".to_owned(),
+                String::new()
+            )
+        );
     })
     .await;
 }
@@ -1218,15 +1271,11 @@ impl Taken {
 /// sender is dropped. The chat has taken a chunk once [`Taken`] counts it: the chat's poll that
 /// took it has read every line in it before the test runs again.
 struct Chunks {
-    rx: tokio::sync::mpsc::UnboundedReceiver<&'static [u8]>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     taken: Taken,
 }
 
-fn chunks() -> (
-    tokio::sync::mpsc::UnboundedSender<&'static [u8]>,
-    Chunks,
-    Taken,
-) {
+fn chunks() -> (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Chunks, Taken) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let taken = Taken::default();
     (
@@ -1247,7 +1296,7 @@ impl AsyncRead for Chunks {
     ) -> Poll<std::io::Result<()>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(chunk)) => {
-                buf.put_slice(chunk);
+                buf.put_slice(&chunk);
                 *self.taken.n.lock().unwrap() += 1;
                 self.taken.changed.notify_waiters();
                 Poll::Ready(Ok(()))
@@ -1269,13 +1318,13 @@ async fn a_line_split_across_reads_survives_a_live_message_between_its_halves() 
         let (session, out, err) = chat_on(&c, &command, input);
         let drive = async {
             fake.wait_for_subscribers(1).await;
-            tx.send(b"hel").unwrap();
+            tx.send(b"hel".to_vec()).unwrap();
             taken.wait_for(1).await;
             // The follower's branch wins the select: the read of the line is dropped between
             // its halves.
             fake.receive("alice", "between").unwrap();
             out.wait_for(|s| s.ends_with("<- alice between\n")).await;
-            tx.send(b"lo\n").unwrap();
+            tx.send(b"lo\n".to_vec()).unwrap();
             out.wait_for(|s| s.contains("-> bob (sending) hello\n"))
                 .await;
             drop(tx);
@@ -1299,7 +1348,7 @@ async fn a_chat_that_ends_early_reports_the_line_in_flight_and_the_lines_queued(
         let (session, _out, err) = chat_on(&c, &command, input);
         let drive = async {
             fake.wait_for_subscribers(1).await;
-            tx.send(b"one\ntwo\nthree\n").unwrap();
+            tx.send(b"one\ntwo\nthree\n".to_vec()).unwrap();
             taken.wait_for(1).await;
             gate.wait_held(1).await;
             fake.stop();
@@ -1697,6 +1746,43 @@ async fn chat_never_sends_to_an_instance_restarted_inside_the_send() {
     .await;
 }
 
+#[tokio::test]
+async fn a_chat_whose_station_restarts_before_its_follower_attaches_shows_nothing() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.receive("bob", "before").unwrap();
+        let c = Client::new(fake.clone());
+        // The chat's own status is the first; the follower's first status is the second.
+        restart_on(&fake, 2, |r| matches!(r, Request::Status));
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, input) = chat(&c, &command);
+        let exit = tokio::select! {
+            exit = session => exit,
+            () = out.wait_for(|s| !s.is_empty()) => {
+                panic!("the chat showed messages of another instance: {:?}", out.text())
+            }
+        };
+        drop(input);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(out.text(), "");
+        let err = err.text();
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.starts_with("lost the connection to the station: "),
+            "{err}"
+        );
+        // Nothing reached the new instance: no subscription, no page of its log.
+        assert_eq!(fake.subscriber_count(), 0);
+        assert!(
+            !fake
+                .requests()
+                .iter()
+                .any(|r| matches!(r, Request::Log { .. }))
+        );
+    })
+    .await;
+}
+
 // chat keeps reading while a send is pending (finding 3 of the review of #51).
 
 /// Where [`Gated`] holds a `Send`.
@@ -1927,6 +2013,43 @@ async fn typed_lines_are_sent_one_at_a_time_in_order() {
         assert_eq!(exit, Exit::Done);
         assert_eq!(err.text(), "");
         assert_eq!(sends(&fake), ["one", "two", "three"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn chat_stops_reading_while_its_queue_is_full() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        // One line per chunk, so that the chunks the chat took are the lines it read.
+        let lines: Vec<String> = (0..3 * CHAT_QUEUE_MAX)
+            .map(|i| format!("l{i:03}"))
+            .collect();
+        let (tx, input, taken) = chunks();
+        let (session, _out, err) = chat_on(&c, &command, input);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            for l in &lines {
+                tx.send(format!("{l}\n").into_bytes()).unwrap();
+            }
+            gate.wait_held(1).await;
+            // Every line is ready to be read: let the chat run until it has nothing left to do.
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+            }
+            // One line in flight, CHAT_QUEUE_MAX waiting, and no more read.
+            assert_eq!(*taken.n.lock().unwrap(), 1 + CHAT_QUEUE_MAX);
+            assert_eq!(sends(&fake).len(), 0);
+            gate.release(lines.len());
+            drop(tx);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!((exit, err.text().as_str()), (Exit::Done, ""));
+        assert_eq!(sends(&fake), lines);
     })
     .await;
 }
