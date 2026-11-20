@@ -322,6 +322,9 @@ mod tests {
         // 3 labels of 63, one of 61 and 3 dots: exactly 253 characters.
         let longest = format!("{label63}.{label63}.{label63}.{}", "b".repeat(61));
         assert_eq!(longest.len(), 253);
+        // 3 labels of 63, one of 62 and 3 dots: one character over the limit.
+        let one_too_long = format!("{label63}.{label63}.{label63}.{}", "b".repeat(62));
+        assert_eq!(one_too_long.len(), 254);
         for refused in [
             "tower..example.com",
             "-tower.example.com",
@@ -330,6 +333,8 @@ mod tests {
             "tower;1.example.com",
             &format!("{label64}.example.com"),
             &too_long,
+            &one_too_long,
+            &format!("{one_too_long}."),
         ] {
             assert!(tower_url(refused, 443).is_err(), "accepted {refused}");
         }
@@ -382,6 +387,36 @@ mod tests {
             tower_url("::ffff:1.2.3.4", 8443).unwrap(),
             "https://[::ffff:102:304]:8443/"
         );
+    }
+
+    /// The defaults the docs of `TlsTower::new`, `TowerConfig::tls` and the bind constants
+    /// promise: HTTPS on all IPv4 interfaces at 443, address discovery on UDP 7842, the plain
+    /// HTTP listener on port 80, a reload once a day, and a dev tower's other defaults (no
+    /// allowlist, the default client rate, iroh-relay's burst).
+    #[test]
+    fn a_tls_tower_starts_from_the_documented_defaults() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+
+        let all = |port: u16| SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        assert_eq!(super::DEFAULT_HTTPS_BIND, all(443));
+        assert_eq!(super::DEFAULT_QAD_BIND, all(7842));
+        assert_eq!(super::DEFAULT_TLS_HTTP_BIND, all(80));
+
+        let tls = super::TlsTower::new("tower.example", "cert.pem", "key.pem");
+        assert_eq!(tls.hostname, "tower.example");
+        assert_eq!(tls.https_bind, super::DEFAULT_HTTPS_BIND);
+        assert_eq!(tls.qad_bind, Some(super::DEFAULT_QAD_BIND));
+        assert_eq!(tls.cert_path, std::path::Path::new("cert.pem"));
+        assert_eq!(tls.key_path, std::path::Path::new("key.pem"));
+        assert_eq!(tls.reload_interval, Duration::from_secs(24 * 60 * 60));
+
+        let config = crate::TowerConfig::tls(tls);
+        assert_eq!(config.bind, super::DEFAULT_TLS_HTTP_BIND);
+        assert!(config.tls.is_some());
+        assert_eq!(config.allow, None);
+        assert_eq!(config.client_rate, crate::DEFAULT_CLIENT_RATE);
+        assert_eq!(config.client_burst, None);
     }
 
     #[test]

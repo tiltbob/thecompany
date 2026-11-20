@@ -401,10 +401,135 @@ async fn reload(
 
 #[cfg(test)]
 mod tests {
-    use super::{TlsFileProblem, read};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rustls::crypto::CryptoProvider;
+    use rustls::sign::CertifiedKey;
+    use tokio::time::{Instant, sleep};
+
+    use super::{CurrentPair, Reloader, TlsFileProblem, load_pair, read};
 
     /// The cap the reader enforces.
     const CAP: usize = 64 * 1024;
+
+    /// The reload interval of the reload task tests: long, so that only the test moves time on.
+    const EVERY: Duration = Duration::from_secs(60 * 60);
+
+    /// A self-signed pair for 127.0.0.1 written as PEM files into `dir`, the provider, and the
+    /// pair loaded from the files.
+    fn pair_in(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, Arc<CryptoProvider>, CertifiedKey) {
+        let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cert, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let pair = load_pair(&provider, &cert, &key).unwrap();
+        (cert, key, provider, pair)
+    }
+
+    /// The pair the resolver hands out now.
+    fn in_use(current: &CurrentPair) -> Arc<CertifiedKey> {
+        Arc::clone(&current.0.read().unwrap())
+    }
+
+    /// The reload task keeps neither the resolver nor, once the reloader is dropped, the
+    /// provider alive: the resolver is gone as soon as its last holder drops it, and the
+    /// provider soon after the reloader is dropped, although the next reload is an hour away.
+    #[tokio::test]
+    async fn the_reload_task_holds_the_resolver_weakly_and_ends_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key, provider, pair) = pair_in(&dir);
+        let current = Arc::new(CurrentPair::new(pair));
+        let reloader =
+            Reloader::spawn(&current, provider, cert, key, Instant::now() + EVERY, EVERY);
+        let (resolver, provider) = reloader.watch.clone();
+
+        drop(current);
+        assert_eq!(resolver.strong_count(), 0);
+
+        drop(reloader);
+        // The aborted task lets go of the provider when the runtime next runs it; no event
+        // marks that, so poll under a bound that only a task that was not aborted can reach.
+        let released = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            while provider.strong_count() > 0 {
+                tick.tick().await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the reload task still holds the provider");
+    }
+
+    /// Waits on real time, through the blocking pool, until the pair in use is no longer `old`,
+    /// and returns it. A blocking task in flight stops paused time from moving on, so this
+    /// never lets a later reload run. 5000 round trips of at least 2 ms bound it at 10 s or more.
+    async fn replaced(current: &CurrentPair, old: &Arc<CertifiedKey>) -> Arc<CertifiedKey> {
+        for _ in 0..5000 {
+            let pair = in_use(current);
+            if !Arc::ptr_eq(&pair, old) {
+                return pair;
+            }
+            blocking_round_trip().await;
+        }
+        panic!("the due reload did not finish within 10 s");
+    }
+
+    /// One real round trip through the blocking pool, of at least 2 ms.
+    async fn blocking_round_trip() {
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2)))
+            .await
+            .unwrap();
+    }
+
+    /// The reload task reloads at its first deadline, not before, then once per interval: never
+    /// in between, and it keeps going.
+    ///
+    /// Time is paused. While a blocking task is in flight on a current-thread runtime, tokio does
+    /// not move paused time on by itself (`BlockingSchedule` in tokio's blocking pool inhibits
+    /// auto-advance until the task is released), so a test `sleep` that ends after a reload
+    /// deadline returns only once that reload has replaced the pair. Every pair read is kept
+    /// alive, so `Arc::ptr_eq` is a sound "same pair" check.
+    #[tokio::test(start_paused = true)]
+    async fn the_reload_task_reloads_once_per_interval_from_its_first_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key, provider, pair) = pair_in(&dir);
+        let current = Arc::new(CurrentPair::new(pair));
+        let first = in_use(&current);
+        let _reloader =
+            Reloader::spawn(&current, provider, cert, key, Instant::now() + EVERY, EVERY);
+
+        sleep(EVERY - Duration::from_secs(1)).await;
+        assert!(
+            Arc::ptr_eq(&in_use(&current), &first),
+            "reloaded before the first deadline"
+        );
+
+        // `advance`, not `sleep`: a reload task that never waits would keep the blocking pool
+        // busy, paused time would never move on, and a `sleep` would hang instead of failing.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let second = replaced(&current, &first).await;
+
+        // Real time passes, paused time does not: no reload is due, so none runs.
+        for _ in 0..50 {
+            blocking_round_trip().await;
+        }
+        assert!(
+            Arc::ptr_eq(&in_use(&current), &second),
+            "reloaded again before the next deadline"
+        );
+
+        // The reload ran at the time `advance` moved to, so the next one is due one interval
+        // later. Sleep one second past it, so that the test does not wake at the very instant
+        // the reload task does.
+        sleep(EVERY + Duration::from_secs(1)).await;
+        let third = in_use(&current);
+        assert!(
+            !Arc::ptr_eq(&third, &second) && !Arc::ptr_eq(&third, &first),
+            "no reload one interval later"
+        );
+    }
 
     /// The reader takes a file of exactly the cap, refuses one byte more, and returns the buffer
     /// it allocated up front: its capacity is the cap plus one, whatever the file's size.
