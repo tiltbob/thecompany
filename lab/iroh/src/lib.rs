@@ -9,6 +9,7 @@ pub mod paths;
 pub mod relay;
 pub mod tower;
 #[cfg(feature = "verbatim")]
+#[rustfmt::skip]
 mod verbatim;
 
 pub type Res<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

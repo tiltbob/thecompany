@@ -14,6 +14,13 @@ cd lab/iroh
 ```
 
 About 4.5 minutes. The last step reruns the suite inside a network namespace that has only
-loopback, which needs root for `unshare -n`. `src/verbatim.rs` holds the snippets as written, with
-the three fixes they need marked `FIX1` to `FIX3`; `tests/lab.rs` holds experiments T0 to T14 and
-prints one `MEASURE` line per number.
+loopback, which needs root for `unshare -n`. `src/verbatim.rs` is generated from the notes: every rust
+block of sections 2 to 10, byte for byte, wrapped only in functions that supply the free variables.
+Regenerate it after editing the notes and build it with the `verbatim` feature:
+
+```bash
+python3 -I scripts/gen-verbatim.py ../../docs/notes/iroh-snippets.md > src/verbatim.rs
+cargo build --locked --features verbatim
+```
+
+`tests/lab.rs` holds experiments T0 to T14 and prints one `MEASURE` line per number.
