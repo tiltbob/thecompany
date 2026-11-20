@@ -39,8 +39,10 @@
 //! checks every page against rule 6 in `chief::api`: its messages ascend by `seq`, lie below the
 //! cursor it was asked with, and its cursor is the `seq` of its first message; a page with a
 //! cursor is not empty. So the cursor moves back with every page. It stops at
-//! [`LOG_MAX_MESSAGES`] (100,000) messages, far more than a station keeps. A page that breaks a
-//! rule, or a log that runs past that, ends `log` with exit 3, one line, and nothing printed.
+//! [`LOG_MAX_MESSAGES`] (100,000) messages, or at [`LOG_MAX_BYTES`] (64 MiB) of text owned by the
+//! messages (bodies, peer names and ids), counted before a page is kept; both are far more than a
+//! station keeps. A page that breaks a rule, or a log that runs past either bound, ends `log` with
+//! exit 3, one line, and nothing printed.
 //!
 //! # send
 //!
@@ -183,6 +185,11 @@ pub const CHAT_QUEUE_MAX: usize = 64;
 /// station whose pages add up to more is answering nonsense ([`ApiError::BadReply`]).
 pub const LOG_MAX_MESSAGES: usize = 100_000;
 
+/// How many bytes of text the messages of a `log` may own in all (body, peer name and id): 64 MiB,
+/// four times the largest log a station keeps (1,000 messages of at most 16 KiB). A station whose
+/// pages add up to more is answering nonsense ([`ApiError::BadReply`]).
+pub const LOG_MAX_BYTES: usize = 64 << 20;
+
 /// How long `send` waits for the outcome of a message the station accepted, before it gives up
 /// with exit 3: a bound of its own, whatever the station's send deadline is.
 pub const SEND_OUTCOME_WAIT: Duration = Duration::from_secs(120);
@@ -197,9 +204,9 @@ Exit status:
   2  usage error
   3  cannot talk to a station: no socket path could be worked out, none is running, it speaks
      another API version, it is shutting down, the connection broke, it stopped answering, it
-     answered nonsense (such as a malformed page of the log, or a log longer than 100,000
-     messages), or it restarted during the command; for send: also when the outcome is unknown
-     (see chief send --help); for chat: the station stopped or restarted
+     answered nonsense (such as a malformed page of the log, or a log of more than 100,000
+     messages or 64 MiB of text), or it restarted during the command; for send: also when the
+     outcome is unknown (see chief send --help); for chat: the station stopped or restarted
 
 Without --station, the socket is $XDG_RUNTIME_DIR/thecompany/station.sock when XDG_RUNTIME_DIR is
 set, otherwise station.sock in the station's data dir, $XDG_DATA_HOME/thecompany/station (or
@@ -783,6 +790,7 @@ async fn log<T: BindInstance>(
     let mut pages: Vec<Vec<Message>> = Vec::new();
     let mut before: Option<u64> = None;
     let mut read = 0usize;
+    let mut bytes = 0usize;
     loop {
         let page = client.log(peer, before, LOG_PAGE_MAX_MESSAGES).await?;
         check_page(&page, before)?;
@@ -790,6 +798,17 @@ async fn log<T: BindInstance>(
         if read > LOG_MAX_MESSAGES {
             return Err(Stop::Api(ApiError::BadReply {
                 detail: format!("the log runs past {LOG_MAX_MESSAGES} messages"),
+            }));
+        }
+        // Checked before the page is kept: never more than the budget and the page in hand.
+        bytes = page
+            .messages
+            .iter()
+            .map(text_bytes)
+            .fold(bytes, usize::saturating_add);
+        if bytes > LOG_MAX_BYTES {
+            return Err(Stop::Api(ApiError::BadReply {
+                detail: format!("the log runs past {LOG_MAX_BYTES} bytes"),
             }));
         }
         let empty = page.messages.is_empty();
@@ -824,6 +843,12 @@ async fn log<T: BindInstance>(
         say(out, &format_message(&message))?;
     }
     Ok(Exit::Done)
+}
+
+/// The bytes of text `message` owns, as [`LOG_MAX_BYTES`] counts them: its body, peer name and
+/// id. Its status holds no text.
+fn text_bytes(message: &Message) -> usize {
+    message.body.len() + message.peer.len() + message.id.len()
 }
 
 /// Checks the shape of a page of the log asked with `before` (rule 6 in `chief::api`): its

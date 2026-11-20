@@ -11,8 +11,8 @@ use chief::client::{BindInstance, Client, SUBSCRIPTION_CAPACITY, Subscription, T
 use chief::fake::{FAKE_LOG_CAPACITY, FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
-    AFTER_HELP, CHAT_QUEUE_MAX, Cli, Command, Exit, LOG_MAX_MESSAGES, PeerCommand, format_change,
-    format_message, format_time, run, say, socket_path,
+    AFTER_HELP, CHAT_QUEUE_MAX, Cli, Command, Exit, LOG_MAX_BYTES, LOG_MAX_MESSAGES, PeerCommand,
+    format_change, format_message, format_time, run, say, socket_path,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -1927,6 +1927,43 @@ async fn a_log_longer_than_any_station_keeps_is_a_bad_reply() {
         assert_bad_log([cursor]).await;
         // It stopped at the cap: one page past it at most.
         assert_eq!(*logs.lock().unwrap(), pages + 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_log_of_more_text_than_any_station_keeps_is_a_bad_reply() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        // Pages that obey rule 6, of 64 messages with bodies of BODY_MAX_BYTES each (about 1 MiB
+        // a page), without end: the byte budget runs out long before the message cap.
+        let heavy = |before: Option<u64>, _page: LogPage| {
+            let top = before.unwrap_or(1 << 40);
+            let first = top - 64;
+            let body = "x".repeat(BODY_MAX_BYTES);
+            LogPage {
+                messages: (first..top)
+                    .map(|seq| message(seq, Direction::Incoming, &body, MessageStatus::Received))
+                    .collect(),
+                next_before: Some(first),
+            }
+        };
+        let cursor = Cursor {
+            max_logs: 70,
+            ..Cursor::new(&fake, heavy)
+        };
+        let logs = Arc::clone(&cursor.logs);
+        let c = Client::new(cursor);
+        let (exit, out, err) = exec(&c, &["log"]).await;
+        assert_eq!((exit, out.as_str()), (Exit::NoStation, ""));
+        assert_eq!(
+            err,
+            format!("unexpected reply from the station: the log runs past {LOG_MAX_BYTES} bytes\n")
+        );
+        // Each message owns BODY_MAX_BYTES + 3 (peer) + 10 (id) bytes of text: 63 pages fit in the
+        // budget, the 64th crosses it.
+        let page = 64 * (BODY_MAX_BYTES + 3 + 10);
+        assert_eq!(*logs.lock().unwrap(), LOG_MAX_BYTES / page + 1);
     })
     .await;
 }
