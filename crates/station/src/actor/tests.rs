@@ -59,7 +59,7 @@ async fn actor_fixture(data_dir: &Path) -> (Actor, Link) {
     let actor = Actor::new(
         storage,
         own_id,
-        PeerBook::new(),
+        None,
         authorizer,
         status,
         budget,
@@ -99,7 +99,8 @@ async fn duplicate_peer_add_confirms_an_uncertain_book_without_another_event() {
             .storage
             .load_peers(own_id)
             .expect("read visible peer book")
-            == book
+            .as_ref()
+            == Some(&book)
     );
     let original = File::open(&book_path).expect("hold the original peer book open");
     let original_inode = original.metadata().expect("read original inode").ino();
@@ -135,7 +136,8 @@ async fn duplicate_peer_add_confirms_an_uncertain_book_without_another_event() {
             .storage
             .load_peers(own_id)
             .expect("read uncertain rewrite")
-            == book
+            .as_ref()
+            == Some(&book)
     );
     let rewritten = File::open(&book_path).expect("hold the rewritten peer book open");
     let rewritten_inode = rewritten.metadata().expect("read rewritten inode").ino();
@@ -151,7 +153,8 @@ async fn duplicate_peer_add_confirms_an_uncertain_book_without_another_event() {
             .storage
             .load_peers(own_id)
             .expect("read confirmed peer book")
-            == book
+            .as_ref()
+            == Some(&book)
     );
     let confirmed_inode = fs::metadata(&book_path)
         .expect("read confirmed inode")
@@ -207,7 +210,14 @@ async fn missing_peer_remove_confirms_an_uncertain_book_without_another_event() 
             .authorize(&removed, Protocol::Stream(CHAT_PROTOCOL)),
         None
     );
-    assert!(actor.storage.load_peers(own_id).expect("read visible book") == book);
+    assert!(
+        actor
+            .storage
+            .load_peers(own_id)
+            .expect("read visible book")
+            .as_ref()
+            == Some(&book)
+    );
     let original = File::open(&book_path).expect("hold the visible peer book open");
     let original_inode = original.metadata().expect("read visible inode").ino();
 
@@ -240,7 +250,8 @@ async fn missing_peer_remove_confirms_an_uncertain_book_without_another_event() 
             .storage
             .load_peers(own_id)
             .expect("read rewritten book")
-            == book
+            .as_ref()
+            == Some(&book)
     );
     let rewritten = File::open(&book_path).expect("hold the rewritten peer book open");
     let rewritten_inode = rewritten.metadata().expect("read rewritten inode").ino();
@@ -257,7 +268,8 @@ async fn missing_peer_remove_confirms_an_uncertain_book_without_another_event() 
             .storage
             .load_peers(own_id)
             .expect("read confirmed book")
-            == book
+            .as_ref()
+            == Some(&book)
     );
     let confirmed_inode = fs::metadata(&book_path)
         .expect("read confirmed inode")

@@ -56,7 +56,7 @@ async fn chat_from_a_removed_peer_is_refused_and_not_logged() {
     let mut actor = Actor::new(
         storage,
         own_id,
-        book,
+        Some(book),
         authorizer,
         status,
         BUDGET,

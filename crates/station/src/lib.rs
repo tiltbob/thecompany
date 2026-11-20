@@ -137,8 +137,8 @@ impl fmt::Debug for Station {
 }
 
 impl Station {
-    /// Takes the data-dir lock and starts the local endpoint. This never waits for a tower or a
-    /// peer. Call it on a Tokio runtime with I/O and time enabled.
+    /// Takes the data-dir lock, syncs the directory, and starts the local endpoint. This never
+    /// waits for a tower or a peer. Call it on a Tokio runtime with I/O and time enabled.
     pub async fn start(config: StationConfig) -> Result<Self, StartError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| StartError::RuntimeRequired)?;
@@ -156,7 +156,9 @@ impl Station {
         let own_id = node_id(&key);
         let book = storage.load_peers(own_id)?;
         let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
-        actor::authorize_book(&authorizer, &book);
+        if let Some(book) = &book {
+            actor::authorize_book(&authorizer, book);
+        }
         let endpoint_config = EndpointConfig {
             towers,
             ip_transport: config.ip_transport,
