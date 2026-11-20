@@ -23,7 +23,7 @@ use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
     LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
     PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
-    check_peer_name, clean,
+    check_peer_name, clean, clean_tower_display,
 };
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
@@ -213,16 +213,15 @@ impl FakeStation {
 
     /// Sets the state of the one tower and pushes [`Event::Status`].
     ///
-    /// The text in the state (the `error` of [`TowerState::Failing`], the `reason` of
-    /// [`TowerState::Denied`]) came from outside, so every character of rule 9 in it is replaced
-    /// with a space ([`crate::api::clean`]) before it is stored and before the event is pushed.
+    /// The `error` of [`TowerState::Failing`] and the `reason` of [`TowerState::Denied`] are
+    /// cleaned and bounded with [`clean_tower_display`] before being stored or sent in an event.
     pub fn set_tower_state(&self, tower: TowerState) {
         let tower = match tower {
             TowerState::Failing { error } => TowerState::Failing {
-                error: clean(&error).into_owned(),
+                error: clean_tower_display(&error),
             },
             TowerState::Denied { reason } => TowerState::Denied {
-                reason: clean(&reason).into_owned(),
+                reason: clean_tower_display(&reason),
             },
             other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
         };
