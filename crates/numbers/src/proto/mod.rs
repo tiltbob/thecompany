@@ -5,6 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub mod chat;
+pub mod towers;
 
 use chat::NackReason;
 
@@ -14,6 +15,10 @@ pub const LINK_VERSION: u32 = 1;
 pub const CHAT_VERSION: u32 = 1;
 /// Stream protocol name for chat.
 pub const CHAT_PROTOCOL: &str = "chat";
+/// Initial tower-announcement stream version.
+pub const TOWERS_VERSION: u32 = 1;
+/// Stream protocol name for tower announcements.
+pub const TOWERS_PROTOCOL: &str = "towers";
 
 /// The hello exchanged once on each authenticated link.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +103,14 @@ impl StreamHeader {
         Self {
             proto: CHAT_PROTOCOL.into(),
             v: CHAT_VERSION,
+        }
+    }
+
+    /// A header for the current tower-announcement version.
+    pub fn towers() -> Self {
+        Self {
+            proto: TOWERS_PROTOCOL.into(),
+            v: TOWERS_VERSION,
         }
     }
 
