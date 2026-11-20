@@ -243,6 +243,15 @@ async fn request<T: Serialize>(
     read_frame(&mut recv, WIRE_FRAME_MAX, Some(PROBE_TIMEOUT)).await
 }
 
+/// Opens a chat stream and sends a complete request without waiting for the reply.
+async fn open_chat(conn: &Connection, header: &StreamHeader, body: &ChatMessage) -> RecvStream {
+    let (mut send, recv) = checked(conn.open_bi().await, "open chat stream");
+    write(&mut send, header).await;
+    write(&mut send, body).await;
+    checked(send.finish(), "finish chat request");
+    recv
+}
+
 async fn wait_for_close(conn: &Connection) {
     checked(
         timeout(PROBE_TIMEOUT, conn.closed()).await,
@@ -853,12 +862,21 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
             );
             let header = StreamHeader::chat();
             // Hold the application's reply sender while the raw peer waits for the reset.
+            let started = Instant::now();
             let (response, held) = checked(
                 timeout(SEND_DEADLINE + Duration::from_secs(1), async {
                     tokio::join!(request(&conn, &header, &chat), inbox.recv())
                 })
                 .await,
                 "reset the unanswered chat by the receiver deadline",
+            );
+            // `started` is taken before the request opens its stream, and the receiver creates
+            // its timer only after it accepts that stream. Tokio never fires a timer early, so
+            // on a correct receiver this cannot be shorter than the deadline.
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= SEND_DEADLINE,
+                "the receiver reset the chat before its send deadline: {elapsed:?}"
             );
             let held = held.expect("receive the complete chat before it times out");
             assert_delivery(&held, peer_id, "second", &chat);
@@ -886,6 +904,204 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
         })
         .await,
         "receiver reply deadline test timed out",
+    );
+}
+
+/// Sends `count` chats one after another, each acknowledged by the application.
+async fn exchange_chats(
+    conn: &Connection,
+    inbox: &mut Receiver<IncomingChat>,
+    peer: NodeId,
+    prefix: &str,
+    count: usize,
+) {
+    let header = StreamHeader::chat();
+    for index in 0..count {
+        let chat = message(&format!("{prefix}-{index}"), "return stream credit");
+        let (reply, ()) = tokio::join!(
+            request(conn, &header, &chat),
+            acknowledge(inbox, peer, "second", &chat),
+        );
+        assert_eq!(checked(reply, "read a credit chat's ACK"), ChatReply::Ack);
+    }
+}
+
+/// Opens `count` complete chats and takes each from the inbox before opening the next. The
+/// returned chats are held by the application, so each keeps one receiver stream slot.
+async fn fill_stream_slots(
+    conn: &Connection,
+    inbox: &mut Receiver<IncomingChat>,
+    peer: NodeId,
+    prefix: &str,
+    count: usize,
+) -> (Vec<RecvStream>, Vec<IncomingChat>) {
+    let header = StreamHeader::chat();
+    let mut replies = Vec::new();
+    let mut held = Vec::new();
+    for index in 0..count {
+        let chat = message(&format!("{prefix}-{index}"), "occupy one stream slot");
+        replies.push(open_chat(conn, &header, &chat).await);
+        let incoming = checked(
+            timeout(PROBE_TIMEOUT, inbox.recv()).await,
+            "deliver a chat that fills a stream slot",
+        )
+        .expect("link inbox remains open");
+        assert_delivery(&incoming, peer, "second", &chat);
+        held.push(incoming);
+    }
+    (replies, held)
+}
+
+/// Every chat stream slot of the receiver holds a chat that the application does not answer.
+/// When they all reach the receiver's deadline, their slots must be released: the test then
+/// holds `REFILL` new chats at once, without waiting for another deadline.
+///
+/// 16 is the link's stream limit (`STREAM_LIMIT` in `crates/numbers/src/link.rs`, which is
+/// also the endpoint's limit of concurrent bidirectional streams). This test must follow it
+/// if it changes.
+///
+/// The refill is 2 short of the limit. noq-proto 1.5.0 announces new stream credit only when
+/// more than 1/8 of the window (2 of 16) freed streams are pending (`queue_max_stream_id` in
+/// `src/connection/streams/state.rs`). The 16 resets free their streams over several packets,
+/// and up to 2 frees that come after the last announcement stay unannounced while the refill
+/// holds its streams, so the peer can rely on only 14 concurrent streams. The test therefore
+/// catches a receiver that keeps 3 or more slots after the deadline; a leak of 1 or 2 slots
+/// cannot be told apart from the credit noq may legitimately withhold with this limit.
+#[tokio::test]
+async fn chats_reset_at_the_receiver_deadline_release_their_stream_slots() {
+    const LINK_STREAM_LIMIT: usize = 16;
+    // See the doc comment: up to 2 freed streams can stay unannounced.
+    const REFILL: usize = LINK_STREAM_LIMIT - 2;
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let conn = dial(&peer, &address).await;
+            let (mut send, remote) =
+                begin_hello(&conn, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            finish_hello(&mut send, &remote).await;
+            wait_for_path(&link.handle(), peer_id, LinkPath::Direct).await;
+
+            // noq announces new stream credit only once more than 1/8 of the window (2 of
+            // 16 streams) is free again. Free two more streams after the hello so that the
+            // peer can open as many concurrent streams as the link has slots.
+            exchange_chats(&conn, &mut inbox, peer_id, "warmup", 2).await;
+            // The inbox holds more chats than the link has slots, so every slot can hold a
+            // delivered chat whose reply sender the application keeps. All of them reach the
+            // receiver's deadline together.
+            checked(
+                timeout(SEND_DEADLINE + Duration::from_secs(1), async {
+                    let (mut replies, held) =
+                        fill_stream_slots(&conn, &mut inbox, peer_id, "held", LINK_STREAM_LIMIT)
+                            .await;
+                    for recv in &mut replies {
+                        let reset = recv.read(&mut [0]).await;
+                        assert!(
+                            matches!(reset, Err(ReadError::Reset(code)) if code.into_inner() == 0)
+                        );
+                    }
+                    drop(held);
+                })
+                .await,
+                "the held chats were not reset by the receiver deadline",
+            );
+
+            // Refill as many slots as the stream credit allows at once, without waiting for
+            // another deadline. Each refill chat needs a slot that a reset chat released.
+            checked(
+                timeout(Duration::from_secs(1), async {
+                    let (replies, held) =
+                        fill_stream_slots(&conn, &mut inbox, peer_id, "refill", REFILL).await;
+                    // Answer them so that each slot is seen to carry a working chat.
+                    for incoming in held {
+                        incoming.respond(ChatReply::Ack);
+                    }
+                    for mut recv in replies {
+                        assert_eq!(read::<ChatReply>(&mut recv).await, ChatReply::Ack);
+                    }
+                })
+                .await,
+                "the released stream slots could not be filled again at once",
+            );
+            assert!(conn.close_reason().is_none());
+            checked(link.shutdown().await, "stop link after the deadline resets");
+            peer.iroh().close().await;
+        })
+        .await,
+        "stream slot release test timed out",
+    );
+}
+
+#[tokio::test]
+async fn acceptor_closes_a_silent_or_stalled_hello_with_400_at_its_connect_timeout() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (endpoint, auth) = bind_direct().await;
+            let (peer, peer_auth) = bind_direct().await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            let (link, mut inbox) = Link::start(endpoint, config());
+            let handle = link.handle();
+
+            // The dialer opens no hello stream, so the acceptor waits in `accept_bi` until
+            // its hello timeout elapses. Opening a stream without writing to it would look
+            // the same to the acceptor: QUIC sends nothing for it.
+            let dialed = Instant::now();
+            let silent = dial(&peer, &address).await;
+            checked(
+                timeout(
+                    CONNECT_TIMEOUT + Duration::from_secs(1),
+                    expect_close(&silent, 400),
+                )
+                .await,
+                "the acceptor did not close a silent dialer by its hello timeout",
+            );
+            // `dialed` is taken before the dial starts, and the acceptor starts its hello timer
+            // only after the handshake completes. Tokio never fires a timer early, so on a
+            // correct acceptor this cannot be shorter than the timeout. (Taking `dialed` after
+            // `dial` returns is not enough: on a loaded runtime the acceptor can start its timer
+            // before this task resumes.)
+            let elapsed = dialed.elapsed();
+            assert!(
+                elapsed >= CONNECT_TIMEOUT,
+                "the acceptor closed a silent dialer before its hello timeout: {elapsed:?}"
+            );
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+            assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+
+            // This dialer sends its hello and reads the acceptor's answer, but never sends the
+            // echo, so the acceptor waits in the read of the echo under the same timeout.
+            let dialed = Instant::now();
+            let stalled = dial(&peer, &address).await;
+            let (_held_hello, _) =
+                begin_hello(&stalled, &Hello::local(RAW_GENERATION, [1; 16])).await;
+            checked(
+                timeout(
+                    CONNECT_TIMEOUT + Duration::from_secs(1),
+                    expect_close(&stalled, 400),
+                )
+                .await,
+                "the acceptor did not close a stalled hello by its hello timeout",
+            );
+            // As above, the acceptor's timer starts after `dialed`.
+            let elapsed = dialed.elapsed();
+            assert!(
+                elapsed >= CONNECT_TIMEOUT,
+                "the acceptor closed a stalled hello before its hello timeout: {elapsed:?}"
+            );
+            assert_eq!(handle.path(peer_id), LinkPath::Down);
+            assert!(matches!(inbox.try_recv(), Err(TryRecvError::Empty)));
+            checked(
+                link.shutdown().await,
+                "stop link after the silent and the stalled dialer",
+            );
+            peer.iroh().close().await;
+        })
+        .await,
+        "silent and stalled dialer test timed out",
     );
 }
 
@@ -1252,13 +1468,21 @@ async fn chat_retry_waits_for_a_later_replacement_close() {
             while_sending(send.as_mut(), sleep(Duration::from_millis(300))).await;
             first.close(409u32.into(), b"");
 
-            let (reply, second) = tokio::join!(send, async {
-                let (second, mut hello) = accept_hello(&peer).await;
-                hello.reply(RAW_GENERATION, [2; 16]).await;
-                hello.confirm([2; 16]).await;
-                reply_to_chat(&second, &chat).await;
-                second
-            });
+            // The close must end the sender's close wait. Without this bound, a wait that
+            // ignored the close would still retry when its 2 s budget runs out.
+            let (reply, second) = checked(
+                timeout(Duration::from_secs(1), async {
+                    tokio::join!(send, async {
+                        let (second, mut hello) = accept_hello(&peer).await;
+                        hello.reply(RAW_GENERATION, [2; 16]).await;
+                        hello.confirm([2; 16]).await;
+                        reply_to_chat(&second, &chat).await;
+                        second
+                    })
+                })
+                .await,
+                "the retry did not follow the replacement close",
+            );
             assert_eq!(reply, Ok(ChatReply::Ack));
             assert!(second.close_reason().is_none());
             checked(
