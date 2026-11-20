@@ -254,7 +254,11 @@ If the higher-ID peer closes a link initiated by the lower-ID peer and the close
 lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
 peer can refuse both dials from the higher-ID peer with code `409`. The higher-ID peer can
 reconnect once the lower-ID peer detects the old connection's closure or retires it. M1 relies
-on QUIC and the send progress check for that detection. When looking for a connection after a
+on QUIC and the send progress check for that detection. In the loopback measurements of the
+appendix ("A lost close on a connection with several paths"), QUIC alone took up to about 5 s on
+a link with one path, and from a few seconds to 30 s and more on a link that had moved from the
+tower to a direct path.
+[#124](https://github.com/tiltbob/thecompany/issues/124) When looking for a connection after a
 lost election, it makes at most one fallback dial.
 
 Link application close codes are `400` for a bad hello or an acceptor's hello timeout, `403` for
@@ -649,6 +653,37 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
 - **Paths.** `conn.paths()`, `conn.paths_stream().wait_any(..)`, `conn.path_events()`; a path reports
   `is_relay()`, `is_ip()`, `is_selected()`. On one host a connection starts on the relay and selects
   the direct path 33–47 ms after `connect()` starts.
+- **A lost close on a connection with several paths (noq 1.5.0; measured for decision 124).**
+  `CONNECTION_CLOSE` leaves on the lowest-numbered path that can carry it: path 0 while it exists,
+  also when another path is selected (source; seen in all 26 runs that could tell). For three
+  times its largest probe timeout the closing side answers a packet from a validated path with
+  `CONNECTION_CLOSE` again, sent on that lowest path whichever path the packet came in on
+  (source; on one direct path on loopback this period ended 150–240 ms after the close). After
+  it, the endpoint answers with a stateless reset, at most one per 20 ms for the whole endpoint
+  (`min_reset_interval`), and none for a datagram of 21 bytes or less (source). The side that
+  still holds the connection accepts a reset only if two things hold (source): its endpoint has
+  the token registered under the address the reset comes from, and the token is path 0's, the
+  only one the connection compares. noq passes a path's token to the endpoint only when an ID of
+  that path is retired or replaced, so the token of the first ID of a path other than 0 is never
+  registered, and a reset drawn by a packet on such a path is dropped as "invalid CID": with only
+  a direct path 1 left, every one, in 12 of 12 runs. A reset for path 0's ID that comes from
+  another address than path 0's is dropped too; noq's NAT-traversal probes draw such resets and
+  use up the rate limit.
+  Measured from a lost close until a send of the closing side succeeded again (loopback, a dev
+  tower, the holder idle): one path, 4.7–5.0 s (35 runs; the holder's 5 s keep-alive draws the
+  reset); path 0 direct with a relay path beside it, 2.3–2.7 s (13 runs); path 0 relay with a
+  direct path selected, as after a first dial by node ID, 2.7–3.9 s in 7 of 13 runs and 14–63 s
+  in the other 6 (the 14–18 s runs ended once the direct path had idled out and a packet on the
+  relay path drew a reset, the 48–63 s runs by the connection timing out; no single timeout
+  explains 63 s); with the relay path gone, 30.7–30.9 s in 6 of 6 (the last path is not closed by
+  its own idle timer, so the connection's 30 s idle timeout decides).
+  An empty datagram sent on the held connection ended it within 10 ms on one path (35 runs) and
+  within 120 ms on path 0 of two (13 runs). When it left on a path other than 0, it helped only
+  while the closing side was still in its closing period (5 of 5 runs; the answer came back on
+  path 0); after that it changed nothing (14 runs).
+  A relay path closed about 33 s after its relay connection was cut (relay path idle timeout
+  30 s), and nothing in iroh opens a relay path again while a direct path is selected (source;
+  none came back in the 10 s the runs watched).
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
   equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket address holds
   108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107
