@@ -38,12 +38,18 @@
 //!   absent.
 //! - Exactly one of `[tls]` (certificate files, read and reloaded once a day by the tower) and
 //!   `[acme]` (a Let's Encrypt certificate; see [`CertSource::Acme`](crate::CertSource::Acme))
-//!   must be given.
+//!   must be given. With `[acme]`, the host name needs at least two labels, the contact is
+//!   `mailto:` and one address, and the cache directory holds the tower's keys: when the tower
+//!   starts it creates a missing one with mode 0700 and refuses one that the group or others
+//!   can access (on unix). The loaded configuration says what to do; only starting the tower
+//!   checks these.
 //! - A production tower is not an open relay by accident: either `allow_file` names the list of
 //!   endpoint ids it admits, or `open = true` admits everybody. Both together, or neither, is an
 //!   error.
 //! - A relative path (`allow_file`, `[tls] cert`, `[tls] key`, `[acme] cache_dir`) is resolved
-//!   against the directory that holds the config file, not the working directory.
+//!   against the directory of the config file's path as given, not the working directory. A
+//!   symbolic link to the config file is not resolved: through a link, relative paths resolve
+//!   against the link's directory.
 //! - `[rate]` defaults to [`DEFAULT_CLIENT_RATE`](crate::DEFAULT_CLIENT_RATE) bytes per
 //!   second, with iroh-relay's default burst, a tenth of the rate.
 //!
@@ -60,7 +66,8 @@
 //! [`MAX_ALLOW_FILE_SIZE`] (1 MiB); both must be regular files (symbolic links are followed;
 //! a directory, a device or a FIFO is refused before it is opened) and UTF-8. Every error is a
 //! [`ConfigError`]: a fixed category that names the key, the line where that helps, and which
-//! of the two files, but never a path, a host name, an id or any other value from a file.
+//! of the two files, but never a path, a host name, an id or any other value from a file. One
+//! leading byte-order mark is ignored in both files.
 
 use std::fmt;
 use std::fs::File;
@@ -271,9 +278,10 @@ struct RawRate {
 
 /// Reads the config file at `path`, and the allow file it names, into a [`TowerConfig`].
 ///
-/// Relative paths in the file are resolved against the directory that holds it. Both paths
-/// must name regular files. This function blocks on file I/O: call it before the async runtime
-/// starts its work, or on its blocking pool (the `tower` binary uses
+/// Relative paths in the file are resolved against the directory of `path` as given; a symbolic
+/// link to the config file is not resolved, so through a link they resolve against the link's
+/// directory. Both paths must name regular files. This function blocks on file I/O: call it
+/// before the async runtime starts its work, or on its blocking pool (the `tower` binary uses
 /// `tokio::task::spawn_blocking`).
 pub fn load(path: &Path) -> Result<TowerConfig, ConfigError> {
     let text = read_text(path, ConfigFile::Config, MAX_CONFIG_FILE_SIZE)?;
@@ -354,9 +362,10 @@ pub fn parse(text: &str, base_dir: &Path) -> Result<TowerConfig, ConfigError> {
 /// Parses the text of an allow file into its endpoint ids, in file order.
 ///
 /// Everything from `#` to the end of a line is a comment, blank lines are skipped, and the
-/// whitespace around an id is trimmed. A line that is not a valid endpoint id is an error that
-/// names the line, never its text.
+/// whitespace around an id is trimmed. One leading byte-order mark is ignored. A line that is
+/// not a valid endpoint id is an error that names the line, never its text.
 pub fn parse_allow_file(text: &str) -> Result<Vec<String>, ConfigError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut ids = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let entry = line.split('#').next().unwrap_or_default().trim();
@@ -376,7 +385,8 @@ pub fn parse_allow_file(text: &str) -> Result<Vec<String>, ConfigError> {
 /// The path must name a regular file (a symbolic link to one is followed): `std::fs::metadata`
 /// does not block on a FIFO, while opening one, or reading a terminal or a device, can. The
 /// file is read into a buffer of `limit + 1` bytes allocated up front; a file that fills it is
-/// too large.
+/// too large. The check and the open are two steps, not one: someone who can replace the file
+/// between them can still make the open block.
 fn read_text(path: &Path, file: ConfigFile, limit: usize) -> Result<String, ConfigError> {
     let unreadable = |error: io::Error| ConfigError::Unreadable {
         file,
@@ -650,7 +660,8 @@ mod tests {
                 ConfigError::UnknownKey { line: Some(8) },
             ),
             (
-                "hostname = \"t.example.com\"\nopen = true\n[acme]\ncontact = \"mailto:o@e.com\"\n\
+                "hostname = \"t.example.com\"\nopen = true\n[acme]\n\
+                 contact = \"mailto:o@example.com\"\n\
                  cache_dir = \"a\"\nstaging = true\n"
                     .to_owned(),
                 ConfigError::UnknownKey { line: Some(6) },
@@ -755,6 +766,14 @@ mod tests {
             }
         );
         std::fs::remove_dir(path("allow.txt")).unwrap();
+        std::fs::write(path("allow.txt"), b"# caf\xe9\n").unwrap();
+        assert_eq!(
+            error(MINIMAL, dir.path()),
+            ConfigError::NotUtf8 {
+                file: ConfigFile::Allow
+            }
+        );
+        std::fs::remove_file(path("allow.txt")).unwrap();
         std::fs::write(path("latin1.toml"), b"# caf\xe9\n").unwrap();
         assert_eq!(
             load(&path("latin1.toml")).unwrap_err(),
@@ -776,6 +795,59 @@ mod tests {
                 file: ConfigFile::Allow
             }
         );
+    }
+
+    /// One leading byte-order mark is ignored in the allow file, as the TOML parser ignores one
+    /// in the config file.
+    #[test]
+    fn a_leading_byte_order_mark_is_ignored_in_both_files() {
+        let an_id = id();
+        let ids = parse_allow_file(&format!("\u{feff}{an_id}\n")).unwrap();
+        assert!(ids == vec![an_id.clone()]);
+        let (dir, _) = dir_with_allow_file();
+        std::fs::write(
+            dir.path().join("allow.txt"),
+            format!("\u{feff}# team\n{an_id}\n"),
+        )
+        .unwrap();
+        let config = parse(&format!("\u{feff}{MINIMAL}"), dir.path()).unwrap();
+        assert!(config.allow == Some(vec![an_id]));
+    }
+
+    /// A file of exactly its cap is read; the test of one byte more is above.
+    #[test]
+    fn files_of_exactly_the_cap_are_read() {
+        let (dir, ids) = dir_with_allow_file();
+        let mut config_text = MINIMAL.to_owned();
+        config_text.push('#');
+        config_text.push_str(&"x".repeat(MAX_CONFIG_FILE_SIZE - config_text.len() - 1));
+        config_text.push('\n');
+        assert_eq!(config_text.len(), MAX_CONFIG_FILE_SIZE);
+        let config_path = dir.path().join("tower.toml");
+        std::fs::write(&config_path, &config_text).unwrap();
+        let mut allow_text = format!("{}\n", ids.join("\n"));
+        allow_text.push('#');
+        allow_text.push_str(&"x".repeat(MAX_ALLOW_FILE_SIZE - allow_text.len() - 1));
+        allow_text.push('\n');
+        assert_eq!(allow_text.len(), MAX_ALLOW_FILE_SIZE);
+        std::fs::write(dir.path().join("allow.txt"), &allow_text).unwrap();
+        let config = load(&config_path).unwrap();
+        assert!(config.allow == Some(ids));
+    }
+
+    /// Through a symbolic link to the config file, relative paths resolve against the link's
+    /// directory, the directory of the path as given; the link is not resolved.
+    #[cfg(unix)]
+    #[test]
+    fn relative_paths_resolve_against_the_directory_of_the_path_as_given() {
+        let (real, _) = dir_with_allow_file();
+        std::fs::write(real.path().join("tower.toml"), MINIMAL).unwrap();
+        let (linked, linked_ids) = dir_with_allow_file();
+        let link = linked.path().join("tower.toml");
+        std::os::unix::fs::symlink(real.path().join("tower.toml"), &link).unwrap();
+        let config = load(&link).unwrap();
+        assert_eq!(files(&config).0, linked.path().join("cert.pem"));
+        assert!(config.allow == Some(linked_ids));
     }
 
     #[test]
