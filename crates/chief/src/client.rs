@@ -32,6 +32,9 @@ pub trait Transport: Send + Sync + 'static {
     /// [`ApiError`]: the station's refusal, passed through unchanged, or the transport's own
     /// failure ([`ApiError::NotRunning`], [`ApiError::IncompatibleApi`],
     /// [`ApiError::Disconnected`], [`ApiError::Timeout`], [`ApiError::BadReply`]).
+    ///
+    /// Dropping the future does not take the request back: the station may still carry it out, as
+    /// after a lost answer (rule 12 in [`crate::api`]).
     fn call(&self, request: Request) -> impl Future<Output = Result<Response, ApiError>> + Send;
 
     /// Opens a subscription to live events from now on; earlier events are not replayed.
