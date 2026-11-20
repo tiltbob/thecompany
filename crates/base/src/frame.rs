@@ -19,9 +19,11 @@
 //!
 //! # Memory
 //!
-//! The cap bounds the body buffer, which grows only with the bytes that actually arrive. It does
-//! not bound what deserializing can allocate: a small frame read into `serde_json::Value` can still
-//! expand into many nodes. Read peer frames into concrete message types, not into `Value`.
+//! The body buffer of a read is exactly the announced length, which is never more than the cap. A
+//! peer that sends a header and then stalls holds that buffer until the read deadline, so the
+//! bound per stream is the cap. The cap does not bound what deserializing can allocate: a small
+//! frame read into `serde_json::Value` can still expand into many nodes. Read peer frames into
+//! concrete message types, not into `Value`.
 //!
 //! Non-finite floats (`NaN`, infinities) are written as JSON `null` and do not round-trip.
 //!
@@ -169,8 +171,9 @@ where
 /// Reads one frame and deserializes its JSON as `T`.
 ///
 /// The length in the header is checked against `cap` before any of the body is read; a longer
-/// frame fails with [`FrameError::TooLarge`]. The body buffer starts small and grows with the bytes
-/// that actually arrive, never past the announced length, so a header alone pins no memory.
+/// frame fails with [`FrameError::TooLarge`]. The body buffer is then exactly the announced length,
+/// never more than `cap`; a peer that sends a header and stalls holds it until the deadline, so the
+/// bound per stream is the cap.
 ///
 /// `deadline` is a budget for the whole call, header and body: with `Some(d)` the call fails with
 /// [`FrameError::Timeout`] once `d` has passed. With `None` it waits as long as it takes; that is
@@ -221,9 +224,6 @@ fn encode<T: Serialize + ?Sized>(value: &T, cap: usize) -> Result<Vec<u8>, Frame
     Ok(buf)
 }
 
-/// Initial capacity of a body buffer; it grows with the bytes that arrive.
-const INITIAL_BODY_CAPACITY: usize = 4096;
-
 /// Reads the header, checks it against `cap`, then reads exactly the body.
 async fn read_body<R>(reader: &mut R, cap: usize) -> Result<Vec<u8>, FrameError>
 where
@@ -255,18 +255,10 @@ where
             });
         }
     };
-    let mut body = Vec::with_capacity(len.min(INITIAL_BODY_CAPACITY));
-    // `take` never asks the reader for more than the body, so nothing past the frame is consumed.
-    (&mut *reader)
-        .take(u64::from(announced))
-        .read_to_end(&mut body)
-        .await?;
-    if body.len() != len {
-        return Err(FrameError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "stream ended inside a frame body",
-        )));
-    }
+    // Exactly the announced length, already checked against the cap. `read_exact` reads no byte
+    // past the frame, and an early end of the stream is `UnexpectedEof`.
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).await?;
     Ok(body)
 }
 
@@ -602,6 +594,15 @@ mod tests {
         guard(b.read_to_end(&mut rest)).await.unwrap();
         assert_eq!(rest, b"raw terminal bytes");
         guard(writer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_buffer_is_exactly_the_announced_length() {
+        let cap = WIRE_FRAME_MAX;
+        let frame = frame_bytes(&json_string_of_len(cap), cap).await;
+        let body = read_body(&mut frame.as_slice(), cap).await.unwrap();
+        assert_eq!(body.len(), cap);
+        assert_eq!(body.capacity(), cap);
     }
 
     #[tokio::test]

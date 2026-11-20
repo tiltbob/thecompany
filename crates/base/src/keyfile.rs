@@ -255,8 +255,12 @@ pub fn check_private_dir(dir: &Path) -> Result<(), PrivatePathError> {
 ///
 /// An error returned after the link (removing the temporary name or syncing the directory failed)
 /// can leave a complete key file behind, so a retry gets `AlreadyExists`; the key can then be read.
-/// A temporary file left by a crash does not block a later create. Needs a file system with hard
-/// links.
+///
+/// The temporary file gets a hidden staging name, `.<name>.<pid>.<thread hash>.<n>.tmp`; a name
+/// that is taken is skipped (16 tries, then an error naming the directory), and only the entry
+/// this call created is ever removed. A staging file left by a crash therefore stays behind: it is
+/// a 0600 file in the private directory, it is never read as a key, it does not block a later
+/// create, and it can be deleted. Needs a file system with hard links.
 pub fn create_key_file(path: &Path, key: &[u8]) -> Result<(), PrivatePathError> {
     let (dir_path, name) = split(path)?;
     let dir = open_private_dir(dir_path, Create::IfMissing)?;
@@ -361,50 +365,85 @@ fn open_private_dir(dir: &Path, create: Create) -> Result<File, PrivatePathError
     let mut parent_path = base.to_path_buf();
     for name in missing.into_iter().rev() {
         let path = parent_path.join(name);
-        let created = match rustix::fs::mkdirat(&parent, name, Mode::RWXU) {
-            Ok(()) => true,
-            Err(e) if e == Errno::EXIST => false,
-            Err(e) => return Err(io_error(&path, e.into())),
-        };
-        let fd = rustix::fs::openat(
-            &parent,
+        parent = create_level(&parent, &parent_path, name, Mode::RWXU)?;
+        parent_path = path;
+    }
+    Ok(parent)
+}
+
+/// Creates the directory `name` in `parent` (or finds it, if it appeared concurrently), makes its
+/// mode exactly 0700 if this call created it, checks it and returns it open. `mkdir_mode` is the
+/// mode passed to `mkdirat`: 0700 in production; tests pass narrower modes to stand in for a
+/// umask, which is process-global and cannot be changed in a test.
+fn create_level(
+    parent: &File,
+    parent_path: &Path,
+    name: &OsStr,
+    mkdir_mode: Mode,
+) -> Result<File, PrivatePathError> {
+    let path = parent_path.join(name);
+    let created = match rustix::fs::mkdirat(parent, name, mkdir_mode) {
+        Ok(()) => true,
+        Err(e) if e == Errno::EXIST => false,
+        Err(e) => return Err(io_error(&path, e.into())),
+    };
+    let open = || {
+        rustix::fs::openat(
+            parent,
             name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| {
-            if e == Errno::LOOP || e == Errno::MLINK {
-                PrivatePathError::Symlink { path: path.clone() }
-            } else if e == Errno::NOTDIR {
-                PrivatePathError::NotDirectory { path: path.clone() }
-            } else {
-                io_error(&path, e.into())
-            }
-        })?;
-        let handle = File::from(fd);
-        if created {
-            let meta = handle.metadata().map_err(|e| io_error(&path, e))?;
-            let euid = effective_uid();
-            // The owner first: never change the mode of something that is not ours.
-            if meta.uid() != euid {
-                return Err(Refusal::Owner {
-                    owner: meta.uid(),
-                    expected: euid,
+    };
+    let opened = match open() {
+        Err(e) if e == Errno::ACCESS && created => {
+            // A umask that strips the owner's read bit (0277, 0777) left a level we cannot open.
+            // Only in this case the mode is set by name, before the owner can be checked, on an
+            // entry this call created a moment earlier; the precondition that nobody else can
+            // write the ancestors (see the module docs) covers the gap. Apple honours
+            // AT_SYMLINK_NOFOLLOW here; Linux does not offer it for fchmodat, so it follows.
+            let nofollow = rustix::fs::chmodat(parent, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW);
+            match nofollow {
+                Err(e) if e == Errno::OPNOTSUPP || e == Errno::NOTSUP || e == Errno::INVAL => {
+                    rustix::fs::chmodat(parent, name, Mode::RWXU, AtFlags::empty())
                 }
-                .at(&path));
+                other => other,
             }
-            // The umask may have narrowed the mode (or a default ACL widened it).
-            handle
-                .set_permissions(Permissions::from_mode(PRIVATE_DIR_MODE))
-                .map_err(|e| io_error(&path, e))?;
-            parent.sync_all().map_err(|e| io_error(&parent_path, e))?;
+            .map_err(|e| io_error(&path, e.into()))?;
+            open()
         }
-        // A level that appeared concurrently is checked like any existing directory.
-        check_dir(&handle, &path)?;
-        parent = handle;
-        parent_path = path;
+        other => other,
+    };
+    let fd = opened.map_err(|e| {
+        if e == Errno::LOOP || e == Errno::MLINK {
+            PrivatePathError::Symlink { path: path.clone() }
+        } else if e == Errno::NOTDIR {
+            PrivatePathError::NotDirectory { path: path.clone() }
+        } else {
+            io_error(&path, e.into())
+        }
+    })?;
+    let handle = File::from(fd);
+    if created {
+        let meta = handle.metadata().map_err(|e| io_error(&path, e))?;
+        let euid = effective_uid();
+        // The owner first: never change the mode of something that is not ours.
+        if meta.uid() != euid {
+            return Err(Refusal::Owner {
+                owner: meta.uid(),
+                expected: euid,
+            }
+            .at(&path));
+        }
+        // The umask may have narrowed the mode (or a default ACL widened it).
+        handle
+            .set_permissions(Permissions::from_mode(PRIVATE_DIR_MODE))
+            .map_err(|e| io_error(&path, e))?;
+        parent.sync_all().map_err(|e| io_error(parent_path, e))?;
     }
-    Ok(parent)
+    // A level that appeared concurrently is checked like any existing directory.
+    check_dir(&handle, &path)?;
+    Ok(handle)
 }
 
 /// Opens a directory by path, following a symlink.
@@ -448,26 +487,40 @@ fn create_in(
     key: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
 ) -> Result<(), PrivatePathError> {
-    let tmp = temp_name(name);
-    let tmp_path = dir_path.join(&tmp);
-    let open_tmp = || {
-        rustix::fs::openat(
+    // An entry under a staging name proves nothing about who made it (any file name is a valid key
+    // name), so a taken name is skipped, never removed. Only the name this call created is
+    // unlinked below.
+    let mut staged = None;
+    for candidate in staging_names(name) {
+        match rustix::fs::openat(
             dir,
-            &tmp,
+            &candidate,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
-        )
-    };
-    let fd = match open_tmp() {
-        Err(e) if e == Errno::EXIST => {
-            // Left by a crashed run with this process id and thread: ours, and never published.
-            rustix::fs::unlinkat(dir, &tmp, AtFlags::empty())
-                .map_err(|e| io_error(&tmp_path, e.into()))?;
-            open_tmp()
+        ) {
+            Ok(fd) => {
+                staged = Some((candidate, fd));
+                break;
+            }
+            Err(e) if e == Errno::EXIST => {}
+            Err(e) => return Err(io_error(&dir_path.join(&candidate), e.into())),
         }
-        other => other,
     }
-    .map_err(|e| io_error(&tmp_path, e.into()))?;
+    let Some((tmp, fd)) = staged else {
+        return Err(io_error(
+            dir_path,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "all {STAGING_ATTEMPTS} staging names for {} are taken; remove leftover \
+                     staging files (.{}.<pid>.<thread>.<n>.tmp) from this directory",
+                    name.to_string_lossy(),
+                    name.to_string_lossy(),
+                ),
+            ),
+        ));
+    };
+    let tmp_path = dir_path.join(&tmp);
     let mut file = File::from(fd);
 
     let published = write_temp(&mut file, &tmp_path, key, write).and_then(|()| {
@@ -557,19 +610,22 @@ fn read_in<const N: usize>(
         .map_err(|_| wrong_length(u64::try_from(buf.len()).unwrap_or(u64::MAX)))
 }
 
-/// The temporary name for a key file being created: hidden, and unique among concurrent creators
-/// (process id, and a hash of the thread id, which is never reused within a process).
-fn temp_name(name: &OsStr) -> OsString {
+/// How many staging names [`create_in`] tries before it gives up.
+const STAGING_ATTEMPTS: usize = 16;
+
+/// The staging names for a key file being created, in the order they are tried: hidden, and
+/// distinct among concurrent creators (process id, and a hash of the thread id, which is never
+/// reused within a process), with a counter for names that are taken.
+fn staging_names(name: &OsStr) -> impl Iterator<Item = OsString> + '_ {
     let mut hasher = DefaultHasher::new();
     std::thread::current().id().hash(&mut hasher);
-    let mut tmp = OsString::from(".");
-    tmp.push(name);
-    tmp.push(format!(
-        ".{}.{:016x}.tmp",
-        std::process::id(),
-        hasher.finish()
-    ));
-    tmp
+    let (pid, thread) = (std::process::id(), hasher.finish());
+    (0..STAGING_ATTEMPTS).map(move |n| {
+        let mut tmp = OsString::from(".");
+        tmp.push(name);
+        tmp.push(format!(".{pid}.{thread:016x}.{n}.tmp"));
+        tmp
+    })
 }
 
 /// Splits a key-file path into its directory and its file name.
@@ -851,25 +907,98 @@ mod tests {
         assert_eq!(entries(&base), ["node.key"]);
     }
 
+    /// The staging name this thread would try first for `name`.
+    fn first_staging_name(name: &str) -> OsString {
+        staging_names(OsStr::new(name)).next().unwrap()
+    }
+
     #[test]
-    fn stale_temporary_files_do_not_block_a_create() {
+    fn stale_staging_files_do_not_block_a_create_and_are_left_alone() {
         let (_t, base) = tmp();
-        let name = OsStr::new("node.key");
-        // One left by a crashed run of this process and thread, one by another process.
-        let ours = base.join(temp_name(name));
-        let foreign = base.join(".node.key.1.0000000000000000.tmp");
+        // One under the name this thread tries first, one left by another process.
+        let ours = base.join(first_staging_name("node.key"));
+        let foreign = base.join(".node.key.1.0000000000000000.0.tmp");
         for stale in [&ours, &foreign] {
             fs::write(stale, b"partial").unwrap();
         }
-        let path = base.join(name);
+        let path = base.join("node.key");
         create_key_file(&path, KEY).unwrap();
         assert_eq!(&read32(&path).unwrap(), KEY);
-        assert!(!ours.exists(), "our own leftover is replaced and removed");
+        for stale in [&ours, &foreign] {
+            assert_eq!(fs::read(stale).unwrap(), b"partial", "{}", stale.display());
+        }
+        assert_eq!(entries(&base).len(), 3, "the key and the two leftovers");
+    }
+
+    #[test]
+    fn a_real_key_under_a_staging_name_survives_a_create() {
+        // Any file name is a valid key name, also one that equals a staging name.
+        let (_t, base) = tmp();
+        let staging = base.join(first_staging_name("node.key"));
+        create_key_file(&staging, KEY).unwrap();
+        assert_eq!(&read32(&staging).unwrap(), KEY);
+
+        let other = [7u8; 32];
+        let path = base.join("node.key");
+        create_key_file(&path, &other).unwrap();
+        assert_eq!(read32(&path).unwrap(), other);
         assert_eq!(
-            fs::read(&foreign).unwrap(),
-            b"partial",
-            "another's is left alone"
+            &read32(&staging).unwrap(),
+            KEY,
+            "the first key must survive"
         );
+        let mut want = vec![OsString::from("node.key"), first_staging_name("node.key")];
+        want.sort();
+        assert_eq!(entries(&base), want, "no staging entry is left");
+    }
+
+    #[test]
+    fn all_staging_names_taken_is_a_clean_error_that_removes_nothing() {
+        let (_t, base) = tmp();
+        let taken: Vec<_> = staging_names(OsStr::new("node.key"))
+            .map(|n| base.join(n))
+            .collect();
+        assert_eq!(taken.len(), STAGING_ATTEMPTS);
+        for t in &taken {
+            fs::write(t, b"taken").unwrap();
+        }
+        let err = create_key_file(&base.join("node.key"), KEY).unwrap_err();
+        assert!(
+            matches!(&err, PrivatePathError::Io { path, source }
+                if *path == base && source.kind() == io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("staging"), "{err}");
+        for t in &taken {
+            assert_eq!(fs::read(t).unwrap(), b"taken");
+        }
+        assert_eq!(
+            entries(&base).len(),
+            STAGING_ATTEMPTS,
+            "nothing added or removed"
+        );
+    }
+
+    #[test]
+    fn a_level_created_under_a_narrow_umask_ends_up_usable_0700() {
+        // The mkdir mode stands in for the umask; as a normal user 0o000 and 0o300 cannot be
+        // opened for reading and take the fallback, 0o500 takes the normal path.
+        let (_t, base) = tmp();
+        let parent = open_private_dir(&base, Create::Never).unwrap();
+        for (name, mode) in [
+            ("m000", Mode::empty()),
+            ("m300", Mode::WUSR | Mode::XUSR),
+            ("m500", Mode::RUSR | Mode::XUSR),
+        ] {
+            let level = create_level(&parent, &base, OsStr::new(name), mode).unwrap();
+            let dir = base.join(name);
+            assert_eq!(mode_of(&dir), 0o700, "{name}");
+            assert!(level.metadata().unwrap().is_dir());
+            // Usable: a key can be created in it and read back.
+            let path = dir.join("node.key");
+            create_key_file(&path, KEY).unwrap();
+            assert_eq!(&read32(&path).unwrap(), KEY, "{name}");
+        }
     }
 
     #[test]
@@ -936,9 +1065,9 @@ mod tests {
         ensure_private_dir(&real).unwrap();
         ensure_private_dir(&decoy).unwrap();
         let name = OsStr::new("node.key");
-        // A file under the temporary name in the decoy: a cleanup by path after the swap below
+        // A file under the staging name in the decoy: a cleanup by path after the swap below
         // would remove it.
-        let decoy_tmp = decoy.join(temp_name(name));
+        let decoy_tmp = decoy.join(first_staging_name("node.key"));
         fs::write(&decoy_tmp, b"decoy").unwrap();
         let link = base.join("link");
         symlink(&real, &link).unwrap();
