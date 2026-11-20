@@ -72,10 +72,11 @@ quoted=${stub//%/%%}
 # unit or its drop-ins gives a non-zero exit status too, and the units it depends on
 # (network-online.target, multi-user.target) are not loaded, so warnings about the host's own
 # unit files cannot appear. verify needs no running systemd: it starts a manager in test mode.
-# In 255 and 256 that manager needs no root either. In 257 and 258 (src/core/manager.c) it
-# creates /run/systemd even in this mode, so an unprivileged user on a machine without that
-# directory cannot verify any unit: "Failed to create directory '/run/systemd/': Permission
-# denied".
+# With 255 (as root, no systemd running) and with 259 on a GitHub runner that works as it is.
+# It does not work everywhere: in an unprivileged container with systemd 257 and no
+# /run/systemd, verify failed for every unit, a minimal one included, with "Failed to create
+# directory '/run/systemd/': Permission denied" (seen in the review of this script; 258 is
+# reported to do the same). The preflight below is for environments like that one.
 #
 # verify prints nothing for a clean unit, so any output also fails the check. No message has
 # been seen from the host here (systemd 255 with no systemd running); if one shows up in CI,
