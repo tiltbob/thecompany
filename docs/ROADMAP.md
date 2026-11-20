@@ -145,7 +145,8 @@ appears offline, or has not added you": an unknown caller is ignored, which look
 
 A send to a peer with several stations tries connected stations first, preserving peer-book order
 within each group. It tries one station at a time using the same message ID and one deadline, and
-stops on an acknowledgement or explicit refusal. A station admits at most 1,000 concurrent sends
+stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets the
+send try the next station within the same deadline. A station admits at most 1,000 concurrent sends
 and returns an internal error if it is full. While the station is running, it publishes the final
 outcome even after its message leaves the log. The receiving station keeps the 1,000 most recent
 unique receipts across all peers in memory, keyed by peer name and message ID. Duplicate
@@ -158,8 +159,9 @@ version-1 object with a list of peer records, each containing a name and ordered
 IDs. It is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
 rename and directory sync. If the rename succeeds but directory sync fails, the station applies
 the visible book and reports that the change may not survive a crash. While that running station
-has an uncertain book, a duplicate peer add rewrites the same book before confirming it and emits
-no further event. The saved file contains no network path state or message history.
+has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
+and syncs the directory before giving its usual answer. These retries emit no additional events.
+The saved file contains no network path state or message history.
 
 **Deliberately not in M1:** TLS, SRV bootstrap, several towers, a tower set that changes at runtime,
 non-loopback plain HTTP, tower allowlist, running the station as a service (all M2); chiefs as

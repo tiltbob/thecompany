@@ -14,7 +14,7 @@ use chief::api::{
 };
 use chief::client::{Client, Subscription};
 use numbers::proto::CHAT_PROTOCOL;
-use numbers::proto::chat::{ChatMessage, ChatReply};
+use numbers::proto::chat::{ChatMessage, ChatReply, NackReason};
 use numbers::{
     Authorizer, Endpoint, EndpointConfig, IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle,
     LinkPath, NodeId, TowerSet, generate_node_key,
@@ -24,7 +24,7 @@ use numbers_station::{
 };
 use numbers_tower::{Tower, TowerConfig};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -205,17 +205,27 @@ async fn assert_log(client: &Chief, sent: &Message, received: &Message) {
 }
 
 async fn wait_api_link(client: &Chief, expected: ApiLink) {
+    wait_api_links(client, &[expected]).await;
+}
+
+async fn wait_api_links(client: &Chief, expected: &[ApiLink]) {
+    let matches = |peer: &chief::api::Peer| {
+        peer.stations
+            .iter()
+            .map(|station| station.link)
+            .eq(expected.iter().copied())
+    };
     within(
         PROBE_TIMEOUT,
         async {
             let mut events = subscribe(client).await;
             let peers = checked(client.peers().await, "read link snapshot");
-            if peers[0].stations[0].link == expected {
+            if matches(&peers[0]) {
                 return;
             }
             loop {
                 if let Event::Peer { peer } = next_event(&mut events).await
-                    && peer.stations[0].link == expected
+                    && matches(&peer)
                 {
                     return;
                 }
@@ -478,6 +488,7 @@ async fn station_starts_while_the_tower_is_unavailable() {
 }
 
 struct WirePeer {
+    id: NodeId,
     link: Link,
     inbox: mpsc::Receiver<IncomingChat>,
 }
@@ -496,10 +507,9 @@ impl WirePeer {
             Endpoint::bind(&generate_node_key(), config, auth).await,
             "bind fixture endpoint",
         );
+        let id = endpoint.iroh().id();
         checked(
-            station
-                .peer_add(name, &endpoint.iroh().id().to_string())
-                .await,
+            station.peer_add(name, &id.to_string()).await,
             "register fixture identity",
         );
         checked(
@@ -513,7 +523,7 @@ impl WirePeer {
                 send_deadline: HELD_SEND_DEADLINE,
             },
         );
-        Self { link, inbox }
+        Self { id, link, inbox }
     }
 
     fn handle(&self) -> LinkHandle {
@@ -526,6 +536,14 @@ impl WirePeer {
             "fixture receives pending chat",
         )
         .expect("fixture inbox stays open")
+    }
+
+    async fn receive_before(&mut self, other: &mut Self) -> IncomingChat {
+        tokio::select! {
+            biased;
+            _ = other.inbox.recv() => panic!("message reached the lower priority station first"),
+            incoming = self.receive() => incoming,
+        }
     }
 
     async fn send(&self, station: NodeId, id: &str, body: &str, sent_at_ms: u64) {
@@ -551,6 +569,213 @@ impl WirePeer {
     async fn shutdown(self) {
         checked(self.link.shutdown().await, "shut down fixture endpoint");
     }
+}
+
+/// Returns both fixtures in the peer book's order, regardless of which registers first.
+async fn delivery_peers(
+    network: &Network,
+    client: &Chief,
+    warm_first: bool,
+) -> (WirePeer, WirePeer) {
+    let ((), first, second) = tokio::join!(
+        wait_online(client),
+        WirePeer::connect(&network.tower, client, "peer"),
+        WirePeer::connect(&network.tower, client, "peer"),
+    );
+    let peers = checked(client.peers().await, "read delivery peer's book order");
+    assert_eq!(peers.len(), 1);
+    let stations = &peers[0].stations;
+    assert_eq!(stations.len(), 2);
+    let (first, second) = if stations[0].station_id == first.id.to_string() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(stations[0].station_id == first.id.to_string());
+    assert!(stations[1].station_id == second.id.to_string());
+    let target = station_id(client).await;
+    tokio::join!(
+        async {
+            if warm_first {
+                first.send(target, "warm-first", "open first link", 0).await;
+            }
+        },
+        second.send(target, "warm-second", "open second link", 0),
+    );
+    let first_path = if warm_first {
+        ApiLink::Relayed
+    } else {
+        ApiLink::Down
+    };
+    wait_api_links(client, &[first_path, ApiLink::Relayed]).await;
+    (first, second)
+}
+
+fn assert_same_chat(incoming: &IncomingChat, sent: &Message) {
+    assert!(incoming.message.id == sent.id, "chat has the original ID");
+    assert!(
+        incoming.message.body == sent.body,
+        "chat has the original body"
+    );
+    assert_eq!(incoming.message.sent_at_ms, sent.at_ms);
+}
+
+#[tokio::test]
+async fn unavailable_station_falls_back_in_peer_book_order_with_the_same_chat() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let (station, client) = network.station("station", IpTransport::RelayOnly).await;
+            let (mut first, mut second) = delivery_peers(&network, &client, true).await;
+            let mut events = subscribe(&client).await;
+            let sent = checked(
+                client.send("peer", "deliver after unavailable").await,
+                "accept outgoing chat",
+            );
+            let received = first.receive_before(&mut second).await;
+            assert_same_chat(&received, &sent);
+            received.respond(ChatReply::Nack(NackReason::Unavailable));
+
+            let mut outcome = pin!(client.wait_for_outcome(&mut events, sent.clone()));
+            let incoming = tokio::select! {
+                incoming = second.receive() => incoming,
+                result = outcome.as_mut() => {
+                    let result = checked(result, "read early delivery outcome");
+                    panic!("delivery ended before the second station's ACK: {:?}", result.status);
+                }
+            };
+            assert_same_chat(&incoming, &sent);
+            incoming.respond(ChatReply::Ack);
+            let outcome = checked(outcome.await, "read delivery outcome");
+            assert_eq!(outcome.status, MessageStatus::Delivered);
+            assert_eq!(outcome.rev, 1);
+            tokio::join!(stop(station), first.shutdown(), second.shutdown());
+            network.shutdown().await;
+        },
+        "unavailable station fallback test timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_connected_station_is_tried_before_an_earlier_down_station() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let (station, client) = network.station("station", IpTransport::RelayOnly).await;
+            let (mut first, mut second) = delivery_peers(&network, &client, false).await;
+            let mut events = subscribe(&client).await;
+            let sent = checked(
+                client.send("peer", "prefer the connected station").await,
+                "accept outgoing chat",
+            );
+            let received = second.receive_before(&mut first).await;
+            assert_same_chat(&received, &sent);
+            received.respond(ChatReply::Ack);
+            let outcome = checked(
+                client.wait_for_outcome(&mut events, sent).await,
+                "read delivery outcome",
+            );
+            assert_eq!(outcome.status, MessageStatus::Delivered);
+            assert!(matches!(
+                first.inbox.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            tokio::join!(stop(station), first.shutdown(), second.shutdown());
+            network.shutdown().await;
+        },
+        "connected station priority test timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn trying_a_second_station_does_not_extend_the_send_deadline() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let mut config = network.config("station", IpTransport::RelayOnly);
+            let deadline = Duration::from_secs(6);
+            config.send_deadline = deadline;
+            // Keep the link's earlier stale-path check out of this actor deadline test.
+            config.connect_timeout = deadline;
+            let (station, client) = start(config).await;
+            let (mut first, mut second) = delivery_peers(&network, &client, true).await;
+            let mut events = subscribe(&client).await;
+            let started = Instant::now();
+            let sent = checked(
+                client.send("peer", "one deadline across both stations").await,
+                "accept outgoing chat",
+            );
+            let accepted_by = Instant::now();
+            let received = first.receive_before(&mut second).await;
+            assert_same_chat(&received, &sent);
+            sleep_until(accepted_by + deadline / 2).await;
+            received.respond(ChatReply::Nack(NackReason::Unavailable));
+
+            // The first reply spends three seconds of the budget. Two seconds of scheduling
+            // slack still makes the outer bound shorter than a fresh six-second attempt.
+            let outcome = checked(
+                timeout_at(accepted_by + deadline + Duration::from_secs(2), async {
+                    let mut outcome = pin!(client.wait_for_outcome(&mut events, sent.clone()));
+                    let held = tokio::select! {
+                        incoming = second.receive() => incoming,
+                        result = outcome.as_mut() => {
+                            let result = checked(result, "read early delivery outcome");
+                            panic!("delivery ended before the second station held the chat: {:?}", result.status);
+                        }
+                    };
+                    assert_same_chat(&held, &sent);
+                    let outcome = checked(outcome.await, "read the unanswered chat's outcome");
+                    // Keep the reply sender live until the actor declares NoAnswer.
+                    drop(held);
+                    outcome
+                })
+                .await,
+                "both station attempts share the original deadline",
+            );
+            assert_eq!(outcome.status, MessageStatus::Failed { reason: FailReason::NoAnswer });
+            assert!(started.elapsed() >= deadline, "send did not fail before its deadline");
+            tokio::join!(stop(station), first.shutdown(), second.shutdown());
+            network.shutdown().await;
+        },
+        "shared send deadline test timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_validation_refusal_stops_delivery_at_the_first_station() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let (station, client) = network.station("station", IpTransport::RelayOnly).await;
+            let (mut first, mut second) = delivery_peers(&network, &client, true).await;
+            let mut events = subscribe(&client).await;
+            let sent = checked(
+                client.send("peer", "stop after validation refusal").await,
+                "accept outgoing chat",
+            );
+            let received = first.receive_before(&mut second).await;
+            assert_same_chat(&received, &sent);
+            received.respond(ChatReply::Nack(NackReason::InvalidBody));
+
+            let outcome = tokio::select! {
+                biased;
+                _ = second.inbox.recv() => panic!("validation refusal must stop the send"),
+                outcome = client.wait_for_outcome(&mut events, sent) => checked(outcome, "read refusal outcome"),
+            };
+            assert_eq!(outcome.status, MessageStatus::Failed { reason: FailReason::Refused });
+            tokio::join!(stop(station), first.shutdown(), second.shutdown());
+            network.shutdown().await;
+        },
+        "validation refusal test timed out",
+    )
+    .await;
 }
 
 async fn station_id(client: &Chief) -> NodeId {

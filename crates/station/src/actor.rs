@@ -221,14 +221,7 @@ impl Actor {
         if let Some((owner, ids)) = self.book.iter().find(|(_, ids)| ids.contains(&id)) {
             if owner == name {
                 let peer = self.peer(owner, ids);
-                if self.book_uncertain {
-                    let saved = self
-                        .storage
-                        .save_peers(&self.book, self.own_id)
-                        .map_err(|error| internal(&error.to_string()))?;
-                    self.book_uncertain = saved == SaveOutcome::DurabilityUncertain;
-                    confirm_durable(saved)?;
-                }
+                self.confirm_current_book()?;
                 return Ok(Response::Peer { peer });
             }
             return Err(ApiError::StationTaken {
@@ -248,7 +241,10 @@ impl Actor {
 
     fn remove_peer(&mut self, name: &str) -> Result<Response, ApiError> {
         let mut book = self.book.clone();
-        let removed = book.remove(name).ok_or_else(|| no_peer(name))?;
+        let Some(removed) = book.remove(name) else {
+            self.confirm_current_book()?;
+            return Err(no_peer(name));
+        };
         let saved = self.change_book(book)?;
         for id in removed {
             self.links.close_peer(id);
@@ -268,6 +264,18 @@ impl Actor {
         });
         confirm_durable(saved)?;
         Ok(Response::Done)
+    }
+
+    fn confirm_current_book(&mut self) -> Result<(), ApiError> {
+        if !self.book_uncertain {
+            return Ok(());
+        }
+        let saved = self
+            .storage
+            .save_peers(&self.book, self.own_id)
+            .map_err(|error| internal(&error.to_string()))?;
+        self.book_uncertain = saved == SaveOutcome::DurabilityUncertain;
+        confirm_durable(saved)
     }
 
     fn change_book(&mut self, book: PeerBook) -> Result<SaveOutcome, ApiError> {
@@ -487,8 +495,8 @@ async fn deliver(
             }
             match link.send(id, chat.clone()).await {
                 Ok(ChatReply::Ack) => return Some(MessageStatus::Delivered),
+                Ok(ChatReply::Nack(NackReason::Unavailable)) | Err(_) => continue,
                 Ok(ChatReply::Nack(_)) => return Some(failed(FailReason::Refused)),
-                Err(_) => continue,
             }
         }
         None
@@ -499,7 +507,7 @@ async fn deliver(
     {
         return status;
     }
-    // A transport refusal or an exhausted candidate set is indistinguishable from silence.
+    // With no conclusive reply, report NoAnswer at the original deadline.
     sleep_until(deadline).await;
     failed(FailReason::NoAnswer)
 }

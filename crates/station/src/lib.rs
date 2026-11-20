@@ -90,8 +90,8 @@ pub enum StartError {
     /// A timeout is zero or cannot be represented as a deadline.
     #[error("station timeouts must be nonzero and representable as deadlines")]
     InvalidTimeouts,
-    /// No Tokio runtime is available.
-    #[error("the station needs a Tokio runtime with I/O and time enabled")]
+    /// There is no current Tokio runtime.
+    #[error("the station must be started inside a Tokio runtime")]
     RuntimeRequired,
     /// The system could not generate a station instance ID.
     #[error("could not generate a station instance ID")]
