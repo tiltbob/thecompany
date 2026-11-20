@@ -7,7 +7,8 @@
 //! [`FakeStation::set_now_ms`]. It is the reference that frontend tests trust, so its own tests
 //! check it against the rules.
 //!
-//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of every call,
+//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of a call (for one
+//! call at a time: a call that starts while the hook runs for another is answered without it),
 //! [`FakeStation::fail_calls`] makes every call fail, and [`FakeStation::hold_subscribes`] keeps
 //! `subscribe` from returning until the test lets it.
 //!
@@ -57,7 +58,8 @@ type CallHook = Box<dyn FnMut(&FakeStation, &Request) + Send>;
 
 /// The hook of [`FakeStation::on_call`], and how often it was set or removed. A hook is taken out
 /// of the slot while it runs, and is put back afterwards only if the slot was not changed
-/// meanwhile: a hook that removes or replaces itself stays removed or replaced.
+/// meanwhile: a hook that removes or replaces itself stays removed or replaced. While it is out, the
+/// slot is empty, so a call that starts meanwhile (on another thread or task) runs no hook.
 #[derive(Default)]
 struct HookSlot {
     hook: Option<CallHook>,
@@ -306,18 +308,23 @@ impl FakeStation {
 
     /// Gives a held outgoing message its final status (`Delivered` or `Failed`): rev 1 and its
     /// event (rule 7), also when the log has evicted the message meanwhile (the log then stays as
-    /// it is). Fails with [`ApiError::Invalid`] when `status` is not a final outgoing status (field
-    /// `status`), or when the `seq` is in the log but is not an outgoing message still `Sending`
-    /// (field `seq`); and with [`ApiError::MessageNotFound`] for any other `seq` that is not a
-    /// held message.
+    /// it is). The checks run in this order: [`ApiError::Stopping`] after [`FakeStation::stop`]
+    /// (rule 7 promises no outcome after a stop), and nothing changes; [`ApiError::Invalid`] when
+    /// `status` is not a final outgoing status (field `status`), or when the `seq` is in the log
+    /// but is not an outgoing message still `Sending` (field `seq`); and
+    /// [`ApiError::MessageNotFound`] for any other `seq` that is not a held message.
     pub fn resolve(&self, seq: u64, status: MessageStatus) -> Result<Message, ApiError> {
+        let mut state = self.state();
+        if state.stopped {
+            return Err(ApiError::Stopping);
+        }
         if !matches!(
             status,
             MessageStatus::Delivered | MessageStatus::Failed { .. }
         ) {
             return Err(invalid("status", "must be delivered or failed"));
         }
-        self.state().finish(seq, status)
+        state.finish(seq, status)
     }
 
     /// Stops the station: every subscription ends (rule 11), and every later call and subscribe
@@ -338,11 +345,12 @@ impl FakeStation {
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, and calls are answered again after a [`FakeStation::stop`]. A subscribe that
-    /// is waiting at [`FakeStation::hold_subscribes`] wakes up and fails with
-    /// [`ApiError::Stopping`]: it belonged to the old instance and never attaches to the new one.
-    /// The peer book, the send outcome and the other test settings, the hold of subscribes
-    /// included, stay, as a station's peer book survives a restart.
+    /// link is down, the tower is back in [`TowerState::Connecting`] as in a new fake (no event is
+    /// pushed: the subscriptions have ended), and calls are answered again after a
+    /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
+    /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
+    /// to the new one. The peer book, the send outcome and the other test settings, the hold of
+    /// subscribes included, stay, as a station's peer book survives a restart.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();
@@ -354,6 +362,9 @@ impl FakeStation {
             state.next_seq = 1;
             state.stopped = false;
             state.generation += 1;
+            for tower in &mut state.status.towers {
+                tower.state = TowerState::Connecting;
+            }
             for stations in state.peers.values_mut() {
                 for station in stations {
                     station.link = Link::Down;
@@ -444,9 +455,13 @@ impl FakeStation {
         self.state().status.clone()
     }
 
-    /// Runs `hook` at the start of every later call, before the fake looks at the request, with
-    /// the fake unlocked: the hook may change the station (receive a message, for example), so a
-    /// test can make things happen exactly between a client's calls. Replaces an earlier hook.
+    /// Runs `hook` at the start of later calls, before the fake looks at the request, with the
+    /// fake unlocked: the hook may change the station (receive a message, for example), so a test
+    /// can make things happen exactly between a client's calls. Replaces an earlier hook.
+    ///
+    /// The hook runs for one call at a time: a call that starts while the hook is running for
+    /// another call (on another thread or task) is answered without running the hook. A test that
+    /// needs the hook before a particular call makes its calls one at a time.
     ///
     /// A call through a handle bound to an instance that is already gone (see "A bound handle" on
     /// [`FakeStation`]) is refused before the hook, which then does not run for it. `subscribe`

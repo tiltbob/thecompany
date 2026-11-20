@@ -7,6 +7,7 @@ use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription};
 use chief::fake::*;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -201,7 +202,9 @@ async fn peer_remove_fails_pending_sends_first_and_keeps_the_messages() {
     let held = c.send("bob", "one").await.unwrap();
     fake.set_outcome(SendOutcome::Deliver);
     let delivered = c.send("bob", "two").await.unwrap();
+    fake.set_link("bob", "STATION-B", Link::Direct).unwrap();
     let mut events = c.subscribe().await.unwrap();
+    // Its link is closed too, and pushes no `Event::Peer` (rule 10).
     c.peer_remove("bob").await.unwrap();
     let failed = Message {
         rev: 1,
@@ -320,6 +323,31 @@ async fn a_held_send_waits_for_resolve_and_a_final_status_never_changes() {
         ApiError::MessageNotFound { seq: 999 }
     );
     assert_eq!(c.message(sent.seq).await.unwrap(), done);
+}
+
+#[tokio::test]
+async fn resolve_after_stop_is_refused_and_pushes_nothing() {
+    let (fake, c) = with_peers().await;
+    fake.set_outcome(SendOutcome::Hold);
+    let sent = c.send("bob", "hi").await.unwrap();
+    let mut events = c.subscribe().await.unwrap();
+    fake.stop();
+    // Rule 7 promises no outcome after a stop. The check comes first: a status that is not final
+    // is refused with `Stopping` too.
+    assert_eq!(
+        fake.resolve(sent.seq, MessageStatus::Delivered),
+        Err(ApiError::Stopping)
+    );
+    assert_eq!(
+        fake.resolve(sent.seq, MessageStatus::Sending),
+        Err(ApiError::Stopping)
+    );
+    assert_eq!(
+        tokio::time::timeout(BOUND, events.next()).await.unwrap(),
+        None
+    );
+    // The message is unchanged.
+    assert_eq!(fake.messages(), vec![sent]);
 }
 
 // Incoming messages (rules 8 and 9).
@@ -597,6 +625,45 @@ async fn a_hook_that_removes_or_replaces_itself_does_not_run_again() {
     assert_eq!(*kept.lock().unwrap(), 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hook_runs_for_one_call_at_a_time() {
+    let (fake, c) = with_peers().await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (entered, in_hook) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let count = Arc::clone(&runs);
+    fake.on_call(move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let _ = entered.send(());
+        released.recv_timeout(BOUND).unwrap();
+    });
+    // Call A, on a worker thread, enters the hook and blocks there.
+    let a = tokio::spawn({
+        let c = c.clone();
+        async move { c.status().await }
+    });
+    tokio::task::spawn_blocking(move || in_hook.recv_timeout(BOUND))
+        .await
+        .unwrap()
+        .unwrap();
+    // Call B, meanwhile, is answered without running the hook.
+    assert_eq!(c.peers().await.unwrap().len(), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    release.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(BOUND, a)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    // Both calls reached the station.
+    let requests = fake.requests();
+    assert!(requests.contains(&Request::Status));
+    assert!(requests.contains(&Request::Peers));
+}
+
 #[tokio::test]
 async fn requests_are_recorded_and_the_hook_runs_first() {
     let (fake, c) = with_peers().await;
@@ -675,6 +742,7 @@ async fn send_checks_the_peer_before_the_body() {
 async fn restart_is_a_new_instance_that_keeps_the_peer_book() {
     let (fake, c) = with_peers().await;
     fake.set_link("bob", "STATION-B", Link::Direct).unwrap();
+    fake.set_tower_state(TowerState::Connected);
     fake.receive("bob", "x").unwrap();
     let mut events = c.subscribe().await.unwrap();
     fake.stop();
@@ -682,6 +750,12 @@ async fn restart_is_a_new_instance_that_keeps_the_peer_book() {
     assert_eq!(events.next().await, None);
     let status = c.status().await.unwrap();
     assert_eq!(status.instance_id, "INSTANCE-2");
+    // The tower is back where a new fake starts.
+    assert_eq!(
+        status.towers,
+        FakeStation::new(ME, "INSTANCE-X").status().towers
+    );
+    assert_eq!(status.towers[0].state, TowerState::Connecting);
     assert!(c.log(None, None, 10).await.unwrap().messages.is_empty());
     assert_eq!(fake.receive("bob", "y").unwrap().seq, 1);
     let peers = c.peers().await.unwrap();
@@ -753,9 +827,14 @@ async fn hold_subscribes_keeps_subscribe_from_registering_until_released() {
     assert!(poll_once(subscribe.as_mut()).is_none());
     assert_eq!(fake.held_subscribes(), 1);
     assert_eq!(fake.subscriber_count(), 0);
-    fake.wait_for_held_subscribes(1).await;
+    tokio::time::timeout(BOUND, fake.wait_for_held_subscribes(1))
+        .await
+        .unwrap();
     fake.hold_subscribes(false);
-    let events = subscribe.await.unwrap();
+    let events = tokio::time::timeout(BOUND, subscribe)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fake.held_subscribes(), 0);
     assert_eq!(fake.subscriber_count(), 1);
     drop(events);
@@ -763,6 +842,30 @@ async fn hold_subscribes_keeps_subscribe_from_registering_until_released() {
     fake.hold_subscribes(true);
     assert!(poll_once(c.subscribe()).is_none());
     assert_eq!(fake.held_subscribes(), 0);
+}
+
+#[tokio::test]
+async fn wait_for_held_subscribes_wakes_when_a_subscribe_is_held() {
+    let fake = station();
+    fake.hold_subscribes(true);
+    let c = client(&fake);
+    // The wait starts first, and waits: nothing is held yet.
+    let mut waiting = pin!(fake.wait_for_held_subscribes(1));
+    assert!(poll_once(waiting.as_mut()).is_none());
+    let mut subscribe = pin!(c.subscribe());
+    assert!(poll_once(subscribe.as_mut()).is_none());
+    tokio::time::timeout(BOUND, waiting).await.unwrap();
+    assert_eq!(fake.held_subscribes(), 1);
+    // And again when the held subscribe goes away.
+    let mut gone = pin!(fake.wait_for_held_subscribes(0));
+    assert!(poll_once(gone.as_mut()).is_none());
+    fake.hold_subscribes(false);
+    let events = tokio::time::timeout(BOUND, subscribe)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(BOUND, gone).await.unwrap();
+    drop(events);
 }
 
 // The receipt window (rule 8).
@@ -952,9 +1055,13 @@ async fn a_held_subscribe_fails_with_stopping_on_restart_and_never_joins_the_new
         .await
         .unwrap();
     assert_eq!(fake.subscriber_count(), 0);
-    // With the hold released, a new subscribe works and sees the new instance only.
+    // The restart kept the hold: a new subscribe is held too.
+    let mut subscribe = pin!(c.subscribe());
+    assert!(poll_once(subscribe.as_mut()).is_none());
+    assert_eq!(fake.held_subscribes(), 1);
+    // With the hold released, it works and sees the new instance only.
     fake.hold_subscribes(false);
-    let mut events = tokio::time::timeout(BOUND, c.subscribe())
+    let mut events = tokio::time::timeout(BOUND, subscribe)
         .await
         .unwrap()
         .unwrap();

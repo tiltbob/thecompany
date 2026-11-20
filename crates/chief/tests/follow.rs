@@ -9,7 +9,7 @@ use chief::api::*;
 use chief::client::{
     Client, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
 };
-use chief::fake::{FakeStation, SendOutcome};
+use chief::fake::{FAKE_LOG_CAPACITY, FakeStation, SendOutcome};
 use chief::follow::{FOLLOW_MEMORY, LogFollower, LogUpdate};
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -84,48 +84,59 @@ async fn a_backlog_spans_several_pages_and_a_short_log() {
     // 40 messages of 16 KiB need two pages under the byte budget.
     let mut f = c.follow_log(None, 50).await.unwrap();
     assert_eq!(ready(&mut f), added(1..=40));
-    let logs = fake
+    // Pages, not counting the attach's page of `limit: 0`.
+    let pages = fake
         .requests()
         .iter()
-        .filter(|r| matches!(r, Request::Log { .. }))
+        .filter(|r| matches!(r, Request::Log { limit, .. } if *limit > 0))
         .count();
-    assert!(logs >= 2, "{logs}");
+    assert!(pages >= 2, "{pages}");
 }
 
 #[tokio::test]
 async fn messages_between_the_subscribe_and_the_page_are_shown_once() {
-    let fake = fake_with_peers();
-    receive_n(&fake, "bob", 3);
-    fake.on_call(|fake, request| {
-        if matches!(request, Request::Log { .. }) {
-            // After the subscribe and before the page: their events are queued, and the page
-            // holds them too. One is an outgoing send that is delivered at once (rev 1).
-            fake.receive("bob", "between").unwrap();
-            fake.receive("alice", "between").unwrap();
-            assert!(
-                poll_once(Client::new(fake.clone()).send("bob", "sent between"))
-                    .unwrap()
-                    .is_ok()
-            );
-            fake.clear_on_call();
-        }
-    });
-    let c = Client::new(fake.clone());
-    let mut f = c.follow_log(None, 50).await.unwrap();
-    // seq 6 is already delivered in the page: rev 1, and its stale events are skipped.
-    assert_eq!(
-        ready(&mut f),
-        vec![
-            (true, 1, 0),
-            (true, 2, 0),
-            (true, 3, 0),
-            (true, 4, 0),
-            (true, 5, 0),
-            (true, 6, 1)
-        ]
-    );
-    fake.receive("bob", "after").unwrap();
-    assert_eq!(ready(&mut f), added([7]));
+    // Before the attach's page of `limit: 0` (the first `Log` call), and between it and the page
+    // (the second).
+    for nth in [1, 2] {
+        let fake = fake_with_peers();
+        receive_n(&fake, "bob", 3);
+        let mut logs = 0;
+        fake.on_call(move |fake, request| {
+            if matches!(request, Request::Log { .. }) {
+                logs += 1;
+                if logs < nth {
+                    return;
+                }
+                // After the subscribe and before the page: their events are queued, and the page
+                // holds them too. One is an outgoing send that is delivered at once (rev 1).
+                fake.receive("bob", "between").unwrap();
+                fake.receive("alice", "between").unwrap();
+                assert!(
+                    poll_once(Client::new(fake.clone()).send("bob", "sent between"))
+                        .unwrap()
+                        .is_ok()
+                );
+                fake.clear_on_call();
+            }
+        });
+        let c = Client::new(fake.clone());
+        let mut f = c.follow_log(None, 50).await.unwrap();
+        // seq 6 is already delivered in the page: rev 1, and its stale events are skipped.
+        assert_eq!(
+            ready(&mut f),
+            vec![
+                (true, 1, 0),
+                (true, 2, 0),
+                (true, 3, 0),
+                (true, 4, 0),
+                (true, 5, 0),
+                (true, 6, 1)
+            ],
+            "Log call {nth}"
+        );
+        fake.receive("bob", "after").unwrap();
+        assert_eq!(ready(&mut f), added([7]), "Log call {nth}");
+    }
 }
 
 #[tokio::test]
@@ -494,13 +505,18 @@ async fn a_reread_that_finds_a_new_instance_after_its_pages_applies_nothing_and_
 
 #[tokio::test]
 async fn a_restart_while_attaching_is_disconnected() {
-    for tail in [10, 0] {
+    // In the attach's page of `limit: 0` (the first `Log` call), or, with a tail, in the page.
+    for (tail, nth) in [(10, 1), (10, 2), (0, 1)] {
         let fake = fake_with_peers();
         receive_n(&fake, "bob", 3);
-        fake.on_call(|fake, request| {
+        let mut logs = 0;
+        fake.on_call(move |fake, request| {
             if matches!(request, Request::Log { .. }) {
-                fake.clear_on_call();
-                fake.restart("INSTANCE-2");
+                logs += 1;
+                if logs == nth {
+                    fake.clear_on_call();
+                    fake.restart("INSTANCE-2");
+                }
             }
         });
         let c = Client::new(fake.clone());
@@ -509,7 +525,7 @@ async fn a_restart_while_attaching_is_disconnected() {
                 c.follow_log(None, tail).await,
                 Err(ApiError::Disconnected { detail }) if detail.contains("restarted")
             ),
-            "tail {tail}"
+            "tail {tail}, Log call {nth}"
         );
     }
 }
@@ -938,43 +954,6 @@ async fn a_stream_of_live_messages_does_not_make_the_held_call_again() {
 }
 
 #[tokio::test]
-async fn held_messages_overflowing_start_the_reread_again() {
-    let fake = fake_with_peers().with_log_capacity(FOLLOW_MEMORY);
-    let h = held(&fake);
-    let c = Client::new(h.clone());
-    let mut f = c.follow_log(None, 0).await.unwrap();
-    receive_n(&fake, "bob", SUBSCRIPTION_CAPACITY + 1); // lost in a gap
-    h.logs.hold_next();
-    let (logs, statuses) = (h.logs.received(), h.statuses.received());
-    let mut yielded = Vec::new();
-    {
-        let mut next = pin!(tokio::task::unconstrained(f.next()));
-        assert!(poll_now(next.as_mut()).is_none());
-        // More than FOLLOW_MEMORY live messages while the page call is held, in rounds the
-        // subscription can hold.
-        for _ in 0..FOLLOW_MEMORY / 200 + 1 {
-            receive_n(&fake, "bob", 200);
-            assert!(poll_now(next.as_mut()).is_none());
-        }
-        // The message that found the held ones full started the re-read again: a new instance
-        // check, and a new page call, held too.
-        assert_eq!(
-            (h.logs.received(), h.statuses.received()),
-            (logs + 2, statuses + 2)
-        );
-        h.logs.release();
-        let first = within(next.as_mut()).await.unwrap().unwrap();
-        let m = first.message();
-        yielded.push((matches!(first, LogUpdate::Added(_)), m.seq, m.rev));
-    }
-    yielded.extend(ready(&mut f));
-    // Every message the log still holds, once, oldest first.
-    let log: Vec<(bool, u64, u32)> = fake.messages().iter().map(|m| (true, m.seq, 0)).collect();
-    assert_eq!(log.len(), FOLLOW_MEMORY);
-    assert_eq!(yielded, log);
-}
-
-#[tokio::test]
 async fn a_message_held_during_a_reread_at_the_pages_rev_is_yielded_once() {
     let fake = fake_with_peers();
     fake.set_outcome(SendOutcome::Hold);
@@ -1221,4 +1200,380 @@ async fn a_gap_as_a_page_answers_starts_the_reread_again() {
         ready(&mut f),
         added(2..=1 + 2 * (SUBSCRIPTION_CAPACITY as u64 + 1))
     );
+}
+
+// The floor of an attach: what has left the log is never shown (defect A of #105).
+
+#[tokio::test]
+async fn an_evicted_sends_outcome_after_a_tail_0_attach_with_a_peer_filter_is_not_shown() {
+    let fake = fake_with_peers().with_log_capacity(2);
+    fake.set_outcome(SendOutcome::Hold);
+    let c = Client::new(fake.clone());
+    assert_eq!(c.send("bob", "hi").await.unwrap().seq, 1);
+    receive_n(&fake, "alice", 2); // 2 and 3: the log no longer holds 1, nor any message of bob
+    let mut f = c.follow_log(Some("bob"), 0).await.unwrap();
+    assert!(ready(&mut f).is_empty());
+    // Rule 7: the outcome's event comes although 1 has left the log. It is older than the attach.
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![]);
+    fake.receive("bob", "new").unwrap();
+    assert_eq!(ready(&mut f), added([4]));
+}
+
+#[tokio::test]
+async fn an_evicted_sends_outcome_after_a_backlog_that_reached_the_end_of_the_log_is_not_shown() {
+    let fake = fake_with_peers().with_log_capacity(2);
+    fake.set_outcome(SendOutcome::Hold);
+    let c = Client::new(fake.clone());
+    assert_eq!(c.send("bob", "hi").await.unwrap().seq, 1);
+    receive_n(&fake, "alice", 2);
+    // The pages reach the oldest message the log holds, 2.
+    let mut f = c.follow_log(None, 5).await.unwrap();
+    assert_eq!(ready(&mut f), added([2, 3]));
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![]);
+    fake.receive("bob", "new").unwrap();
+    assert_eq!(ready(&mut f), added([4]));
+}
+
+// Held-back messages are never dropped while the follower lives (defect B of #105).
+
+#[tokio::test]
+async fn a_held_back_outcome_survives_a_second_resync() {
+    let fake = fake_with_peers();
+    fake.set_outcome(SendOutcome::Hold);
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    assert_eq!(c.send("bob", "held").await.unwrap().seq, 1);
+    assert_eq!(ready(&mut f), added([1]));
+    // 2..=1001: 1 leaves the log, and the subscription overflows.
+    receive_n(&fake, "alice", FAKE_LOG_CAPACITY);
+    h.logs.hold_next();
+    let logs = h.logs.received();
+    {
+        let mut next = pin!(tokio::task::unconstrained(f.next()));
+        assert!(poll_now(next.as_mut()).is_none());
+        assert_eq!(h.logs.received(), logs + 1, "the page call is held");
+        // The outcome of 1 (rev 1) arrives while the page call is held: it is held back.
+        fake.resolve(1, MessageStatus::Delivered).unwrap();
+        assert!(poll_now(next.as_mut()).is_none());
+        // A second gap: 1002..=1258.
+        receive_n(&fake, "alice", SUBSCRIPTION_CAPACITY + 1);
+        assert!(poll_now(next.as_mut()).is_none());
+        h.logs.release();
+        let first = within(next.as_mut()).await.unwrap().unwrap();
+        assert!(matches!(first, LogUpdate::Changed(_)), "{first:?}");
+        assert_eq!((first.message().seq, first.message().rev), (1, 1));
+    }
+    // Then what the log holds now, oldest first.
+    assert_eq!(ready(&mut f), added(259..=1258));
+}
+
+/// A gap for a follower that has shown nothing: 1..=257, all lost. Returns 257.
+fn a_gap_of_257(fake: &FakeStation) -> u64 {
+    receive_n(fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+    SUBSCRIPTION_CAPACITY as u64 + 1
+}
+
+/// Takes `rounds` rounds of 200 live messages while the re-read of `kind` is held, polling one
+/// `next()` between them, then releases the calls; returns everything yielded.
+async fn overflow_the_hold_back(
+    fake: &FakeStation,
+    h: &Held,
+    f: &mut LogFollower<'_, Held>,
+    kind: Kind,
+    rounds: usize,
+) -> Vec<(bool, u64, u32)> {
+    let mut yielded = Vec::new();
+    {
+        let mut next = pin!(tokio::task::unconstrained(f.next()));
+        assert!(poll_now(next.as_mut()).is_none());
+        for _ in 0..rounds {
+            receive_n(fake, "bob", 200);
+            assert!(poll_now(next.as_mut()).is_none());
+        }
+        match kind {
+            Kind::Log => h.logs.release(),
+            Kind::Status => h.statuses.release(),
+        }
+        let first = within(next.as_mut()).await.unwrap().unwrap();
+        let m = first.message();
+        yielded.push((matches!(first, LogUpdate::Added(_)), m.seq, m.rev));
+    }
+    yielded.extend(ready(f));
+    yielded
+}
+
+#[tokio::test]
+async fn held_messages_overflowing_are_all_yielded_with_the_default_log() {
+    let fake = fake_with_peers();
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    h.logs.hold_next();
+    let (logs, statuses) = (h.logs.received(), h.statuses.received());
+    // 21 rounds: 4,200 live messages while the page call is held, 104 more than may be held back.
+    let rounds = FOLLOW_MEMORY / 200 + 1;
+    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Log, rounds).await;
+    let newest = lost + 200 * rounds as u64;
+    // The page, read on release, holds the newest 1,000; with the 4,096 held back, every live
+    // message once, oldest first. 1..=257 have left the log.
+    assert_eq!(yielded, added(lost + 1..=newest));
+    // A full hold-back is no gap: the held page call went on. Since messages were dropped, one more
+    // re-read followed: two checks and one page each.
+    assert_eq!(
+        (h.logs.received(), h.statuses.received()),
+        (logs + 2, statuses + 4)
+    );
+}
+
+#[tokio::test]
+async fn messages_dropped_while_the_hold_back_is_full_are_recovered_by_another_reread() {
+    let fake = fake_with_peers();
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    // The instance check and the pages (1..=257) pass; the final check is held.
+    h.statuses.hold_after(1);
+    let (logs, statuses) = (h.logs.received(), h.statuses.received());
+    let rounds = FOLLOW_MEMORY / 200 + 1;
+    let yielded = overflow_the_hold_back(&fake, &h, &mut f, Kind::Status, rounds).await;
+    let newest = lost + 200 * rounds as u64;
+    // The re-read gives 1..=257 and the 4,096 held back; the next re-read, two checks and one page
+    // more, the 104 dropped ones.
+    assert_eq!(yielded, added(1..=newest));
+    assert_eq!(
+        (h.logs.received(), h.statuses.received()),
+        (logs + 2, statuses + 4)
+    );
+}
+
+#[tokio::test]
+async fn held_messages_that_left_the_log_come_before_newer_recovered_ones() {
+    let fake = fake_with_peers().with_log_capacity(10);
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    h.logs.hold_next();
+    let mut yielded = Vec::new();
+    {
+        let mut next = pin!(tokio::task::unconstrained(f.next()));
+        assert!(poll_now(next.as_mut()).is_none());
+        // 258..=277 are held back; the log keeps only 268..=277.
+        receive_n(&fake, "bob", 20);
+        assert!(poll_now(next.as_mut()).is_none());
+        h.logs.release();
+        let first = within(next.as_mut()).await.unwrap().unwrap();
+        let m = first.message();
+        yielded.push((matches!(first, LogUpdate::Added(_)), m.seq, m.rev));
+    }
+    yielded.extend(ready(&mut f));
+    assert_eq!(yielded, added(lost + 1..=lost + 20));
+}
+
+#[tokio::test]
+async fn the_outcome_of_a_message_lost_in_a_gap_that_left_the_log_is_not_shown() {
+    let fake = fake_with_peers().with_log_capacity(100);
+    fake.set_outcome(SendOutcome::Hold);
+    let c = Client::new(fake.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    assert_eq!(c.send("bob", "held").await.unwrap().seq, 1);
+    // 2..=258: the event of 1 is lost in the gap with them, and 1 leaves the log.
+    receive_n(&fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+    assert_eq!(ready(&mut f), added(159..=258));
+    // Its outcome now would put 1 after 258: it is not shown.
+    fake.resolve(1, MessageStatus::Delivered).unwrap();
+    assert_eq!(ready(&mut f), vec![]);
+    fake.receive("bob", "new").unwrap();
+    assert_eq!(ready(&mut f), added([259]));
+}
+
+// What the review of #105 found untested.
+
+/// A follower with nothing shown, a log that keeps 5 messages, and a gap (1..=257, lost); then
+/// the `nth` call of `kind` of the re-read fails, after 10 live messages (258..=267) arrived
+/// while it was pending. They are held back; the log keeps only 263..=267. Returns what is
+/// yielded after the error.
+async fn live_messages_across_a_failed_call(kind: Kind, nth: usize) -> Vec<(bool, u64, u32)> {
+    let fake = fake_with_peers().with_log_capacity(5);
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    receive_n(&fake, "bob", SUBSCRIPTION_CAPACITY + 1);
+    a.after(kind, nth, true, |fake| receive_n(fake, "bob", 10));
+    assert!(matches!(
+        within(f.next()).await,
+        Err(ApiError::Disconnected { .. })
+    ));
+    ready(&mut f)
+}
+
+#[tokio::test]
+async fn live_messages_held_across_a_failed_page_are_yielded_once() {
+    // The page is read again: it holds 263..=267 only, and the held-back ones give the rest.
+    assert_eq!(
+        live_messages_across_a_failed_call(Kind::Log, 1).await,
+        added(258..=267)
+    );
+}
+
+#[tokio::test]
+async fn live_messages_held_across_a_failed_final_check_are_yielded_once() {
+    // The page (253..=257) was read before them; only the final check is made again.
+    assert_eq!(
+        live_messages_across_a_failed_call(Kind::Status, 2).await,
+        added(253..=267)
+    );
+}
+
+#[tokio::test]
+async fn a_stop_as_a_page_fails_ends_the_follower_without_the_error() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    a.after(Kind::Log, 1, true, FakeStation::stop);
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_gap_as_a_page_fails_starts_the_reread_again_without_the_error() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    let statuses = a.statuses.load(Ordering::SeqCst);
+    a.after(Kind::Log, 1, true, deliver_and_overflow);
+    let first = within(f.next()).await.unwrap().unwrap();
+    assert_eq!((first.message().seq, first.message().rev), (1, 1));
+    assert_eq!(a.statuses.load(Ordering::SeqCst), statuses + 3);
+    assert_eq!(
+        ready(&mut f),
+        added(2..=1 + 2 * (SUBSCRIPTION_CAPACITY as u64 + 1))
+    );
+}
+
+/// A live message, then the end of the station.
+fn live_then_stop(fake: &FakeStation) {
+    fake.receive("bob", "live").unwrap();
+    fake.stop();
+}
+
+#[tokio::test]
+async fn a_live_message_and_a_stop_as_the_final_check_answers_end_the_follower() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    // Both are ready when the final check answers: the end, behind the message, still wins.
+    a.after(Kind::Status, 2, false, live_then_stop);
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_live_message_and_a_stop_as_a_page_answers_end_the_follower() {
+    let fake = fake_with_peers();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    a_gap_with_a_pending_send(&fake, &c).await;
+    a.after(Kind::Log, 1, false, live_then_stop);
+    assert_eq!(within(f.next()).await, Ok(None));
+    assert_eq!(f.next().await, Ok(None));
+}
+
+#[tokio::test]
+async fn peer_and_status_events_during_a_held_call_do_not_make_it_again() {
+    let fake = fake_with_peers();
+    let h = held(&fake);
+    let c = Client::new(h.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    let lost = a_gap_of_257(&fake);
+    h.logs.hold_next();
+    let (logs, statuses) = (h.logs.received(), h.statuses.received());
+    {
+        let mut next = pin!(tokio::task::unconstrained(f.next()));
+        assert!(poll_now(next.as_mut()).is_none());
+        assert_eq!(
+            (h.logs.received(), h.statuses.received()),
+            (logs + 1, statuses + 1)
+        );
+        fake.set_tower_state(TowerState::Connected);
+        fake.set_link("bob", "STATION-B", Link::Relayed).unwrap();
+        assert!(poll_now(next.as_mut()).is_none());
+        // Still the one page call, and no new instance check.
+        assert_eq!(
+            (h.logs.received(), h.statuses.received()),
+            (logs + 1, statuses + 1)
+        );
+        h.logs.release();
+        let first = within(next.as_mut()).await.unwrap().unwrap();
+        assert_eq!((first.message().seq, first.message().rev), (1, 0));
+    }
+    assert_eq!(ready(&mut f), added(2..=lost));
+    assert_eq!(
+        (h.logs.received(), h.statuses.received()),
+        (logs + 1, statuses + 2)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_second_page_of_a_reread_goes_on_with_its_cursor() {
+    // Uninterrupted.
+    let fake = big_log_after_attach();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    overflow_with_big_messages(&fake);
+    let start = fake.requests().len();
+    let mut whole = Vec::new();
+    while whole.len() < 300 {
+        whole.push(within(f.next()).await.unwrap().unwrap());
+    }
+    let whole_calls = fake.requests()[start..].to_vec();
+    assert!(
+        matches!(
+            whole_calls[..3],
+            [
+                Request::Status,
+                Request::Log { before: None, .. },
+                Request::Log {
+                    before: Some(_),
+                    ..
+                }
+            ]
+        ),
+        "{whole_calls:?}"
+    );
+
+    // The second page fails once (after the fake answered it).
+    let fake = big_log_after_attach();
+    let a = AfterAnswer::new(&fake);
+    let c = Client::new(a.clone());
+    let mut f = c.follow_log(None, 0).await.unwrap();
+    overflow_with_big_messages(&fake);
+    let start = fake.requests().len();
+    a.after(Kind::Log, 2, true, |_| {});
+    assert!(matches!(
+        within(f.next()).await,
+        Err(ApiError::Disconnected { .. })
+    ));
+    let mut interrupted = Vec::new();
+    while interrupted.len() < 300 {
+        interrupted.push(within(f.next()).await.unwrap().unwrap());
+    }
+    // The same calls, with the second page asked again with its cursor; no new instance check.
+    let mut expected = whole_calls.clone();
+    expected.insert(3, whole_calls[2].clone());
+    assert_eq!(fake.requests()[start..].to_vec(), expected);
+    assert_eq!(interrupted, whole);
 }

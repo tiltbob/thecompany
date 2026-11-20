@@ -106,8 +106,9 @@
 //! 9. **Text from outside.** Before a frontend sees a string that came from a peer or a tower, the
 //!    station replaces every control character in it with a space: every `char` for which
 //!    `char::is_control` is true (C0, DEL and C1, so newline, carriage return, tab and escape too).
-//!    M1 messages are therefore single lines (AGENTS.md, hard rule 8). [`TowerState::Failing`] and
-//!    [`TowerState::Denied`] carry display text: show it, never match on it.
+//!    Incoming M1 messages are therefore single lines (AGENTS.md, hard rule 8); an outgoing body is
+//!    logged as the frontend sent it (rule 7). [`TowerState::Failing`] and [`TowerState::Denied`]
+//!    carry display text: show it, never match on it.
 //! 10. **Peer book.** Peer names follow [`check_peer_name`] and are compared byte for byte.
 //!     [`Request::PeerAdd`] creates the peer or appends the station to an existing one and pushes
 //!     [`Event::Peer`]; adding a station the peer already has changes nothing and pushes nothing.
@@ -117,8 +118,9 @@
 //!     ([`ApiError::Invalid`], field `station_id`); a station that belongs to another peer
 //!     ([`ApiError::StationTaken`]). [`Request::PeerRemove`] fails the
 //!     peer's outgoing messages that are still `Sending` (rule 7, with their events), closes its
-//!     links and pushes [`Event::PeerRemoved`]. Any change of a link pushes [`Event::Peer`] with the
-//!     whole peer.
+//!     links and pushes [`Event::PeerRemoved`]. Any other change of a link pushes [`Event::Peer`]
+//!     with the whole peer; the links that `PeerRemove` closes push no [`Event::Peer`]:
+//!     [`Event::PeerRemoved`] stands for the whole peer, its links included.
 //! 11. **End of a subscription.** A subscription ends when the station stops or the transport
 //!     loses its connection: [`crate::client::Subscription::next`] returns the events still queued,
 //!     then `None`, and `None` on every later call. It never resumes. To go on, the client
