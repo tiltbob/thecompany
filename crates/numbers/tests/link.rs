@@ -853,12 +853,18 @@ async fn receiver_deadline_resets_a_chat_held_by_the_application() {
             );
             let header = StreamHeader::chat();
             // Hold the application's reply sender while the raw peer waits for the reset.
+            let started = Instant::now();
             let (response, held) = checked(
                 timeout(SEND_DEADLINE + Duration::from_secs(1), async {
                     tokio::join!(request(&conn, &header, &chat), inbox.recv())
                 })
                 .await,
                 "reset the unanswered chat by the receiver deadline",
+            );
+            // The receiver's timer starts after `started`, so a correct reset is never early.
+            assert!(
+                started.elapsed() >= SEND_DEADLINE - Duration::from_millis(250),
+                "the receiver reset the chat before its send deadline"
             );
             let held = held.expect("receive the complete chat before it times out");
             assert_delivery(&held, peer_id, "second", &chat);
