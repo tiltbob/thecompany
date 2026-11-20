@@ -9,6 +9,7 @@
 mod actor;
 mod history;
 mod storage;
+mod towers;
 
 #[cfg(unix)]
 pub mod ipc;
@@ -18,18 +19,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chief::api::{ApiError, Request, Response, Status, TowerStatus};
+use chief::api::{ApiError, Request, Response, Status};
 use chief::client::{Subscription, Transport};
-use iroh::Watcher;
 use numbers::link::{LINK_ALPN, Link, LinkConfig};
 use numbers::proto::CHAT_PROTOCOL;
-use numbers::{Authorizer, Endpoint, EndpointConfig, TowerSet, TowerSetError, node_id};
+use numbers::{
+    Authorizer, DnsConfig, Endpoint, EndpointConfig, Locator, TlsRoots, TowerSet, node_id,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use actor::{Actor, Command};
 use storage::{Storage, StorageError};
+use towers::{RuntimeTowers, TowerMode, canonical_domain};
 
 pub use numbers::IpTransport;
 
@@ -38,13 +41,30 @@ pub const MESSAGE_LOG_CAPACITY: usize = 1_000;
 
 const COMMAND_CAPACITY: usize = 64;
 
-/// Configuration for a station with one explicit M1 tower.
+/// Selects how to configure the station's towers for one run.
+#[derive(Clone)]
+pub enum TowerInput {
+    /// Use this nonempty set for this run. The station leaves remembered towers untouched.
+    Pinned(TowerSet),
+    /// Use this bootstrap domain, reusing the remembered set for the same domain.
+    Domain(String),
+    /// Use the stored domain and set. Discover towers if its set is empty.
+    Remembered,
+}
+
+/// Configuration for a station and its tower connections.
 #[derive(Clone)]
 pub struct StationConfig {
     /// Private state directory. Its ancestors must be writable only by the station user or root.
     pub data_dir: PathBuf,
-    /// The tower's base URL.
-    pub tower_url: String,
+    /// How this run obtains its tower set and bootstrap domain.
+    pub tower_input: TowerInput,
+    /// Root certificates for HTTPS towers.
+    pub tls_roots: TlsRoots,
+    /// DNS settings for tower connections and the default SRV locator.
+    pub dns: DnsConfig,
+    /// Optional SRV locator override. By default, discovery uses [`Self::dns`].
+    pub locator: Option<Arc<dyn Locator>>,
     /// Which IP sockets the endpoint binds. Use `RelayOnly` to disable direct paths.
     pub ip_transport: IpTransport,
     /// Budget for connecting to one peer station.
@@ -54,12 +74,15 @@ pub struct StationConfig {
 }
 
 impl StationConfig {
-    /// Uses the default IP transport, a five-second connect timeout and a fifteen-second send
-    /// deadline.
-    pub fn new(data_dir: impl Into<PathBuf>, tower_url: impl Into<String>) -> Self {
+    /// Uses the default TLS roots, DNS and IP transport, a five-second connect timeout and a
+    /// fifteen-second send deadline.
+    pub fn new(data_dir: impl Into<PathBuf>, tower_input: TowerInput) -> Self {
         Self {
             data_dir: data_dir.into(),
-            tower_url: tower_url.into(),
+            tower_input,
+            tls_roots: TlsRoots::default(),
+            dns: DnsConfig::default(),
+            locator: None,
             ip_transport: IpTransport::Default,
             connect_timeout: Duration::from_secs(5),
             send_deadline: Duration::from_secs(15),
@@ -84,9 +107,15 @@ pub enum StartError {
     /// Another station holds the lock for this data directory.
     #[error("another station is already running with this data directory")]
     AlreadyRunning,
-    /// The tower cannot be configured for this station.
-    #[error("invalid station tower configuration: {0}")]
-    InvalidTower(TowerSetError),
+    /// The explicitly pinned tower set is empty.
+    #[error("a pinned station requires at least one tower")]
+    EmptyPinnedTowers,
+    /// The supplied bootstrap domain is invalid.
+    #[error("invalid station bootstrap domain")]
+    InvalidBootstrapDomain,
+    /// The station was asked to resume without a usable remembered domain.
+    #[error("the station needs pinned towers or a bootstrap domain")]
+    MissingTowerConfig,
     /// A timeout is zero or cannot be represented as a deadline.
     #[error("station timeouts must be nonzero and representable as deadlines")]
     InvalidTimeouts,
@@ -137,13 +166,19 @@ impl fmt::Debug for Station {
 }
 
 impl Station {
-    /// Takes the data-dir lock, syncs the directory, and starts the local endpoint. This never
-    /// waits for a tower or a peer. Call it on a Tokio runtime with I/O and time enabled.
+    /// Takes the data-dir lock, syncs the directory, and starts the local endpoint. Discovery
+    /// runs in the station actor after startup. This never waits for discovery, a tower, or a
+    /// peer. Call it on a Tokio runtime with I/O and time enabled.
     pub async fn start(config: StationConfig) -> Result<Self, StartError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| StartError::RuntimeRequired)?;
-        let towers = TowerSet::from_url(&config.tower_url).map_err(StartError::InvalidTower)?;
-        let tower_url = towers.entries()[0].url().to_owned();
+        let input = match config.tower_input {
+            TowerInput::Pinned(set) if set.is_empty() => return Err(StartError::EmptyPinnedTowers),
+            TowerInput::Domain(domain) => TowerInput::Domain(
+                canonical_domain(&domain).map_err(|_| StartError::InvalidBootstrapDomain)?,
+            ),
+            input => input,
+        };
         let now = Instant::now();
         for duration in [config.connect_timeout, config.send_deadline] {
             if duration.is_zero() || now.checked_add(duration).is_none() {
@@ -155,29 +190,33 @@ impl Station {
         let key = storage.load_node_key()?;
         let own_id = node_id(&key);
         let book = storage.load_peers(own_id)?;
+        let mode = TowerMode::prepare(input, &storage, config.locator, config.dns)?;
         let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
         if let Some(book) = &book {
             actor::authorize_book(&authorizer, book);
         }
         let endpoint_config = EndpointConfig {
-            towers,
+            towers: mode.set().clone(),
             ip_transport: config.ip_transport,
-            ..EndpointConfig::default()
+            tls_roots: config.tls_roots,
+            dns: config.dns,
         };
         let endpoint = Endpoint::bind(&key, endpoint_config, Arc::clone(&authorizer))
             .await
             .map_err(|_| StartError::Bind)?;
 
-        let mut relay = endpoint.iroh().home_relay_status();
+        let relay = endpoint.iroh().home_relay_status();
+        let towers = RuntimeTowers {
+            mode,
+            control: endpoint.tower_control(),
+        };
         let status = Status {
             station_id: own_id.to_string(),
             instance_id,
-            towers: vec![TowerStatus {
-                url: tower_url,
-                state: actor::tower_state(relay.get().first()),
-                source: None,
-            }],
-            bootstrap_domain: None,
+            towers: towers
+                .statuses()
+                .unwrap_or_else(|_| towers.mode.statuses(&[])),
+            bootstrap_domain: towers.mode.domain().map(str::to_owned),
         };
         let (network, incoming) = Link::start(
             endpoint,
@@ -197,7 +236,7 @@ impl Station {
         );
         let (commands, receive) = mpsc::channel(COMMAND_CAPACITY);
         let (stop, stopped) = oneshot::channel();
-        let task = runtime.spawn(actor.run(network, incoming, relay, receive, stopped));
+        let task = runtime.spawn(actor.run(network, incoming, relay, towers, receive, stopped));
         Ok(Self {
             handle: StationHandle { commands },
             stop: Some(stop),

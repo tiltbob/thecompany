@@ -7,8 +7,9 @@ use std::process::ExitCode;
 
 use chief::paths::{PathEnv, check_socket_path};
 use clap::{Parser, Subcommand, error::ErrorKind};
+use numbers::TowerSet;
 use numbers_station::ipc::{IpcConfig, IpcError, IpcServer};
-use numbers_station::{ShutdownError, StartError, Station, StationConfig};
+use numbers_station::{ShutdownError, StartError, Station, StationConfig, TowerInput};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -107,7 +108,11 @@ fn resolve(args: Args, env: &PathEnv) -> Result<(StationConfig, PathBuf), RunErr
         .ok_or(RunError::DataDirectory)?;
     let socket = env.socket_path(&data_dir);
     check_socket_path(&socket).map_err(|_| RunError::SocketPath)?;
-    Ok((StationConfig::new(data_dir, tower), socket))
+    let towers = TowerSet::from_url(&tower).map_err(|_| RunError::TowerUrl)?;
+    Ok((
+        StationConfig::new(data_dir, TowerInput::Pinned(towers)),
+        socket,
+    ))
 }
 
 fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
@@ -129,6 +134,10 @@ enum RunError {
     DataDirectory,
     #[error("{SOCKET_PATH_GUIDANCE}")]
     SocketPath,
+    #[error(
+        "invalid --tower URL; use an HTTPS root URL or a loopback HTTP root URL without credentials, query, or fragment"
+    )]
+    TowerUrl,
     #[error("could not install the rustls ring provider")]
     CryptoProvider,
     #[error("could not register SIGINT and SIGTERM handlers")]
@@ -147,9 +156,9 @@ enum RunError {
 fn station_start_diagnostic(error: &StartError) -> &'static str {
     match error {
         StartError::AlreadyRunning => "another station is already running with this data directory",
-        StartError::InvalidTower(_) => {
-            "invalid --tower URL; use an HTTPS root URL or a loopback HTTP root URL without credentials, query, or fragment"
-        }
+        StartError::EmptyPinnedTowers => "a pinned station requires at least one tower",
+        StartError::InvalidBootstrapDomain => "invalid station bootstrap domain",
+        StartError::MissingTowerConfig => "the station needs pinned towers or a bootstrap domain",
         StartError::InvalidTimeouts => "invalid station timeouts",
         StartError::RuntimeRequired => "the station must be started inside a Tokio runtime",
         StartError::Randomness => "could not generate a station instance ID",

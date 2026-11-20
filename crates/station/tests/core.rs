@@ -10,8 +10,8 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chief::api::{
-    ApiError, Direction, Event, FailReason, Link as ApiLink, Message, MessageStatus, TowerState,
-    clean,
+    ApiError, Direction, Event, FailReason, Link as ApiLink, Message, MessageStatus, TowerSource,
+    TowerState, clean,
 };
 use chief::client::{Client, Subscription};
 use numbers::proto::CHAT_PROTOCOL;
@@ -22,9 +22,10 @@ use numbers::{
 };
 use numbers_station::{
     IpTransport, MESSAGE_LOG_CAPACITY, StartError, Station, StationConfig, StationHandle,
+    TowerInput,
 };
 use numbers_tower::{Tower, TowerConfig};
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, yield_now};
@@ -81,7 +82,8 @@ impl Network {
 }
 
 fn config(path: &Path, tower_url: &str, ip_transport: IpTransport) -> StationConfig {
-    let mut config = StationConfig::new(path, tower_url);
+    let towers = checked(TowerSet::from_url(tower_url), "validate loopback tower URL");
+    let mut config = StationConfig::new(path, TowerInput::Pinned(towers));
     config.ip_transport = ip_transport;
     config.connect_timeout = CONNECT_TIMEOUT;
     config.send_deadline = SEND_DEADLINE;
@@ -628,7 +630,7 @@ async fn station_starts_while_the_tower_is_unavailable() {
                 "status uses the installed tower's canonical URL"
             );
             assert_eq!(status.bootstrap_domain, None);
-            assert_eq!(status.towers[0].source, None);
+            assert_eq!(status.towers[0].source, Some(TowerSource::Configured));
             assert!(matches!(
                 status.towers[0].state,
                 TowerState::Standby | TowerState::Connecting | TowerState::Failing { .. }
@@ -679,8 +681,8 @@ async fn zero_timeouts_are_refused_and_leave_the_data_directory_free() {
 /// A loopback TCP forwarder in front of the tower, owned by one test for its whole duration.
 ///
 /// Until [`Forwarder::cut`] it pipes each accepted connection both ways to the tower. From then
-/// on it ends every piped connection and closes each new connection as soon as it is accepted,
-/// counting those refused connections. Its listener stays bound until the test shuts it down,
+/// on it ends every piped connection and closes each new connection without forwarding it,
+/// counting only refused relay upgrades. Its listener stays bound until the test shuts it down,
 /// after the station has stopped, so no other test can be given its port while the station
 /// keeps dialling it.
 struct Forwarder {
@@ -732,9 +734,19 @@ impl Forwarder {
                 continue;
             };
             if *down.borrow() {
-                refused.count.fetch_add(1, Ordering::SeqCst);
-                refused.grew.notify_one();
+                // The net report can also open a connection for GET /ping. Count only the
+                // relay actor's serial GET /relay retries, without reading any HTTP headers.
+                const RELAY_REQUEST: &[u8] = b"GET /relay ";
+                let mut prefix = [0; RELAY_REQUEST.len()];
+                let relay = timeout(CONNECT_TIMEOUT, client.read_exact(&mut prefix))
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                    && prefix == RELAY_REQUEST;
                 drop(client);
+                if relay {
+                    refused.count.fetch_add(1, Ordering::SeqCst);
+                    refused.grew.notify_one();
+                }
                 continue;
             }
             let mut down = down.clone();
@@ -813,10 +825,8 @@ async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() 
             within(
                 ONLINE_TIMEOUT,
                 async {
-                    // Reports queued before the outage can still say Connected. After each failed
-                    // attempt iroh publishes the failure (Failing) for the backoff, then Connecting
-                    // while it dials again; it publishes Connected only after a successful dial.
-                    // From the first report that is not Connected on, Connected is a failure.
+                    // Reports queued before the outage can still say Connected. From the first
+                    // report that is not Connected on, Connected is a failure.
                     let mut state = next_tower_state(&mut events).await;
                     while state == TowerState::Connected {
                         state = next_tower_state(&mut events).await;
@@ -825,35 +835,28 @@ async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() 
                         state = next_tower_state(&mut events).await;
                         assert_not_connected(&state);
                     }
-                    // The station must keep retrying after its first Failing report: wait until
-                    // the forwarder has refused a connection that it accepted after that report.
+                    // Iroh attempts relay upgrades serially. A second refused upgrade after the
+                    // first Failing report confirms that the intervening retry finished.
                     let refused = forwarder.refused();
                     loop {
                         tokio::select! {
-                            () = forwarder.refused_more_than(refused) => break,
+                            () = forwarder.refused_more_than(refused + 1) => break,
                             state = next_tower_state(&mut events) => assert_not_connected(&state),
                         }
                     }
-                    // Reports already queued can predate that attempt; the next Failing report
-                    // after them is a retry that failed again.
+                    // The station retains the previous home failure while retrying and emits a
+                    // Status event only when its state changes.
+                    let status = checked(client.status().await, "read tower status after retries");
+                    assert!(matches!(status.towers[0].state, TowerState::Failing { .. }));
                     while let Some(event) = queued_event(&mut events).await {
                         if let Event::Status { status } = event {
                             assert_not_connected(&status.towers[0].state);
-                        }
-                    }
-                    loop {
-                        let state = next_tower_state(&mut events).await;
-                        assert_not_connected(&state);
-                        if matches!(state, TowerState::Failing { .. }) {
-                            break;
                         }
                     }
                 },
                 "station keeps reporting a tower that is down as failing",
             )
             .await;
-            let status = checked(client.status().await, "read station status");
-            assert_not_connected(&status.towers[0].state);
             stop(station).await;
             forwarder.shutdown().await;
             network.shutdown().await;

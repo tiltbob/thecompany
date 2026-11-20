@@ -2104,6 +2104,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2112,6 +2113,7 @@ version = "0.0.0"
 dependencies = [
  "chief",
  "clap",
+ "numbers",
  "numbers-base",
  "numbers-station",
  "numbers-tower",

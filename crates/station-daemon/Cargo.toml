@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 chief.workspace = true
 clap.workspace = true
+numbers.workspace = true
 numbers-station.workspace = true
 rustls.workspace = true
 thiserror.workspace = true

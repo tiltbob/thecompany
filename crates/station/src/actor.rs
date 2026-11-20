@@ -4,21 +4,25 @@ use std::time::Duration;
 
 use chief::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, Link as PeerLink, Message,
-    MessageStatus, Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status,
-    TowerCandidatesPage, TowerState, check_peer_name, check_tower_url, clean, clean_tower_display,
+    MessageStatus, Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerAddOutcome,
+    TowerCandidatesPage, TowerRemoveOutcome, TowerStatus, check_peer_name, check_tower_url, clean,
 };
 use chief::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, subscription};
 use iroh::{Watcher, endpoint::RelayStatus};
 use numbers::link::{IncomingChat, Link, LinkHandle, LinkPath, PathUpdate};
 use numbers::proto::CHAT_PROTOCOL;
 use numbers::proto::chat::{ChatMessage, ChatReply, NackReason, ReceiptWindow};
-use numbers::{Authorizer, NodeId, Protocol};
+use numbers::{Authorizer, MAX_TOWERS, NodeId, Protocol, TowerControlError, TowerEntry};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::history::{History, internal};
 use crate::storage::{PeerBook, SaveOutcome, Storage};
+use crate::towers::{
+    DomainTowers, LOG_TARGET as TOWER_LOG_TARGET, LocateResult, RememberedTowers, RuntimeTowers,
+    SYNC_ERROR as TOWER_SYNC_ERROR, TowerMode, TowerOrigin,
+};
 use crate::{ShutdownError, new_id};
 
 const MAX_PENDING_SENDS: usize = 1_000;
@@ -31,6 +35,14 @@ pub(super) enum Command {
     Subscribe {
         reply: oneshot::Sender<Subscription>,
     },
+}
+
+enum Turn {
+    Command(Command),
+    Located(LocateResult),
+    RelayChanged,
+    Continue,
+    Stop,
 }
 
 struct Pending {
@@ -91,21 +103,29 @@ impl Actor {
         network: Link,
         mut incoming: mpsc::Receiver<IncomingChat>,
         mut relay: impl Watcher<Value = Vec<RelayStatus>> + Send,
+        mut towers: RuntimeTowers,
         mut commands: mpsc::Receiver<Command>,
         mut stop: oneshot::Receiver<()>,
     ) -> Result<(), ShutdownError> {
         let mut paths = self.links.subscribe_paths();
         self.refresh_all_paths();
-        loop {
+        let mut running = self.refresh_towers(&towers).is_ok();
+        while running {
             // Give shutdown priority while keeping command and network traffic fair.
-            let running = tokio::select! {
+            let turn = tokio::select! {
                 biased;
-                _ = &mut stop => false,
-                result = self.turn(&mut incoming, &mut relay, &mut paths, &mut commands) => result,
+                _ = &mut stop => Turn::Stop,
+                turn = self.turn(&mut incoming, &mut relay, &mut paths, &mut commands, &mut towers.mode) => turn,
             };
-            if !running {
-                break;
-            }
+            // Once selected, a command or lookup result can commit state. Keep its apply and
+            // reply together even if shutdown or a dropped caller follows the selection.
+            running = match turn {
+                Turn::Command(command) => self.command(command, &mut towers).await,
+                Turn::Located(result) => self.located(&mut towers, result).await,
+                Turn::RelayChanged => self.refresh_towers(&towers).is_ok(),
+                Turn::Continue => true,
+                Turn::Stop => false,
+            };
         }
 
         commands.close();
@@ -114,6 +134,7 @@ impl Actor {
         drop(incoming);
         drop(relay);
         drop(paths);
+        drop(towers);
         self.jobs.shutdown().await;
         let result = network.shutdown().await.map_err(|_| ShutdownError);
         // Keep the data directory locked through network shutdown.
@@ -127,35 +148,36 @@ impl Actor {
         relay: &mut impl Watcher<Value = Vec<RelayStatus>>,
         paths: &mut broadcast::Receiver<PathUpdate>,
         commands: &mut mpsc::Receiver<Command>,
-    ) -> bool {
+        towers: &mut TowerMode,
+    ) -> Turn {
         tokio::select! {
-            command = commands.recv() => match command {
-                Some(command) => self.command(command),
-                None => return false,
-            },
+            command = commands.recv() => return command.map_or(Turn::Stop, Turn::Command),
+            result = towers.locate() => return Turn::Located(result),
             chat = incoming.recv() => match chat {
                 Some(chat) => self.incoming_chat(chat),
-                None => return false,
+                None => return Turn::Stop,
             },
             status = relay.updated() => match status {
-                Ok(relays) => self.relay_update(&relays),
-                Err(_) => return false,
+                Ok(_) => return Turn::RelayChanged,
+                Err(_) => return Turn::Stop,
             },
             update = paths.recv() => match update {
                 Ok(update) => self.path_update(update.station_id),
                 Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_all_paths(),
-                Err(broadcast::error::RecvError::Closed) => return false,
+                Err(broadcast::error::RecvError::Closed) => return Turn::Stop,
             },
             Some(result) = self.jobs.join_next(), if !self.jobs.is_empty() => self.completed(result),
         }
-        true
+        Turn::Continue
     }
 
-    fn command(&mut self, command: Command) {
+    async fn command(&mut self, command: Command, towers: &mut RuntimeTowers) -> bool {
         match command {
             Command::Call { request, reply } => {
-                let response = self.call(request);
+                let response = self.call(request, towers).await;
+                let running = !matches!(response, Err(ApiError::Stopping));
                 let _ = reply.send(response);
+                running
             }
             Command::Subscribe { reply } => {
                 self.sinks.retain(|sink| !sink.is_closed());
@@ -164,26 +186,29 @@ impl Actor {
                 if reply.send(events).is_err() {
                     self.sinks.pop();
                 }
+                true
             }
         }
     }
 
-    fn call(&mut self, request: Request) -> Result<Response, ApiError> {
+    async fn call(
+        &mut self,
+        request: Request,
+        towers: &mut RuntimeTowers,
+    ) -> Result<Response, ApiError> {
         match request {
             Request::Status => Ok(Response::Status {
                 status: self.status.clone(),
             }),
-            // M1 pins the explicit startup tower and receives no tower announcements.
+            // Peer tower announcements are not received yet, so the candidate page is empty.
             Request::TowerCandidates { .. } => Ok(Response::TowerCandidates {
                 page: TowerCandidatesPage {
                     groups: Vec::new(),
                     next_after_peer: None,
                 },
             }),
-            Request::TowerAdd { url } | Request::TowerRemove { url } => {
-                check_tower_url(&url)?;
-                Err(ApiError::TowersPinned)
-            }
+            Request::TowerAdd { url } => self.add_tower(towers, &url).await,
+            Request::TowerRemove { url } => self.remove_tower(towers, &url).await,
             Request::Peers => Ok(Response::Peers {
                 peers: self
                     .book
@@ -205,6 +230,157 @@ impl Actor {
                 page: self.history.page(peer.as_deref(), before, limit)?,
             }),
         }
+    }
+
+    async fn add_tower(
+        &mut self,
+        towers: &mut RuntimeTowers,
+        input: &str,
+    ) -> Result<Response, ApiError> {
+        let url = check_tower_url(input)?;
+        let TowerMode::Domain(domain) = &mut towers.mode else {
+            return Err(ApiError::TowersPinned);
+        };
+        if domain.record.set().urls().any(|entry| entry == url) {
+            self.confirm_current_towers(domain)?;
+            return Ok(Response::TowerAdd {
+                tower: self.configured_tower(&url)?,
+                outcome: TowerAddOutcome::AlreadyInSet,
+            });
+        }
+        if domain.record.set().len() == MAX_TOWERS {
+            return Err(ApiError::TowerSetFull {
+                max: MAX_TOWERS as u32,
+            });
+        }
+        let entry = TowerEntry::from_url(&url).map_err(|error| internal(&error.to_string()))?;
+        let next = RememberedTowers::new(
+            domain.record.domain(),
+            domain
+                .record
+                .entries()
+                .map(|(entry, origin)| (entry.clone(), origin))
+                .chain([(entry, TowerOrigin::Configured)]),
+        )
+        .map_err(|error| internal(&error.to_string()))?;
+        let saved = self.apply_towers(towers, next).await?;
+        confirm_tower_durability(saved)?;
+        Ok(Response::TowerAdd {
+            tower: self.configured_tower(&url)?,
+            outcome: TowerAddOutcome::Added,
+        })
+    }
+
+    async fn remove_tower(
+        &mut self,
+        towers: &mut RuntimeTowers,
+        input: &str,
+    ) -> Result<Response, ApiError> {
+        let url = check_tower_url(input)?;
+        let TowerMode::Domain(domain) = &mut towers.mode else {
+            return Err(ApiError::TowersPinned);
+        };
+        if !domain.record.set().urls().any(|entry| entry == url) {
+            self.confirm_current_towers(domain)?;
+            return Ok(Response::TowerRemove {
+                url,
+                outcome: TowerRemoveOutcome::NotInSet,
+            });
+        }
+        let next = RememberedTowers::new(
+            domain.record.domain(),
+            domain
+                .record
+                .entries()
+                .filter(|(entry, _)| entry.url() != url)
+                .map(|(entry, origin)| (entry.clone(), origin)),
+        )
+        .map_err(|error| internal(&error.to_string()))?;
+        let saved = self.apply_towers(towers, next).await?;
+        confirm_tower_durability(saved)?;
+        Ok(Response::TowerRemove {
+            url,
+            outcome: TowerRemoveOutcome::Removed,
+        })
+    }
+
+    fn configured_tower(&self, url: &str) -> Result<TowerStatus, ApiError> {
+        self.status
+            .towers
+            .iter()
+            .find(|tower| tower.url == url)
+            .cloned()
+            .ok_or_else(|| internal("the configured tower is missing from status"))
+    }
+
+    fn confirm_current_towers(&self, domain: &mut DomainTowers) -> Result<(), ApiError> {
+        if !domain.uncertain {
+            return Ok(());
+        }
+        let saved = self
+            .storage
+            .save_towers(&domain.record)
+            .map_err(|error| internal(&error.to_string()))?;
+        domain.uncertain = saved == SaveOutcome::DurabilityUncertain;
+        confirm_tower_durability(saved)
+    }
+
+    async fn apply_towers(
+        &mut self,
+        towers: &mut RuntimeTowers,
+        next: RememberedTowers,
+    ) -> Result<SaveOutcome, ApiError> {
+        let TowerMode::Domain(domain) = &mut towers.mode else {
+            return Err(ApiError::TowersPinned);
+        };
+        let saved = self
+            .storage
+            .save_towers(&next)
+            .map_err(|error| internal(&error.to_string()))?;
+        // A visible commit replaces any older discovery result, even if its sync failed.
+        domain.lookup = None;
+        towers
+            .control
+            .set_towers(next.set())
+            .await
+            .map_err(|_| ApiError::Stopping)?;
+        domain.apply(next, saved);
+        self.refresh_towers(towers)
+            .map_err(|_| ApiError::Stopping)?;
+        Ok(saved)
+    }
+
+    async fn located(&mut self, towers: &mut RuntimeTowers, result: LocateResult) -> bool {
+        let TowerMode::Domain(domain) = &mut towers.mode else {
+            return true;
+        };
+        domain.lookup = None;
+        let Ok(entries) = result else {
+            tracing::warn!(target: TOWER_LOG_TARGET, "initial tower discovery failed");
+            return true;
+        };
+        let next = RememberedTowers::new(
+            domain.record.domain(),
+            entries.into_iter().map(|entry| (entry, TowerOrigin::Srv)),
+        );
+        let next = match next {
+            Ok(next) if !next.set().is_empty() => next,
+            _ => {
+                tracing::warn!(target: TOWER_LOG_TARGET, "initial tower discovery returned no usable set");
+                return true;
+            }
+        };
+        match self.apply_towers(towers, next).await {
+            Ok(SaveOutcome::Durable) => {}
+            Ok(SaveOutcome::DurabilityUncertain) => {
+                tracing::warn!(target: TOWER_LOG_TARGET, "{TOWER_SYNC_ERROR}");
+            }
+            Err(ApiError::Stopping) => return false,
+            Err(_) => {
+                tracing::warn!(target: TOWER_LOG_TARGET, "could not save the discovered tower set");
+            }
+        }
+        true
     }
 
     fn emit(&mut self, event: Event) {
@@ -424,15 +600,15 @@ impl Actor {
         }
     }
 
-    fn relay_update(&mut self, relays: &[RelayStatus]) {
-        let state = tower_state(relays.first());
-        let tower = &mut self.status.towers[0];
-        if tower.state != state {
-            tower.state = state;
+    fn refresh_towers(&mut self, towers: &RuntimeTowers) -> Result<(), TowerControlError> {
+        let statuses = towers.statuses()?;
+        if self.status.towers != statuses {
+            self.status.towers = statuses;
             self.emit(Event::Status {
                 status: self.status.clone(),
             });
         }
+        Ok(())
     }
 
     fn path_update(&mut self, id: NodeId) {
@@ -482,25 +658,6 @@ pub(super) fn authorize_book(authorizer: &Authorizer, book: &PeerBook) {
     );
 }
 
-pub(super) fn tower_state(relay: Option<&RelayStatus>) -> TowerState {
-    let Some(relay) = relay else {
-        return TowerState::Standby;
-    };
-    if relay.is_connected() {
-        TowerState::Connected
-    } else if let Some(reason) = relay.auth_denied_reason() {
-        TowerState::Denied {
-            reason: clean_tower_display(reason),
-        }
-    } else if let Some(error) = relay.last_error() {
-        TowerState::Failing {
-            error: clean_tower_display(&error.to_string()),
-        }
-    } else {
-        TowerState::Connecting
-    }
-}
-
 async fn deliver(
     link: LinkHandle,
     stations: Vec<NodeId>,
@@ -535,6 +692,13 @@ fn confirm_durable(saved: SaveOutcome) -> Result<(), ApiError> {
         SaveOutcome::DurabilityUncertain => Err(internal(
             "the peer book was written, but the station could not sync its data directory",
         )),
+    }
+}
+
+fn confirm_tower_durability(saved: SaveOutcome) -> Result<(), ApiError> {
+    match saved {
+        SaveOutcome::Durable => Ok(()),
+        SaveOutcome::DurabilityUncertain => Err(internal(TOWER_SYNC_ERROR)),
     }
 }
 
