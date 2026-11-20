@@ -2090,11 +2090,16 @@ name = "numbers-station"
 version = "0.0.0"
 dependencies = [
  "chief",
+ "getrandom 0.4.3",
+ "iroh",
  "numbers",
  "numbers-base",
+ "numbers-tower",
  "rustix",
  "serde",
+ "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -2102,7 +2107,17 @@ dependencies = [
 name = "numbers-station-daemon"
 version = "0.0.0"
 dependencies = [
+ "chief",
+ "clap",
+ "numbers-base",
  "numbers-station",
+ "numbers-tower",
+ "rustls",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

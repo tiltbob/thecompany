@@ -12,7 +12,7 @@ use chief::fake::{FAKE_LOG_CAPACITY, FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
     AFTER_HELP, CHAT_QUEUE_MAX, Cli, Command, Exit, LOG_MAX_BYTES, LOG_MAX_MESSAGES, PeerCommand,
-    format_change, format_message, format_time, run, say, socket_path,
+    TowerCommand, format_change, format_message, format_time, run, say, socket_path,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -795,7 +795,7 @@ fn status_help_describes_its_lines() {
         "denied (the tower refused this station, and trying again does not help until the \
          tower's operator changes that; the tower's reason follows; a tower of this project says \
          \"not on this tower's list\": give its operator the id that `chief id` prints)",
-        "configured (given when the station was started)",
+        "configured (given at startup or added by the chief without a matching peer announcement)",
         "remembered (stored by an earlier run)",
         "srv (found through the domain's DNS record)",
         "peer (named by a peer and added by the chief)",
@@ -803,6 +803,127 @@ fn status_help_describes_its_lines() {
     ] {
         assert!(help.contains(text), "{text:?} not in {help}");
     }
+}
+
+#[test]
+fn tower_help_describes_the_live_boundary_and_explicit_mutations() {
+    let help = cli(&["tower", "candidates", "--help"])
+        .unwrap_err()
+        .to_string();
+    for text in [
+        "one live page",
+        "candidate <peer> <url>",
+        "next-after-peer <peer>",
+        "no candidates",
+        "--after-peer <PEER>",
+        "--limit <N>",
+        "[default: 32]",
+        "A zero limit probes",
+        "raise the limit and keep your original boundary",
+    ] {
+        assert!(help.contains(text), "{text:?} not in {help}");
+    }
+    let remove = cli(&["tower", "remove", "--help"]).unwrap_err().to_string();
+    assert!(remove.contains("SRV discovery can bring a removed URL back"));
+}
+
+#[tokio::test]
+async fn empty_candidate_listing_prints_no_candidates() {
+    bounded(async {
+        let client = Client::new(FakeStation::new("STATION-A", "INSTANCE-1"));
+        assert_eq!(
+            exec(&client, &["tower", "candidates"]).await,
+            (Exit::Done, "no candidates\n".to_owned(), String::new()),
+        );
+    })
+    .await;
+}
+
+#[derive(Clone)]
+struct TowerReply(Response);
+
+impl Transport for TowerReply {
+    async fn call(&self, _request: Request) -> Result<Response, ApiError> {
+        Ok(self.0.clone())
+    }
+
+    async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        panic!("the tower command opens no subscription")
+    }
+}
+
+impl BindInstance for TowerReply {
+    fn bound_to(&self, _instance_id: &str) -> Self {
+        panic!("a single tower call does not bind to an instance")
+    }
+}
+
+#[tokio::test]
+async fn tower_field_output_strips_controls_and_stays_on_one_line() {
+    bounded(async {
+        let url = "https://tower.synthetic.invalid/\u{202e}\n other";
+        let page = TowerCandidatesPage {
+            groups: vec![TowerCandidateGroup {
+                peer: "un\u{1b}\t\u{2066}safe".into(),
+                candidates: vec![TowerCandidate { url: url.into() }],
+            }],
+            next_after_peer: Some("next\u{2029}peer".into()),
+        };
+        for (args, response, output) in [
+            (
+                &["tower", "candidates"][..],
+                Response::TowerCandidates { page },
+                concat!(
+                    "candidate un%20%20%20safe https://tower.synthetic.invalid/%20%20%20other\n",
+                    "next-after-peer next%20peer\n",
+                ),
+            ),
+            (
+                &["tower", "add", TOWER_A][..],
+                Response::TowerAdd {
+                    tower: tower(url, TowerState::Standby, Some(TowerSource::Configured)),
+                    outcome: TowerAddOutcome::Added,
+                },
+                "added https://tower.synthetic.invalid/%20%20%20other\n",
+            ),
+            (
+                &["tower", "remove", TOWER_A][..],
+                Response::TowerRemove {
+                    url: url.into(),
+                    outcome: TowerRemoveOutcome::Removed,
+                },
+                "removed https://tower.synthetic.invalid/%20%20%20other\n",
+            ),
+        ] {
+            let c = Client::new(TowerReply(response));
+            assert_eq!(
+                exec(&c, args).await,
+                (Exit::Done, output.into(), String::new())
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tower_api_errors_use_the_usual_clean_stderr() {
+    bounded(async {
+        let fake = FakeStation::new("STATION-A", "INSTANCE-1");
+        fake.fail_calls(Some(ApiError::Invalid {
+            field: "url".into(),
+            reason: "invalid\u{202e}\n\u{1b}text".into(),
+        }));
+        let client = Client::new(fake);
+        assert_eq!(
+            exec(&client, &["tower", "add", TOWER_A]).await,
+            (
+                Exit::Failed,
+                String::new(),
+                "invalid url: invalid   text\n".into()
+            ),
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2862,12 +2983,15 @@ impl Transport for Failing {
     }
 }
 
-const EVERY_COMMAND: [&[&str]; 9] = [
+const EVERY_COMMAND: [&[&str]; 12] = [
     &["id"],
     &["status"],
     &["peer", "add", "bob", "STATION-B"],
     &["peer", "ls"],
     &["peer", "rm", "bob"],
+    &["tower", "candidates"],
+    &["tower", "add", TOWER_A],
+    &["tower", "remove", TOWER_A],
     &["send", "bob", "hi"],
     &["log"],
     &["log", "bob"],
@@ -2879,12 +3003,12 @@ async fn transport_errors_exit_3() {
     bounded(async {
         let cases = [
             (
-                // This chief speaks API version 2; a newer station.
+                // A newer station.
                 ApiError::IncompatibleApi {
-                    station: 3,
-                    client: 2,
+                    station: 4,
+                    client: 3,
                 },
-                "the station speaks API version 3 and this chief speaks version 2; use the same \
+                "the station speaks API version 4 and this chief speaks version 3; use the same \
                  release of both\n",
             ),
             (
@@ -2963,7 +3087,7 @@ fn cli(args: &[&str]) -> Result<Cli, clap::Error> {
 #[test]
 fn every_command_parses() {
     let s = |v: &str| v.to_owned();
-    let cases: [(&[&str], Command); 9] = [
+    let cases: [(&[&str], Command); 13] = [
         (&["id"], Command::Id),
         (&["status"], Command::Status),
         (
@@ -2985,6 +3109,36 @@ fn every_command_parses() {
             &["peer", "rm", "bob"],
             Command::Peer {
                 command: PeerCommand::Rm { name: s("bob") },
+            },
+        ),
+        (
+            &["tower", "candidates"],
+            Command::Tower {
+                command: TowerCommand::Candidates {
+                    after_peer: None,
+                    limit: 32,
+                },
+            },
+        ),
+        (
+            &["tower", "candidates", "--limit", "0", "--after-peer=-!"],
+            Command::Tower {
+                command: TowerCommand::Candidates {
+                    after_peer: Some(s("-!")),
+                    limit: 0,
+                },
+            },
+        ),
+        (
+            &["tower", "add", TOWER_A],
+            Command::Tower {
+                command: TowerCommand::Add { url: s(TOWER_A) },
+            },
+        ),
+        (
+            &["tower", "remove", TOWER_A],
+            Command::Tower {
+                command: TowerCommand::Remove { url: s(TOWER_A) },
             },
         ),
         (
@@ -3042,6 +3196,13 @@ fn usage_errors() {
         &["peer"],
         &["peer", "add", "bob"],
         &["peer", "rm"],
+        &["tower"],
+        &["tower", "add"],
+        &["tower", "remove"],
+        &["tower", "candidates", "--after-peer"],
+        &["tower", "candidates", "--limit", "-1"],
+        &["tower", "candidates", "--limit", "4294967296"],
+        &["tower", "candidates", "extra"],
         &["send", "bob"],
         &["send", "bob", "two", "words"],
         &["log", "bob", "alice"],
@@ -3058,6 +3219,7 @@ fn usage_errors() {
         &["help"],
         &["--version"],
         &["peer", "--help"],
+        &["tower", "--help"],
     ] {
         let error = cli(args).unwrap_err();
         assert_eq!(Exit::for_parse_error(&error), Exit::Done, "{args:?}");

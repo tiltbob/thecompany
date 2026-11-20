@@ -155,23 +155,26 @@ again. So a station watches its home tower (below).
   it was configured with and the ones it remembered across restarts; and only then the SRV record
   again. A changed SRV record therefore matters to newcomers and to a node that has lost every
   tower, not to a running network.
-- **Towers named by a peer are candidates, not part of the set.** Stations exchange their working
-  tower sets over an established link. What a peer sends is checked, kept as candidates with the
-  peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
-  and never passes one on; a chief may take one into the set with an explicit command (decided in
-  #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
-- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
-  tower that is not connected, for some seconds, and never while the home tower is connected. Then
-  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
-  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+- **Towers named by a peer are candidates.** Stations exchange the HTTPS
+  entries of their working tower sets over an established link. What a peer sends is checked,
+  kept as candidates with the peer's name, and shown. A station never connects to a candidate,
+  never adds one to its relay map and never passes one on. A chief may take one into the set
+  with an explicit command (decided in #73). Automatic use would be an exception to hard rule 8
+  and is the owner's to grant.
+- **A station watches its home tower.** After some seconds with no home or a disconnected home,
+  it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
+  configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
+  connected home alone. A tower that denies the station is marked and shown with the reason. It
   is taken out of the relay map only if another tower of the set is not marked denied; if it is
   the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
   only when the set changes or at a long interval. The station limits its own attempts; it does not
   control iroh's own retries (decided in #74, built in #78).
-  Station API version 2 represents an unobserved tower as `Standby`, including when there is no
-  home tower observation. An explicit refusal remains `Denied`. Status can also carry the source
-  of each tower and the SRV bootstrap domain.
+  Station API version 2 introduced `Standby` for an unobserved tower, including when there is
+  no home tower observation, and optional tower sources and SRV bootstrap domain in Status. An
+  explicit refusal remains `Denied`. Version 3 defines bounded pages of candidate URLs with
+  their supplying peers and explicit requests to add or remove a tower. Status and subscription
+  events cover the installed set.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
@@ -247,7 +250,11 @@ If the higher-ID peer closes a link initiated by the lower-ID peer and the close
 lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
 peer can refuse both dials from the higher-ID peer with code `409`. The higher-ID peer can
 reconnect once the lower-ID peer detects the old connection's closure or retires it. M1 relies
-on QUIC and the send progress check for that detection. When looking for a connection after a
+on QUIC and the send progress check for that detection. In the loopback measurements of the
+appendix ("A lost close on a connection with several paths"), QUIC alone took up to about 5 s on
+a link with one path, and from a few seconds to 30 s and more on a link that had moved from the
+tower to a direct path.
+[#124](https://github.com/tiltbob/thecompany/issues/124) When looking for a connection after a
 lost election, it makes at most one fallback dial.
 
 Link application close codes are `400` for a bad hello or an acceptor's hello timeout, `403` for
@@ -276,11 +283,19 @@ connection, the sender checks for transport progress a full `connect_timeout` af
 request, if this interval is positive and shorter than the remaining send budget. A
 `connect_timeout` equal to or longer than `send_deadline` leaves the overall deadline in force
 and skips that early check. If the connection is still current and has received no
-authenticated QUIC frames since before the request was written, the sender closes it. A send
-waiting for stream credit skips the progress check. After a crash leaves a connection with no
-stream credit, sends can time out until QUIC's 30 s idle timeout or until the restarted peer
-connects first. QUIC replenishes credits in batches. The stall was reproduced with 14 unanswered
-sends on loopback. [#119](https://github.com/tiltbob/thecompany/issues/119)
+authenticated QUIC frames since before the request was written, the sender closes it.
+
+On that first attempt, a send waiting to open a stream also checks for authenticated QUIC
+frames. The wait for stream credit allows the greater of `connect_timeout` and the configured
+5 s transport keepalive plus 1 s for its acknowledgement. A quiet link can take a keepalive
+to transmit its queued STREAMS_BLOCKED frame. The observation stays with the current connection
+across short sends and resets when new authenticated frames arrive. A caller checks only within
+its original send deadline. If the observed connection is still current and has made
+no progress for the full interval, the sender closes it and can redial. QUIC replenishes
+credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
+An opt-in tower announcement takes one of those credits, so 13 unanswered chat sends can
+exhaust them.
+[#119](https://github.com/tiltbob/thecompany/issues/119)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that
 connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
@@ -292,6 +307,27 @@ leaves delivery uncertain because an earlier attempt can still be accepted. The 
 up to 16 concurrent incoming streams per link and applies `send_deadline` to each stream,
 including waiting for the actor's reply. It refuses unauthorized chat on an established link by
 resetting the stream with code `403`. A full or closed chat mailbox returns `unavailable`.
+
+An opt-in M2 link opens one `{"proto":"towers","v":1}` stream in each direction per admitted
+transport. It sends the HTTPS projection captured at admission in a `towers` array of `{url,
+qad_port}` entries. The whole list contains at most eight distinct canonical HTTPS root URLs.
+A missing or null QAD port means off. Receivers ignore unknown fields in the request and its
+entries. A list that violates the tower rules is rejected whole. Framed replies are
+`{"type":"ack"}` or `{"type":"nack","reason":"…"}` with reason `invalid_towers`,
+`unsupported_version` or `unavailable`. A chat-only link replies `unknown_protocol`. The tower
+stream needs its own authorization after the link hello. Refusal resets the stream with code
+`403`, and malformed frames reset it with code `0`. Replacement starts a new attempt even if the
+path is the same. An attempt ends on a reply, connection closure or deadline, and sends never
+retry or dial.
+
+Tower receives share the 16-stream limit and deadline. One tower stream per transport can read a
+body or wait for mailbox space or the actor. A further recognized tower stream receives
+`unavailable`. Slow headers and flow-controlled replies still use slots within the shared limit
+and deadline. The separate mailbox holds up to 32 snapshots. ACK follows the station's
+whole-snapshot commit while the exact admitted connection and peer remain current. A queued
+snapshot can still commit after its sender's deadline if that lease remains current. The native
+link treats received URLs as data. The station is responsible for retaining committed candidate
+snapshots across ordinary disconnects.
 
 ### Stations and the chief's frontends
 
@@ -609,13 +645,21 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  took it out of the map but left the home connection and the status as they were. A tower that
-  denies an endpoint can still become its home when another tower is
-  in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
+  took it out of the map but left the home connection and the raw status as they were. The same
+  can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
+  and `home_relay_status()` reports the actual home. The `numbers::Endpoint` runs a task that
+  follows `home_relay_status()` between `tower_states()` calls and clears its remembered failure
+  on an observed connection or home change.
+  Iroh's latest-value watcher can coalesce brief transitions. A map change requests a full net
+  report even when `insert_relay` keeps the same configuration, so a nudge needs no removal.
+  If a report is already running, a periodic tick or a minor network change can replace that
+  pending request with an incremental report. A tower that denies an endpoint can still become
+  its home when another tower is in the map (17 of 30) and keeps it; `remove_relay` of the denying
+  tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
-  31 s. Keep-alive is 5 s and idle timeout 30 s; a dial to an
+  31 s. At the QUIC layer, keepalive is 5 s and idle timeout is 30 s; a dial to an
   offline peer, or one whose filter ignores us, fails only by that timeout (30.0 s), and a peer
   killed without closing is noticed after 30.0 s. Two processes on one node key: the relay keeps
   only the newest, and the older one notices nothing (measured with two endpoints in one process).
@@ -626,6 +670,37 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
 - **Paths.** `conn.paths()`, `conn.paths_stream().wait_any(..)`, `conn.path_events()`; a path reports
   `is_relay()`, `is_ip()`, `is_selected()`. On one host a connection starts on the relay and selects
   the direct path 33–47 ms after `connect()` starts.
+- **A lost close on a connection with several paths (noq 1.5.0; measured for decision 124).**
+  `CONNECTION_CLOSE` leaves on the lowest-numbered path that can carry it: path 0 while it exists,
+  also when another path is selected (source; seen in all 26 runs that could tell). For three
+  times its largest probe timeout the closing side answers a packet from a validated path with
+  `CONNECTION_CLOSE` again, sent on that lowest path whichever path the packet came in on
+  (source; on one direct path on loopback this period ended 150–240 ms after the close). After
+  it, the endpoint answers with a stateless reset, at most one per 20 ms for the whole endpoint
+  (`min_reset_interval`), and none for a datagram of 21 bytes or less (source). The side that
+  still holds the connection accepts a reset only if two things hold (source): its endpoint has
+  the token registered under the address the reset comes from, and the token is path 0's, the
+  only one the connection compares. noq passes a path's token to the endpoint only when an ID of
+  that path is retired or replaced, so the token of the first ID of a path other than 0 is never
+  registered, and a reset drawn by a packet on such a path is dropped as "invalid CID": with only
+  a direct path 1 left, every one, in 12 of 12 runs. A reset for path 0's ID that comes from
+  another address than path 0's is dropped too; noq's NAT-traversal probes draw such resets and
+  use up the rate limit.
+  Measured from a lost close until a send of the closing side succeeded again (loopback, a dev
+  tower, the holder idle): one path, 4.7–5.0 s (35 runs; the holder's 5 s keep-alive draws the
+  reset); path 0 direct with a relay path beside it, 2.3–2.7 s (13 runs); path 0 relay with a
+  direct path selected, as after a first dial by node ID, 2.7–3.9 s in 7 of 13 runs and 14–63 s
+  in the other 6 (the 14–18 s runs ended once the direct path had idled out and a packet on the
+  relay path drew a reset, the 48–63 s runs by the connection timing out; no single timeout
+  explains 63 s); with the relay path gone, 30.7–30.9 s in 6 of 6 (the last path is not closed by
+  its own idle timer, so the connection's 30 s idle timeout decides).
+  An empty datagram sent on the held connection ended it within 10 ms on one path (35 runs) and
+  within 120 ms on path 0 of two (13 runs). When it left on a path other than 0, it helped only
+  while the closing side was still in its closing period (5 of 5 runs; the answer came back on
+  path 0); after that it changed nothing (14 runs).
+  A relay path closed about 33 s after its relay connection was cut (relay path idle timeout
+  30 s), and nothing in iroh opens a relay path again while a direct path is selected (source;
+  none came back in the 10 s the runs watched).
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
   equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket address holds
   108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107

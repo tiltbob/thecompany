@@ -360,6 +360,52 @@ async fn status_and_the_peer_book_through_the_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tower_candidates_and_explicit_changes_through_the_socket() {
+    bounded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let fake =
+            FakeStation::new_domain_backed("STATION-A", "INSTANCE-1", "team.synthetic.invalid");
+        let server = IpcServer::bind(fake.clone(), &socket_in(&dir), IpcConfig::default())
+            .await
+            .unwrap();
+        let client = Client::new(SocketTransport::new(server.path()));
+        const URL: &str = "https://tower.synthetic.invalid/";
+        client.peer_add("bob", "STATION-B").await.unwrap();
+        fake.receive_tower_candidates("bob", "STATION-B", &[URL])
+            .unwrap();
+        let page = client.tower_candidates(None, 1).await.unwrap();
+        assert_eq!(
+            page.groups,
+            vec![TowerCandidateGroup {
+                peer: "bob".into(),
+                candidates: vec![TowerCandidate { url: URL.into() }],
+            }]
+        );
+        assert_eq!(page.next_after_peer, None);
+
+        let mut events = client.subscribe().await.unwrap();
+        let added = client
+            .tower_add("HTTPS://Tower.SYNTHETIC.INVALID.:443")
+            .await
+            .unwrap();
+        assert_eq!(added.tower.url, URL);
+        assert_eq!(added.tower.source, Some(TowerSource::Peer));
+        assert_eq!(added.outcome, TowerAddOutcome::Added);
+        let status = client.status().await.unwrap();
+        assert_eq!(status.towers, vec![added.tower]);
+        assert_eq!(events.next().await, Some(Event::Status { status }));
+        let removed = client.tower_remove(URL).await.unwrap();
+        assert_eq!(removed.url, URL);
+        assert_eq!(removed.outcome, TowerRemoveOutcome::Removed);
+        let status = client.status().await.unwrap();
+        assert!(status.towers.is_empty());
+        assert_eq!(events.next().await, Some(Event::Status { status }));
+        assert_eq!(client.tower_candidates(None, 1).await.unwrap(), page);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_with_each_outcome_and_message_through_the_socket() {
     bounded(async {
         let rig = rig().await;

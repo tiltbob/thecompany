@@ -16,6 +16,9 @@
 //!   peer add <name> <station-id>   adds a station to a peer; prints the peer as stored
 //!   peer ls                        one line per peer station
 //!   peer rm <name>                 removes a peer
+//!   tower candidates [--after-peer PEER] [--limit N]  one live page of candidate URLs
+//!   tower add <url>                explicitly adds a tower to the installed set
+//!   tower remove <url>             explicitly removes a tower from the installed set
 //!   send <peer> <text>             sends a message; once the station accepted it, waits at most
 //!                                  120 s for its outcome
 //!   log [peer]                     the whole message log, oldest first
@@ -32,8 +35,8 @@
 //! the station restarts in between, the next call fails before it reaches the new instance, and
 //! the command ends with exit 3 and one line, as for a lost connection (`send` and `chat` add the
 //! lines below): it never mixes the answers of two instances, and never sends a typed line to a
-//! station other than the one whose messages it shows. `id`, `peer ls`, `peer add` and `peer rm`
-//! make one call each and need no binding.
+//! station other than the one whose messages it shows. `id`, the `peer` commands and the `tower`
+//! commands each make one call.
 //!
 //! # log
 //!
@@ -164,6 +167,13 @@
 //!   `no peers` when the book is empty.
 //! - `peer rm`: `removed <name>`. `send`: `delivered to <peer>`. An empty `log`: `no messages`.
 //!
+//! - `tower candidates`: `candidate <peer> <url>` per entry. If more groups remain, one
+//!   `next-after-peer <peer>` line follows. A page with no entries or continuation prints
+//!   `no candidates`. The empty boundary prints as `""`. Peer names, URLs and the continuation
+//!   each occupy one field.
+//! - `tower add`: `added <url>` or `<url> is already in the set`.
+//! - `tower remove`: `removed <url>` or `<url> is not in the set`.
+//!
 //! Errors go to stderr as plain sentences, one per line, starting lowercase.
 //!
 //! # Exit codes
@@ -183,7 +193,8 @@
 
 use chief::api::{
     ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message,
-    MessageStatus, Peer, TowerSource, TowerState, TowerStatus, clean,
+    MessageStatus, Peer, TOWER_CANDIDATES_PAGE_MAX_GROUPS, TowerAddOutcome, TowerRemoveOutcome,
+    TowerSource, TowerState, TowerStatus, clean,
 };
 use chief::client::{BindInstance, Client};
 use chief::follow::LogUpdate;
@@ -268,9 +279,9 @@ pub enum Command {
     /// that; the tower's reason follows; a tower of this project says "not on this tower's list":
     /// give its operator the id that `chief id` prints).
     ///
-    /// Sources: configured (given when the station was started); remembered (stored by an
-    /// earlier run); srv (found through the domain's DNS record); peer (named by a peer and added
-    /// by the chief).
+    /// Tower sources include configured (given at startup or added by the chief without a matching
+    /// peer announcement), remembered (stored by an earlier run), srv (found through the domain's
+    /// DNS record), and peer (named by a peer and added by the chief).
     ///
     /// Then one line per peer station: `peer <name> <station-id> <link>`.
     Status,
@@ -279,6 +290,12 @@ pub enum Command {
         /// What to do with the peer book.
         #[command(subcommand)]
         command: PeerCommand,
+    },
+    /// List candidates or change the installed tower set
+    Tower {
+        /// What to do with the towers.
+        #[command(subcommand)]
+        command: TowerCommand,
     },
     /// Send a message and wait for the outcome
     ///
@@ -345,6 +362,40 @@ pub enum PeerCommand {
     },
 }
 
+/// A `chief tower` command.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum TowerCommand {
+    /// Read one live page of candidate towers
+    ///
+    /// Prints `candidate <peer> <url>` per URL. If another group remains, the last line is
+    /// `next-after-peer <peer>`. A page with no entries or continuation prints `no candidates`.
+    /// Pass the continuation to `--after-peer` for the next page. New
+    /// announcements or a station restart can change later pages. A zero limit probes for another
+    /// group without listing any. To continue after a probe, raise the limit and keep your
+    /// original boundary, omitting `--after-peer` if it was omitted for the probe. An empty
+    /// boundary is displayed as `""`.
+    Candidates {
+        /// Only peer names strictly after this boundary
+        #[arg(long, value_name = "PEER")]
+        after_peer: Option<String>,
+        /// Maximum peer groups to read, capped at 32 (0 probes for more)
+        #[arg(long, value_name = "N", default_value_t = TOWER_CANDIDATES_PAGE_MAX_GROUPS)]
+        limit: u32,
+    },
+    /// Explicitly add a tower and print its canonical URL and outcome
+    Add {
+        /// Tower URL to add
+        url: String,
+    },
+    /// Explicitly remove a tower and print its canonical URL and outcome
+    ///
+    /// SRV discovery can bring a removed URL back into the set.
+    Remove {
+        /// Tower URL to remove
+        url: String,
+    },
+}
+
 /// How `chief` ends. [`Exit::code`] is the process's exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -402,6 +453,8 @@ impl Exit {
             | ApiError::StationTaken { .. }
             | ApiError::MessageNotFound { .. }
             | ApiError::Invalid { .. }
+            | ApiError::TowersPinned
+            | ApiError::TowerSetFull { .. }
             | ApiError::Internal { .. }
             | ApiError::BadRequest { .. } => Self::Failed,
         }
@@ -490,6 +543,13 @@ where
             PeerCommand::Add { name, station_id } => peer_add(client, name, station_id, out).await,
             PeerCommand::Ls => peer_ls(client, out).await,
             PeerCommand::Rm { name } => peer_rm(client, name, out).await,
+        },
+        Command::Tower { command } => match command {
+            TowerCommand::Candidates { after_peer, limit } => {
+                tower_candidates(client, after_peer.as_deref(), *limit, out).await
+            }
+            TowerCommand::Add { url } => tower_add(client, url, out).await,
+            TowerCommand::Remove { url } => tower_remove(client, url, out).await,
         },
         Command::Send { peer, text } => send(client, peer, text, out, err).await,
         Command::Log { peer } => log(client, peer.as_deref(), out).await,
@@ -625,13 +685,11 @@ fn shown_text(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// A URL as one field of a line: rule 9 applied ([`clean`]), then every white-space character
-/// left (the spaces `clean` made included) replaced with `%20`, one for one; `-` for an empty URL.
-/// A canonical URL is unchanged. A station holds canonical URLs only, but a broken one must not
-/// be able to put a false state in front of the real one (hard rule 8).
-fn url_token(url: &str) -> String {
-    let mut token = String::with_capacity(url.len());
-    for c in clean(url).chars() {
+/// One display field with rule 9 applied. Each remaining white-space character becomes
+/// `%20`, and an empty field becomes `-`. Canonical URLs and valid peer names stay intact.
+fn line_token(text: &str) -> String {
+    let mut token = String::with_capacity(text.len());
+    for c in clean(text).chars() {
         if c.is_whitespace() {
             token.push_str("%20");
         } else {
@@ -654,7 +712,7 @@ fn tower_line(tower: &TowerStatus) -> String {
         TowerState::Failing { error } => ("failing", shown_text(error)),
         TowerState::Denied { reason } => ("denied", shown_text(reason)),
     };
-    let mut line = format!("tower {} {state}", url_token(&tower.url));
+    let mut line = format!("tower {} {state}", line_token(&tower.url));
     if let Some(source) = tower.source {
         line.push_str(" (");
         line.push_str(source_label(source));
@@ -771,6 +829,62 @@ async fn peer_ls<T: BindInstance>(client: &Client<T>, out: &mut dyn Write) -> Ou
 async fn peer_rm<T: BindInstance>(client: &Client<T>, name: &str, out: &mut dyn Write) -> Outcome {
     client.peer_remove(name).await?;
     say(out, &format!("removed {name}"))?;
+    Ok(Exit::Done)
+}
+
+async fn tower_candidates<T: BindInstance>(
+    client: &Client<T>,
+    after_peer: Option<&str>,
+    limit: u32,
+    out: &mut dyn Write,
+) -> Outcome {
+    let page = client.tower_candidates(after_peer, limit).await?;
+    if page.groups.is_empty() && page.next_after_peer.is_none() {
+        say(out, "no candidates")?;
+    }
+    for group in page.groups {
+        let peer = line_token(&group.peer);
+        for candidate in group.candidates {
+            say(
+                out,
+                &format!("candidate {peer} {}", line_token(&candidate.url)),
+            )?;
+        }
+    }
+    if let Some(after_peer) = page.next_after_peer {
+        let cursor = if after_peer.is_empty() {
+            r#""""#.to_owned()
+        } else {
+            line_token(&after_peer)
+        };
+        say(out, &format!("next-after-peer {cursor}"))?;
+    }
+    Ok(Exit::Done)
+}
+
+async fn tower_add<T: BindInstance>(client: &Client<T>, url: &str, out: &mut dyn Write) -> Outcome {
+    let result = client.tower_add(url).await?;
+    let url = line_token(&result.tower.url);
+    let line = match result.outcome {
+        TowerAddOutcome::Added => format!("added {url}"),
+        TowerAddOutcome::AlreadyInSet => format!("{url} is already in the set"),
+    };
+    say(out, &line)?;
+    Ok(Exit::Done)
+}
+
+async fn tower_remove<T: BindInstance>(
+    client: &Client<T>,
+    url: &str,
+    out: &mut dyn Write,
+) -> Outcome {
+    let result = client.tower_remove(url).await?;
+    let url = line_token(&result.url);
+    let line = match result.outcome {
+        TowerRemoveOutcome::Removed => format!("removed {url}"),
+        TowerRemoveOutcome::NotInSet => format!("{url} is not in the set"),
+    };
+    say(out, &line)?;
     Ok(Exit::Done)
 }
 

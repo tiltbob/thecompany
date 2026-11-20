@@ -1,31 +1,40 @@
-//! Authenticated, bidirectional links and chat stream dispatch.
+//! Authenticated, bidirectional links and typed stream dispatch.
 
 mod streams;
+mod tower_exchange;
 
 #[cfg(test)]
 mod close_wait_tests;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::pending;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, ConnectionError, Side};
+use iroh::endpoint::{Connection, ConnectionError, FrameStats, RecvStream, SendStream, Side};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use n0_future::{FuturesUnordered, StreamExt};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
+use crate::endpoint::QUIC_KEEPALIVE;
 use crate::proto::chat::{ChatMessage, ChatReply, NackReason};
+use crate::proto::towers::TowerAnnouncement;
 use crate::proto::{CHAT_PROTOCOL, Hello};
-use crate::{Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, generate_node_key};
+use crate::{
+    Authorizer, CLOSE_NOT_ALLOWED, Endpoint, NodeId, Protocol, TowerSet, generate_node_key,
+};
 
 use self::streams::{
-    close_code, exchange_hello, read_chat_reply, receive_chat, write_chat_request,
+    close_code, exchange_hello, read_chat_reply, receive_stream, write_chat_request,
 };
+use self::tower_exchange::{TowerProtocol, announce};
+
+pub use self::tower_exchange::{IncomingTowers, TowerExchange};
 
 /// The ALPN of the numbers link.
 pub const LINK_ALPN: &[u8] = b"numbers/0";
@@ -35,16 +44,17 @@ const CLOSE_REPLACED: u32 = 409;
 const CLOSE_LINK: u32 = 0;
 const STREAM_LIMIT: usize = 16;
 const MAILBOX_CAPACITY: usize = 32;
+const STREAM_CREDIT_MARGIN: Duration = Duration::from_secs(1);
 
-/// Time budgets for a link and its chat operations.
+/// Time budgets for a link and its stream operations.
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
     /// Budget for transport setup and the application hello together.
     ///
     /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
-    /// The early progress check on an established connection needs a positive interval
-    /// shorter than the remaining send budget. Choose a positive value below the send
-    /// deadline to allow time for that check and a retry.
+    /// The progress check after writing a message needs a positive interval shorter
+    /// than the remaining send budget. A wait for stream credit also allows time for
+    /// a transport keepalive, and its progress observation can span several sends.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
@@ -143,6 +153,25 @@ impl Link {
     /// This performs no network wait. Call from a Tokio runtime with time enabled.
     pub fn start(endpoint: Endpoint, config: LinkConfig) -> (Self, mpsc::Receiver<IncomingChat>) {
         let (shared, receive) = Shared::new(&endpoint, config);
+        (Self::spawn(endpoint, shared), receive)
+    }
+
+    /// Starts chat and the opt-in tower exchange, seeded before the router starts.
+    ///
+    /// Enable [`crate::proto::TOWERS_PROTOCOL`] in the endpoint's stream authorizer. Each
+    /// admitted transport makes one bounded announcement attempt, including replacements.
+    /// This performs no network wait. Call from a Tokio runtime with time enabled.
+    pub fn start_with_towers(
+        endpoint: Endpoint,
+        config: LinkConfig,
+        working_set: &TowerSet,
+    ) -> (Self, mpsc::Receiver<IncomingChat>, TowerExchange) {
+        let (towers, exchange) = TowerProtocol::new(working_set);
+        let (shared, receive) = Shared::with_towers(&endpoint, config, Some(towers));
+        (Self::spawn(endpoint, shared), receive, exchange)
+    }
+
+    fn spawn(endpoint: Endpoint, shared: Arc<Shared>) -> Self {
         let workers = Arc::new(Mutex::new(Some(Workers {
             endpoint: endpoint.iroh().clone(),
             tasks: JoinSet::new(),
@@ -152,14 +181,11 @@ impl Link {
             .router_builder()
             .accept(LINK_ALPN, IncomingLinks(Arc::clone(&shared)))
             .spawn();
-        (
-            Self {
-                shared,
-                workers,
-                router,
-            },
-            receive,
-        )
+        Self {
+            shared,
+            workers,
+            router,
+        }
     }
 
     /// Gets a handle for station operations.
@@ -170,7 +196,7 @@ impl Link {
         }
     }
 
-    /// Closes links and the incoming mailbox, then waits for the workers and router.
+    /// Closes links and incoming mailboxes, then waits for the workers and router.
     pub async fn shutdown(self) -> Result<(), ShutdownError> {
         self.shared.stop();
         let workers = lock(&self.workers).take();
@@ -399,12 +425,21 @@ struct Shared {
     config: LinkConfig,
     authorizer: Arc<Authorizer>,
     incoming: Mutex<Option<mpsc::Sender<IncomingChat>>>,
+    towers: Option<TowerProtocol>,
     paths: broadcast::Sender<PathUpdate>,
     registry: Mutex<Registry>,
 }
 
 impl Shared {
     fn new(endpoint: &Endpoint, config: LinkConfig) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
+        Self::with_towers(endpoint, config, None)
+    }
+
+    fn with_towers(
+        endpoint: &Endpoint,
+        config: LinkConfig,
+        towers: Option<TowerProtocol>,
+    ) -> (Arc<Self>, mpsc::Receiver<IncomingChat>) {
         let (incoming, receive) = mpsc::channel(MAILBOX_CAPACITY);
         let (paths, _) = broadcast::channel(MAILBOX_CAPACITY);
         let shared = Arc::new(Self {
@@ -413,6 +448,7 @@ impl Shared {
             config,
             authorizer: endpoint.authorizer_handle(),
             incoming: Mutex::new(Some(incoming)),
+            towers,
             paths,
             registry: Mutex::default(),
         });
@@ -457,6 +493,9 @@ impl Shared {
             peer.revoke(&self.paths);
         }
         lock(&self.incoming).take();
+        if let Some(towers) = &self.towers {
+            towers.close();
+        }
     }
 
     fn hello(&self) -> Hello {
@@ -513,8 +552,11 @@ impl Shared {
                 transport: connection.clone(),
                 admitted_at: Instant::now(),
                 replaced_locally: AtomicBool::new(false),
+                tower_receive: Semaphore::new(1),
             }),
             path,
+            stream_credit_wait: None,
+            tower_announcement: self.towers.as_ref().map(TowerProtocol::snapshot),
         });
         publish_path(&self.paths, peer.id, old_path, path);
         DialResult::Ready
@@ -566,6 +608,41 @@ impl Peer {
         }
     }
 
+    fn stream_credit_wait(
+        &self,
+        connection: &Connection,
+        window: Duration,
+    ) -> Result<Option<Duration>, SendError> {
+        let mut state = self.state();
+        let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.matches(connection) && active.is_open())
+        else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let received = connection.stats().frame_rx;
+        let wait = active.stream_credit_wait.get_or_insert(StreamCreditWait {
+            since: now,
+            received,
+        });
+        // Keep the observation on the connection so a later caller can finish checking
+        // after an earlier send timed out or was cancelled. Authenticated traffic resets it.
+        if wait.received != received {
+            *wait = StreamCreditWait {
+                since: now,
+                received,
+            };
+        }
+        let remaining = window.saturating_sub(now.duration_since(wait.since));
+        if remaining.is_zero() {
+            connection.close(CLOSE_LINK.into(), b"");
+            return Err(SendError::Disconnected);
+        }
+        Ok(Some(remaining))
+    }
+
     fn update_path(&self, paths: &broadcast::Sender<PathUpdate>, connection: &Connection) {
         let mut state = self.state();
         if let Some(active) = state
@@ -608,6 +685,14 @@ impl PeerState {
 struct Active {
     connection: Arc<EstablishedConnection>,
     path: LinkPath,
+    stream_credit_wait: Option<StreamCreditWait>,
+    // This snapshot belongs to this admission even if the working set changes before drive.
+    tower_announcement: Option<Arc<TowerAnnouncement>>,
+}
+
+struct StreamCreditWait {
+    since: Instant,
+    received: FrameStats,
 }
 
 impl Active {
@@ -625,6 +710,7 @@ struct EstablishedConnection {
     admitted_at: Instant,
     // Read and written under the peer lock, including after removal from the active slot.
     replaced_locally: AtomicBool,
+    tower_receive: Semaphore,
 }
 
 async fn wait_for_close(
@@ -638,6 +724,52 @@ async fn wait_for_close(
     }
 }
 
+async fn open_chat_stream(
+    peer: &Peer,
+    connection: &Connection,
+    config: LinkConfig,
+    start: Instant,
+    check_progress: bool,
+) -> Result<(SendStream, RecvStream), SendError> {
+    let open = async {
+        connection
+            .open_bi()
+            .await
+            .map_err(|_| SendError::Disconnected)
+    };
+    if !check_progress {
+        return open.await;
+    }
+    // A blocked noq open queues STREAMS_BLOCKED without waking the driver. A quiet
+    // connection may need the next keepalive and time for the peer's ACK to arrive.
+    let window = config
+        .connect_timeout
+        .max(QUIC_KEEPALIVE + STREAM_CREDIT_MARGIN);
+    let check = async {
+        loop {
+            let remaining = config.send_deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let Some(wait) = peer.stream_credit_wait(connection, window)? else {
+                break;
+            };
+            if wait >= remaining {
+                break;
+            }
+            sleep(wait).await;
+        }
+        pending().await
+    };
+    tokio::select! {
+        biased;
+        // Only check credit progress after a real pending open. Prefer newly
+        // available credit if the open and the check wake up together.
+        result = open => result,
+        result = check => result,
+    }
+}
+
 async fn send_chat(
     peer: &Peer,
     connection: &Connection,
@@ -646,18 +778,16 @@ async fn send_chat(
     start: Instant,
     check_progress: bool,
 ) -> Result<ChatReply, SendError> {
-    let (send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|_| SendError::Disconnected)?;
+    let (send, mut recv) =
+        open_chat_stream(peer, connection, config, start, check_progress).await?;
     // In noq, frame_rx counts decoded frames after packet authentication, including QUIC
     // ACKs and PINGs. Application handling can lag while the connection keeps making progress.
     let received = check_progress.then(|| connection.stats().frame_rx);
     write_chat_request(send, message).await?;
     let remaining = config.send_deadline.saturating_sub(start.elapsed());
     let reply = read_chat_reply(&mut recv, remaining);
-    // Only start a checkpoint after queuing the request. Waiting for stream credit
-    // or the ability to write doesn't give the peer a request to acknowledge.
+    // Start the reply checkpoint after queuing the request so the peer has a request
+    // to acknowledge for the full interval.
     let Some(received) = received
         .filter(|_| !config.connect_timeout.is_zero() && config.connect_timeout < remaining)
     else {
@@ -889,6 +1019,26 @@ impl ProtocolHandler for IncomingLinks {
 }
 
 async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
+    let (lease, snapshot) = {
+        let mut state = peer.state();
+        let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.matches(&connection))
+        else {
+            return;
+        };
+        (
+            Arc::clone(&active.connection),
+            active.tower_announcement.take(),
+        )
+    };
+    let mut announcing = snapshot.is_some();
+    let mut outgoing = pin!(async {
+        if let Some(snapshot) = snapshot {
+            announce(&shared, &peer, &lease, snapshot).await;
+        }
+    });
     let mut path_events = connection.path_events();
     let mut streams = FuturesUnordered::new();
     // The installed connection's path can change between admission and subscription.
@@ -897,6 +1047,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
         tokio::select! {
             biased;
             _ = connection.closed() => break,
+            () = &mut outgoing, if announcing => announcing = false,
             event = path_events.next() => {
                 if event.is_none() {
                     break;
@@ -906,7 +1057,7 @@ async fn drive(shared: Arc<Shared>, peer: Arc<Peer>, connection: Connection) {
             _ = streams.next(), if !streams.is_empty() => {}
             incoming = connection.accept_bi(), if streams.len() < STREAM_LIMIT => {
                 let Ok((send, recv)) = incoming else { break };
-                streams.push(receive_chat(&shared, &peer, &connection, send, recv));
+                streams.push(receive_stream(&shared, &peer, &lease, send, recv));
             },
         }
     }
@@ -979,21 +1130,28 @@ mod tests {
     use crate::{EndpointConfig, IpTransport, generate_node_key};
 
     async fn loopback_endpoint() -> Endpoint {
+        endpoint_with_streams(&[CHAT_PROTOCOL]).await
+    }
+
+    pub(super) async fn endpoint_with_streams(streams: &'static [&'static str]) -> Endpoint {
         let endpoint = Endpoint::bind(
             &generate_node_key(),
             EndpointConfig {
                 ip_transport: IpTransport::LoopbackOnly,
                 ..EndpointConfig::default()
             },
-            Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL])),
+            Arc::new(Authorizer::new(&[LINK_ALPN], streams)),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("bind a loopback endpoint"));
         endpoint.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
         endpoint
     }
 
-    async fn connect(dialer: &Endpoint, listener: &Endpoint) -> (Connection, Connection) {
+    pub(super) async fn connect(
+        dialer: &Endpoint,
+        listener: &Endpoint,
+    ) -> (Connection, Connection) {
         let socket = listener.iroh().bound_sockets()[0];
         let address = iroh::EndpointAddr::new(listener.iroh().id()).with_ip_addr(socket);
         let (client, server) = tokio::join!(dialer.iroh().connect(address, LINK_ALPN), async {
@@ -1149,6 +1307,7 @@ mod tests {
             assert!(
                 shared.admit(&peer, &mut peer.state(), &server, None, [1; 16]) == DialResult::Ready
             );
+            let lease = Arc::clone(&peer.state().active.as_ref().unwrap().connection);
 
             let chat = ChatMessage {
                 id: "probe".into(),
@@ -1181,7 +1340,7 @@ mod tests {
                 },
                 async {
                     let (send, recv) = server.accept_bi().await.unwrap();
-                    receive_chat(&shared, &peer, &server, send, recv).await;
+                    receive_stream(&shared, &peer, &lease, send, recv).await;
                 }
             );
             assert_eq!(reply, Ok(ChatReply::Nack(NackReason::Unavailable)));
