@@ -8,15 +8,17 @@ use std::task::Poll;
 use std::time::Duration;
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
-use iroh::dns::DnsResolver;
+use iroh::dns::{Builder as DnsResolverBuilder, DnsProtocol, DnsResolver};
 use iroh::endpoint::{
     BindError, Incoming, InvalidSocketAddr, NetReportConfig, PortmapperConfig, QuicTransportConfig,
     RelayStatus, presets,
 };
 use iroh::protocol::{DynProtocolHandler, Router, RouterBuilder as IrohRouterBuilder};
+use iroh::tls::CaTlsConfig;
 use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher};
 use n0_future::task::AbortOnDropHandle;
 use n0_future::{StreamExt, boxed::BoxStream, stream};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use tokio::sync::Mutex;
 
 use crate::gate::Gate;
@@ -38,8 +40,6 @@ pub struct EndpointConfig {
 }
 
 /// Certificate roots for TLS connections to towers.
-///
-/// [Endpoint::bind] currently supports only [Self::WebPki].
 #[derive(Clone, Default)]
 pub enum TlsRoots {
     /// Trust the bundled WebPKI roots.
@@ -47,8 +47,34 @@ pub enum TlsRoots {
     WebPki,
     /// Trust the bundled WebPKI roots and the supplied DER-encoded certificates.
     WebPkiPlus(Vec<Vec<u8>>),
-    /// Trust only the supplied DER-encoded certificates.
+    /// Trust only the supplied DER-encoded certificates. The list must contain at least one.
     CustomOnly(Vec<Vec<u8>>),
+}
+
+impl TlsRoots {
+    fn ca_tls_config(self) -> Result<CaTlsConfig, EndpointBindError> {
+        match self {
+            Self::WebPki => Ok(CaTlsConfig::embedded()),
+            Self::WebPkiPlus(roots) => {
+                Ok(CaTlsConfig::embedded().with_extra_roots(validated_roots(roots)?))
+            }
+            Self::CustomOnly(roots) if roots.is_empty() => Err(EndpointBindError::InvalidTlsRoots),
+            Self::CustomOnly(roots) => Ok(CaTlsConfig::custom_roots(validated_roots(roots)?)),
+        }
+    }
+}
+
+fn validated_roots(
+    roots: Vec<Vec<u8>>,
+) -> Result<impl Iterator<Item = CertificateDer<'static>>, EndpointBindError> {
+    // iroh accepts the parseable subset. Validate every configured root before binding.
+    let mut store = RootCertStore::empty();
+    for root in &roots {
+        store
+            .add(CertificateDer::from(root.as_slice()))
+            .map_err(|_| EndpointBindError::InvalidTlsRoots)?;
+    }
+    Ok(roots.into_iter().map(CertificateDer::from))
 }
 
 impl fmt::Debug for TlsRoots {
@@ -62,15 +88,28 @@ impl fmt::Debug for TlsRoots {
 }
 
 /// DNS resolver settings for tower hosts.
-///
-/// [Endpoint::bind] currently supports only [Self::System].
 #[derive(Clone, Copy, Default)]
 pub enum DnsConfig {
     /// Use system DNS with public fallback resolvers disabled.
     #[default]
     System,
-    /// Use the specified nameserver.
+    /// Use this UDP nameserver with public fallback resolvers disabled.
+    /// The caller is responsible for providing a usable address and port.
     Nameserver(SocketAddr),
+}
+
+impl DnsConfig {
+    fn resolver_builder(self) -> DnsResolverBuilder {
+        let builder = DnsResolver::builder().disable_fallback();
+        #[allow(
+            deprecated,
+            reason = "NameserverConfig takes an IP and port and loses IPv6 scope"
+        )]
+        match self {
+            Self::System => builder.with_system_defaults(),
+            Self::Nameserver(addr) => builder.with_nameserver(addr, DnsProtocol::Udp),
+        }
+    }
 }
 
 impl fmt::Debug for DnsConfig {
@@ -97,10 +136,8 @@ pub enum IpTransport {
 /// An error opening the endpoint.
 #[derive(thiserror::Error)]
 pub enum EndpointBindError {
-    #[error("custom TLS roots are not supported by the numbers endpoint yet")]
-    UnsupportedTlsRoots,
-    #[error("an explicit DNS nameserver is not supported by the numbers endpoint yet")]
-    UnsupportedDns,
+    #[error("invalid TLS roots for the numbers endpoint")]
+    InvalidTlsRoots,
     #[error("could not configure the loopback socket for the numbers endpoint")]
     Loopback(#[source] InvalidSocketAddr),
     #[error("could not bind the numbers endpoint")]
@@ -314,12 +351,8 @@ impl Endpoint {
         config: EndpointConfig,
         authorizer: Arc<Authorizer>,
     ) -> Result<Self, EndpointBindError> {
-        if !matches!(config.tls_roots, TlsRoots::WebPki) {
-            return Err(EndpointBindError::UnsupportedTlsRoots);
-        }
-        if !matches!(config.dns, DnsConfig::System) {
-            return Err(EndpointBindError::UnsupportedDns);
-        }
+        let ca_tls_config = config.tls_roots.ca_tls_config()?;
+        let dns_resolver = config.dns.resolver_builder().build();
         let relays = config.towers.relay_map();
         let gate = Gate { authorizer };
         let mut net_report = NetReportConfig::default();
@@ -330,12 +363,9 @@ impl Endpoint {
             .keep_alive_interval(QUIC_KEEPALIVE)
             .default_path_keep_alive_interval(QUIC_KEEPALIVE)
             .build();
-        let dns_resolver = DnsResolver::builder()
-            .with_system_defaults()
-            .disable_fallback()
-            .build();
         let builder = iroh::Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(key))
+            .ca_tls_config(ca_tls_config)
             .relay_mode(RelayMode::Custom(relays.clone()))
             .address_lookup(TowerLookup {
                 relays: relays.clone(),

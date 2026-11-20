@@ -79,7 +79,7 @@ async fn a_send_to_an_unknown_peer_is_refused_before_anything_starts() {
 async fn the_pending_send_cap_refuses_one_more_until_a_send_finishes() {
     let dir = tempfile::tempdir().expect("create actor test directory");
     let (mut actor, link, _) = send_fixture(&dir.path().join("station")).await;
-    actor.link_config.send_deadline = HELD_DEADLINE;
+    actor.send_deadline = HELD_DEADLINE;
     actor
         .add_peer("other", &node_id(&generate_node_key()).to_string())
         .unwrap_or_else(|_| panic!("add the other peer"));

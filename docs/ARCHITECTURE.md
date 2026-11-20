@@ -246,7 +246,12 @@ After an outgoing dial ends in `Timeout` or `Disconnected`, each waiting send wi
 start or join one fresh dial within its original deadline. This applies to the send that started
 the failed dial as well. An already open link can serve the send, and a pending incoming hello
 can make a new outgoing dial unnecessary. Authorization refusals and bad hellos keep their own
-errors. If the link redials before iroh processes the close, iroh sends the dial's packets only to
+errors. With another candidate station available, the sender can skip this failed-dial retry.
+It then returns the observed failure even if another caller has started a fresh outgoing dial.
+An admitted link or an incoming hello can still serve the send. The existing recovery after a
+stale connection or lost election is available either way.
+
+If the link redials before iroh processes the close, iroh sends the dial's packets only to
 the old address while that path is still selected. Processing the last connection's close clears
 the selected path, so a subsequent resolution can start an address lookup. `numbers` installs
 `TowerLookup`, which supplies relay URLs. In M1 a peer that restarts on a new port is reached
@@ -301,7 +306,8 @@ frames. The progress window is `max(connect_timeout, 6 s)`, allowing at least th
 across short sends and resets when new authenticated frames arrive. A send that first observes
 a stall can close the connection only if its remaining budget exceeds the window. A later send
 can use the same observation to close and redial if the connection is still current and has made
-no progress for the full window. QUIC replenishes credits in batches. A crash with 14 unanswered
+no progress for the full window. A caller checks only within its original send deadline.
+QUIC replenishes credits in batches. A crash with 14 unanswered
 sends can exhaust those credits on loopback. An opt-in tower announcement takes one of those
 credits, so 13 unanswered chat sends can exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
@@ -569,8 +575,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
-  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
-  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
+  `EndpointConfig` defaults to WebPKI roots and system DNS. Custom DER roots can extend or replace
+  WebPKI, and an invalid root fails binding. An explicit UDP nameserver can replace system DNS.
+  Both DNS modes disable public fallback for relay connections and probes.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the

@@ -11,10 +11,10 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
-    CASE_TIMEOUT, CONNECT_TIMEOUT, RAW_GENERATION, accept_chat, accept_hello, acknowledge,
-    add_address, allow_peers, assert_delivery, bind_direct, bind_direct_with_key, checked, config,
-    expect_close, loopback_address, loopback_socket, message, ordered_keys, read,
-    rebind_after_shutdown, reply_to_chat, wait_for_path, while_sending, write,
+    CASE_TIMEOUT, CONNECT_TIMEOUT, PROBE_TIMEOUT, RAW_GENERATION, accept_chat, accept_hello,
+    acknowledge, add_address, allow_peers, assert_delivery, bind_direct, bind_direct_with_key,
+    checked, config, expect_close, loopback_address, loopback_socket, lose_outgoing_dial, message,
+    ordered_keys, read, rebind_after_shutdown, reply_to_chat, wait_for_path, while_sending, write,
 };
 
 async fn raw_server(config: LinkConfig) -> (Link, Endpoint) {
@@ -175,6 +175,56 @@ async fn shared_authorization_refusal_ends_without_a_retry() {
         )
         .await,
         "authorization refusal test timed out",
+    );
+}
+
+#[tokio::test]
+async fn failed_fallback_after_a_lost_dial_still_gets_a_fresh_retry() {
+    checked(
+        timeout(CASE_TIMEOUT, async {
+            let (lower, higher) = ordered_keys();
+            let (endpoint, auth) = bind_direct_with_key(&higher).await;
+            let (peer, peer_auth) = bind_direct_with_key(&lower).await;
+            let (_, peer_id) = allow_peers((&endpoint, &auth), (&peer, &peer_auth));
+            let address = loopback_address(&endpoint);
+            add_address(&endpoint, loopback_address(&peer));
+            peer.iroh().set_alpns(vec![LINK_ALPN.to_vec()]);
+            let (link, _inbox) = Link::start(
+                endpoint,
+                LinkConfig {
+                    connect_timeout: PROBE_TIMEOUT,
+                    send_deadline: PROBE_TIMEOUT * 3,
+                },
+            );
+            let handle = link.handle();
+            let chat = message(
+                "lost-then-failed",
+                "retry after a lost dial and failed fallback",
+            );
+            let mut send = pin!(handle.send(peer_id, chat.clone()));
+
+            let (first, _hello) = while_sending(send.as_mut(), accept_hello(&peer)).await;
+            while_sending(send.as_mut(), lose_outgoing_dial(&peer, &address, &first)).await;
+            // The pending winner failed its hello. Fail the fallback with an ordinary close
+            // so the sender needs its separate shared dial retry.
+            let (fallback, _hello) = while_sending(send.as_mut(), accept_hello(&peer)).await;
+            fallback.close(0u32.into(), b"");
+
+            let (retry, mut hello) = while_sending(send.as_mut(), accept_hello(&peer)).await;
+            let (result, ()) = tokio::join!(send, async {
+                hello.reply(RAW_GENERATION, [3; 16]).await;
+                hello.confirm([3; 16]).await;
+                reply_to_chat(&retry, &chat).await;
+            });
+            assert_eq!(result, Ok(ChatReply::Ack));
+            checked(
+                link.shutdown().await,
+                "stop link after failed fallback recovery",
+            );
+            peer.iroh().close().await;
+        })
+        .await,
+        "failed fallback dial recovery test timed out",
     );
 }
 

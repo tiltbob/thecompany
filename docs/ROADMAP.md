@@ -148,15 +148,16 @@ appears offline, or has not added you": an unknown caller is ignored, which look
 
 A send to a peer with several stations tries connected stations first, preserving peer-book order
 within each group. It tries one station at a time using the same message ID and one deadline, and
-stops on an acknowledgement or explicit refusal. An unavailable reply, transport error, or expired
-attempt lets it try the next station. The current attempt can use the time left after reserving one
-`connect_timeout` for each later candidate, with a minimum of one `connect_timeout` when the
-original deadline permits. The final candidate gets the remaining time. A station admits at most
-1,000 concurrent sends and returns an internal error if it is full. While the station is running,
-it publishes the final outcome even after its message leaves the log. The receiving station keeps
-the 1,000 most recent unique receipts across all peers in memory, keyed by peer name and message
-ID. Duplicate acknowledgements leave that order alone. Older receipts and those from a prior
-station instance can be accepted again.
+stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets it
+try the next station within the same deadline. The final candidate can retry a failed outgoing
+dial once. Earlier candidates advance after a failed dial, while keeping the usual recovery for
+a stale connection or a lost election. The same deadline also lets a connected station's reply
+arrive late in the send budget. A station admits at most 1,000 concurrent sends and returns an
+internal error if it is full. While the station is running, it publishes the final outcome even
+after its message leaves the log. The receiving station keeps the 1,000 most recent unique
+receipts across all peers in memory, keyed by peer name and message ID. Duplicate acknowledgements
+leave that order alone. Receipt deduplication applies within one station. Older receipts and those
+from a prior station instance can be accepted again.
 
 The private data directory must be on a local filesystem so the station can rely on its exclusive
 lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the
@@ -164,10 +165,14 @@ node key relative to the checked directory handle used for the lock. The peer bo
 object with a list of peer records, each containing a name and ordered canonical station IDs. It
 is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic rename and
 directory sync. Each staging attempt uses a fresh random name and leaves existing staging files
-untouched. If the rename succeeds but directory sync fails, the station applies
-the visible book and reports that the change may not survive a crash. While that running station
-has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
-and syncs the directory before giving its usual answer. These retries emit no additional events.
+untouched. If the rename succeeds but directory sync fails, the station applies the visible book
+and reports that the change may not survive a crash. The station syncs the directory under its
+lock before reading the book or accepting commands on startup. This flushes pending metadata, but
+an earlier writeback failure may already have been reported to the previous process. A loaded
+book, even an empty one, starts uncertain until a successful checked rewrite. While the book is
+uncertain, a duplicate peer add or a remove of an absent peer rewrites the current book and syncs
+the directory before giving its usual answer. These retries emit no additional events. With no
+book file, an absent remove does not create one.
 The saved file contains no network path state or message history. While the actor writes and syncs
 the peer book, command replies and event processing can pause. An incoming chat can receive
 `Unavailable` if its bounded mailbox fills during that time.
@@ -216,6 +221,7 @@ unlisted station denied.
 | `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. | #80, Claude |
 | `crates/chief-cli/src/lib.rs` | `chief tower candidates [--after-peer PEER] [--limit N]` reads one live page. `chief tower add URL` and `chief tower remove URL` request explicit changes and print their outcomes. | #122, Codex |
 | `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` with `StateDirectoryMode=0700` for the ACME cache, `Restart=on-failure` with `RestartPreventExitStatus=2 78` (the binary exits with 78 for a configuration error and 2 for a command-line error, 1 for what can pass), `CAP_NET_BIND_SERVICE`, sandboxing) and an example drop-in for certificate files through `LoadCredential=`, restarted on renewal. A test in the binary reads the unit by section, parses its `ExecStart` with clap and checks the directives the binary needs; `scripts/check-units.sh` (CI) runs `systemd-analyze verify --recursive-errors=no` on the unit alone and with the drop-in, fails on any message, and needs systemd 250 or later (skipped locally without it, a failure in CI). Docs: "Running the tower as a service" (`packaging/systemd/README.md`). | #82, Claude |
+| `packaging/systemd/` | the sandbox of `numbers-tower.service`: protected kernel settings, modules, logs, cgroups, clock and host name; no new namespaces (`clone3` covered from systemd 251), realtime scheduling or personality changes; a private `/dev`; no writable executable memory; the `@system-service` system-call filter for the native architecture, answering `EPERM`; a `/proc` without other users' processes or kernel files; `UMask=0077`. The test in the binary also checks `UMask=0077`; the README says how a refusal shows and how to take one setting out with a drop-in | #135, Claude |
 | `packaging/systemd/` | `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented), with the same test in the binary and the same check as the tower's unit; it waits for the station daemon (#53, #79) | #127, Claude |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
 | `scripts/walkthrough-tls.sh` | the walkthrough with the real binaries over TLS on loopback, run by CI | #84, Codex |

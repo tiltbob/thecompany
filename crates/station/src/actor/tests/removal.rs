@@ -28,7 +28,7 @@ use tokio::time::{sleep, timeout};
 
 use super::super::Actor;
 use super::queued_event;
-use crate::storage::{PeerBook, Storage};
+use crate::storage::Storage;
 
 /// Longer than any case may run, so an unanswered send cannot end by its deadline in a case.
 const SEND_BUDGET: Duration = Duration::from_secs(600);
@@ -115,10 +115,10 @@ async fn station(data_dir: &Path) -> Fixture {
     let actor = Actor::new(
         storage,
         own_id,
-        PeerBook::new(),
+        None,
         authorizer,
         status,
-        config,
+        SEND_BUDGET,
         link.handle(),
     );
     let (_, events) = subscription(SUBSCRIPTION_CAPACITY);

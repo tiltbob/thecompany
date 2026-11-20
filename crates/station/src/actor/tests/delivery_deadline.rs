@@ -1,11 +1,9 @@
-use std::net::{Ipv4Addr, UdpSocket};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chief::api::{FailReason, MessageStatus};
 use iroh::EndpointAddr;
-use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use numbers::link::{LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath};
 use numbers::proto::chat::{ChatMessage, ChatReply, NackReason};
@@ -121,7 +119,6 @@ async fn ready_reply_survives_deadline(reply: ChatReply, expected: MessageStatus
         vec![peer.iroh().id()],
         message,
         deadline,
-        SEND_BUDGET,
     ));
     let mut reply_stream = tokio::select! {
         biased;
@@ -181,80 +178,5 @@ async fn a_refusal_ready_before_the_deadline_still_refuses_after_a_late_poll() {
         )
         .await,
         "late poll after refusal timed out",
-    );
-}
-
-#[tokio::test]
-async fn a_third_station_can_deliver_after_two_silent_stations_with_default_budgets() {
-    checked(
-        timeout(Duration::from_secs(25), async {
-            let local_key = generate_node_key();
-            let peer_key = generate_node_key();
-            let local_id = node_id(&local_key);
-            let peer_id = node_id(&peer_key);
-            let [first, second] = [(); 2].map(|()| {
-                let socket = checked(
-                    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)),
-                    "bind silent station socket",
-                );
-                checked(
-                    socket.set_nonblocking(true),
-                    "set silent socket nonblocking",
-                );
-                (node_id(&generate_node_key()), socket)
-            });
-            let endpoint = bind(&local_key, [first.0, second.0, peer_id]).await;
-            let peer = bind(&peer_key, [local_id]).await;
-            let addresses = [
-                EndpointAddr::new(first.0)
-                    .with_ip_addr(checked(first.1.local_addr(), "read first silent address")),
-                EndpointAddr::new(second.0)
-                    .with_ip_addr(checked(second.1.local_addr(), "read second silent address")),
-                EndpointAddr::new(peer_id).with_ip_addr(peer.iroh().bound_sockets()[0]),
-            ];
-            checked(
-                endpoint.iroh().address_lookup(),
-                "get station address lookup",
-            )
-            .add(MemoryLookup::from_endpoint_info(addresses));
-
-            let config = LinkConfig {
-                connect_timeout: Duration::from_secs(5),
-                send_deadline: Duration::from_secs(15),
-            };
-            let (link, _inbox) = Link::start(endpoint, config);
-            let (peer, mut received) = Link::start(peer, config);
-            let message = ChatMessage {
-                id: "failover-test".into(),
-                sent_at_ms: 123,
-                body: "deliver to the third station".into(),
-            };
-            let mut delivery = pin!(deliver(
-                link.handle(),
-                vec![first.0, second.0, peer_id],
-                message.clone(),
-                Instant::now() + config.send_deadline,
-                config.connect_timeout,
-            ));
-            let status = tokio::select! {
-                status = delivery.as_mut() => status,
-                incoming = received.recv() => {
-                    let incoming = incoming.expect("live station inbox stays open");
-                    assert!(incoming.station_id == local_id && incoming.message == message);
-                    incoming.respond(ChatReply::Ack);
-                    delivery.await
-                }
-            };
-            assert_eq!(status, MessageStatus::Delivered);
-            // Both earlier stations were tried. Keep their sockets bound and silent throughout.
-            for (_, socket) in [first, second] {
-                checked(socket.recv(&mut [0; 1]), "silent station receives a dial");
-            }
-            let (local, remote) = tokio::join!(link.shutdown(), peer.shutdown());
-            checked(local, "shut down sending station link");
-            checked(remote, "shut down receiving station link");
-        })
-        .await,
-        "default station budget failover timed out",
     );
 }

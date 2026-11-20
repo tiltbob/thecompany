@@ -241,6 +241,27 @@ impl LinkHandle {
         station: NodeId,
         message: ChatMessage,
     ) -> Result<ChatReply, SendError> {
+        self.send_with_dial_retry(station, message, true).await
+    }
+
+    /// Sends one message, returning a failed dial without waiting for a fresh outgoing dial.
+    ///
+    /// An admitted link or pending incoming hello can still serve the send. Recovery after a
+    /// stale link or a lost election keeps its usual allowance within the send deadline.
+    pub async fn send_without_failed_dial_retry(
+        &self,
+        station: NodeId,
+        message: ChatMessage,
+    ) -> Result<ChatReply, SendError> {
+        self.send_with_dial_retry(station, message, false).await
+    }
+
+    async fn send_with_dial_retry(
+        &self,
+        station: NodeId,
+        message: ChatMessage,
+        dial_retry_available: bool,
+    ) -> Result<ChatReply, SendError> {
         message.validate().map_err(SendError::InvalidMessage)?;
         let peer = self.shared.peer(station)?;
         if self
@@ -253,7 +274,7 @@ impl LinkHandle {
         }
         timeout(
             self.shared.config.send_deadline,
-            self.send_message(&peer, &message),
+            self.send_message(&peer, &message, dial_retry_available),
         )
         .await
         .map_err(|_| SendError::Timeout)?
@@ -263,13 +284,13 @@ impl LinkHandle {
         &self,
         peer: &Arc<Peer>,
         message: &ChatMessage,
+        mut dial_retry_available: bool,
     ) -> Result<ChatReply, SendError> {
         let start = Instant::now();
         let config = self.shared.config;
         let mut first_attempt = true;
         let mut stale_retry_available = true;
         let mut replacement_retry_available = true;
-        let mut dial_retry_available = true;
         loop {
             let lease = self
                 .connection(peer, start, &mut dial_retry_available)

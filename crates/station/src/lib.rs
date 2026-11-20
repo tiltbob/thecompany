@@ -47,9 +47,8 @@ pub struct StationConfig {
     pub tower_url: String,
     /// Which IP sockets the endpoint binds. Use `RelayOnly` to disable direct paths.
     pub ip_transport: IpTransport,
-    /// Budget for one dial and its application hello. A retry can use more of the send budget.
-    /// When trying several stations, the sender reserves this duration for each later candidate
-    /// when its remaining send budget permits.
+    /// Budget for one dial and its application hello. The last candidate can retry a failed
+    /// dial within the send budget. An earlier candidate advances to the next after a failed dial.
     pub connect_timeout: Duration,
     /// Total budget for one send across all candidate stations.
     pub send_deadline: Duration,
@@ -139,8 +138,8 @@ impl fmt::Debug for Station {
 }
 
 impl Station {
-    /// Takes the data-dir lock and starts the local endpoint. This never waits for a tower or a
-    /// peer. Call it on a Tokio runtime with I/O and time enabled.
+    /// Takes the data-dir lock, syncs the directory, and starts the local endpoint. This never
+    /// waits for a tower or a peer. Call it on a Tokio runtime with I/O and time enabled.
     pub async fn start(config: StationConfig) -> Result<Self, StartError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| StartError::RuntimeRequired)?;
@@ -158,7 +157,9 @@ impl Station {
         let own_id = node_id(&key);
         let book = storage.load_peers(own_id)?;
         let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
-        actor::authorize_book(&authorizer, &book);
+        if let Some(book) = &book {
+            actor::authorize_book(&authorizer, book);
+        }
         let endpoint_config = EndpointConfig {
             towers,
             ip_transport: config.ip_transport,
@@ -179,18 +180,20 @@ impl Station {
             }],
             bootstrap_domain: None,
         };
-        let link_config = LinkConfig {
-            connect_timeout: config.connect_timeout,
-            send_deadline: config.send_deadline,
-        };
-        let (network, incoming) = Link::start(endpoint, link_config);
+        let (network, incoming) = Link::start(
+            endpoint,
+            LinkConfig {
+                connect_timeout: config.connect_timeout,
+                send_deadline: config.send_deadline,
+            },
+        );
         let actor = Actor::new(
             storage,
             own_id,
             book,
             authorizer,
             status,
-            link_config,
+            config.send_deadline,
             network.handle(),
         );
         let (commands, receive) = mpsc::channel(COMMAND_CAPACITY);

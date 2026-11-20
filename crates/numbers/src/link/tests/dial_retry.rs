@@ -144,6 +144,36 @@ async fn acknowledge_retry(connection: &Connection, expected: &ChatMessage) {
 }
 
 #[tokio::test]
+async fn failed_dial_after_the_original_deadline_does_not_reserve_a_retry() {
+    checked(
+        timeout(CASE_BUDGET, async {
+            let (link, remote, _, peer) = linked_endpoints().await;
+            let handle = link.handle();
+            let mut retry_available = true;
+            // Exercise the retry guard directly without the outer send timer.
+            let start = Instant::now() - SEND_BUDGET;
+            let mut connection = pin!(handle.connection(&peer, start, &mut retry_available));
+            assert!(poll_once(connection.as_mut()).await.is_pending());
+            let first_dial = peer.state().dial.clone().expect("first dial is reserved");
+            let (outgoing, _send, _recv) = hold_outgoing_hello(&remote).await;
+            outgoing.close(CLOSE_LINK.into(), b"");
+            wait_for_failed_dial(&peer, &first_dial).await;
+
+            let result = poll_once(connection.as_mut()).await;
+            assert!(
+                peer.state().dial.is_none(),
+                "an expired send must not reserve another dial"
+            );
+            assert!(matches!(result, Poll::Ready(Err(SendError::Timeout))));
+            checked(link.shutdown().await, "stop link after expired dial");
+            remote.iroh().close().await;
+        })
+        .await,
+        "expired dial retry test timed out",
+    );
+}
+
+#[tokio::test]
 async fn failed_dial_is_not_counted_until_the_pending_incoming_hello_fails() {
     checked(
         timeout(CASE_BUDGET, async {
