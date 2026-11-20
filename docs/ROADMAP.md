@@ -7,24 +7,30 @@ What gets built, in which order, and what is still open. The design itself is in
 
 Each milestone is one small, demoable PR series with an automated check and a manual demo.
 
+**One chief.** Settled by the owner: a network belongs to exactly one chief, who has a station on
+each device (a laptop, a phone); there are no teams and no second chief. M1 and M2 were planned
+and largely built before that, as "two chiefs chat". What they built stands: two stations of a
+peer book reach each other and chat. Under this model those stations are the chief's own, and
+the sections on M1 and M2 below keep their original wording.
+
 | # | Milestone | Done when | Needs |
 |---|---|---|---|
 | M0 | Scaffolding: workspace, toolchain pin, CI with the confinement lint, CLAUDE.md, docs, tracking issues | CI green with a real test per crate; issues exist | — |
-| **M1** | **Two chiefs chat**: dev tower, station daemon, `chief` CLI over the local socket, manual peer book | CI: chat through an in-process tower, the same relay-only, a stranger refused, a second station on one data dir refused, CLI ↔ station over the socket, and a scripted walkthrough with the real binaries | M0 |
+| **M1** | **Two stations chat** (planned as "two chiefs chat"): dev tower, station daemon, `chief` CLI over the local socket, manual peer book | CI: chat through an in-process tower, the same relay-only, a stranger refused, a second station on one data dir refused, CLI ↔ station over the socket, and a scripted walkthrough with the real binaries | M0 |
 | M2 | Real-world tower, station as a service: TLS (cert files; ACME optional), QAD, SRV bootstrap, several towers, a remembered tower set (SRV again only when no known tower answers) that peers exchange and show, static allowlist + rate limit, systemd units, FFI smoke check | CI, in-process: TLS tower with a test certificate, QAD, fake SRV resolver; a station that knows its towers starts without an SRV lookup and returns to SRV only when none answers; an unlisted station id is denied. Demo: two stations on different networks, given only a domain, chat, relayed or direct | M1; decisions 13, 16, 17 (settled); **needs:** a public host and a DNS zone (demo only), and a ruling on hard rule 10 for the FFI smoke check |
-| M3 | Membership: chief ids and admin keys, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, invites, station commissions, roster sync, signed address records passed between nodes, removal, the tower's own endpoint with a roster-fed allowlist; linked towers: a link between every two towers of the signed set, forwarding to the tower a node is connected to, roster replication between towers; `chief network` | a second chief joins by invite through an allowlisting tower and chats without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while removal and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); a chief revokes one of their two devices and keeps working from the other; a removed chief is refused by every node after sync; two stations that each know one tower, and not the same one, chat through both towers, and a statement given to one tower reaches a member that asks the other | M1 (allowlist feed: M2); decisions 1, 2, 20; **needs:** Nitrokey HSM 2 tokens |
+| M3 | Membership and linked towers: the chief's identity fixed by genesis, one admin key per device, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, pairing a new device by ticket, station commissions, roster sync, signed address records passed between nodes, device revocation, the tower's own endpoint with a roster-fed allowlist; linked towers: a link between every two towers of the signed set, forwarding to the tower a node is connected to, roster replication between towers; `chief network`, `chief device` | the chief pairs a second device by ticket through an allowlisting tower and its station chats with the first without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while revocation and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); the chief revokes one of two devices and keeps working from the other; a revoked station is refused by every node after sync; two stations that each know one tower, and not the same one, chat through both towers, and a statement given to one tower reaches a node that asks the other | M1 (allowlist feed: M2); decisions 1, 2, 20; **needs:** Nitrokey HSM 2 tokens |
 | M4 | Airspace I: sealed blocks on towers and members, spaces and keys, names, leases and quotas, the two-tower rule with replication between towers (blocks, names, leases, quota counts); text objects; `chief airspace` | an object written on one station is read on another after the first went offline; the tower's disk holds only ciphertext; "stored" needs two towers, and is reached by a writer that knows only one; an object written through one tower is read through another by a member that knows only that one; a rolled-back name is refused; unleased blocks lapse | M3; decisions 4, 5, 6, 20 |
-| M5 | Safehouse, set up by hand by a chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, per-chief OS accounts, confinement checks | a chief runs `claude` and `codex` on a safehouse with API keys set by hand; an agent process cannot read the safehouse's key or another chief's home | M3; decision 3 |
-| M6 | Secrets, then harness API keys on them. (a) Secrets in three scopes — user (one chief), team, project — sealed in airspace spaces of their own; projects; `chief secret`, `chief project`; delivery to a safehouse for a terminal or session. (b) Harness API keys for Claude and Codex as secrets: the presets name the secret, a start resolves it project, then user, then team; `chief harness status` | (a) a secret set on one station is listed on the chief's other station, with no command returning its value; a team secret reaches every chief, a project secret only its members; a session gets exactly the names its harness asks for; after a chief is removed, every secret they could open is listed for rotation; the tower's disk holds only ciphertext. (b) both harnesses run on a safehouse on keys set from a chief with no SSH, once from the user scope and once from the team scope; a value never appears in a log, an error or an event; CI uses a fake harness CLI | M4, M5; decisions 8, 18, 19; **needs:** an Anthropic and an OpenAI API key (manual check only) |
+| M5 | Safehouse, set up by hand by the chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, OS accounts for agents apart from the daemon's (one per project from M6), confinement checks | the chief runs `claude` and `codex` on a safehouse with API keys set by hand, from the laptop and from a second station; an agent process cannot read the safehouse's key or another account's home | M3; decision 3 |
+| M6 | Secrets, then harness API keys on them. (a) Secrets in two scopes — user (the chief's own) and project — sealed in airspace spaces of their own; projects; `chief secret`, `chief project`; delivery to a safehouse for a terminal or session. (b) Harness API keys for Claude and Codex as secrets: the presets name the secret, a start resolves it from the project, then the user scope; `chief harness status` | (a) a secret set on one station is listed on the chief's other station, with no command returning its value; a project secret reaches only sessions of that project, and another project's agent cannot read it; a session gets exactly the names its harness asks for; after a station is revoked, every secret it could open is listed for rotation; the tower's disk holds only ciphertext. (b) both harnesses run on a safehouse on keys set from a station with no SSH, once from the user scope and once from a project; a value never appears in a log, an error or an event; CI uses a fake harness CLI | M4, M5; decisions 8, 18, 19; **needs:** an Anthropic and an OpenAI API key (manual check only) |
 | M7 | Airspace II: git repos — remote helper, bundles and manifests, mirrors on safehouses, compaction | `git clone`, `fetch` and `push` between a station and a safehouse with only towers always on; a non-fast-forward push is refused; two racing pushes leave one tip and one conflict ref | M4 (safehouse side: M5); decision 10 |
-| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, ownership policy, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a chief; reattach from a second station; a non-owner cannot steer. CI: a fake ACP agent | M5 (M6 for keys and other secrets set from a chief, and for projects); decisions 9, 11 |
-| M9 | Chat v2: durable history and outbox, receipts, channels, delivery to all of a chief's stations, offline delivery through airspace, chat tools for agents | history survives a restart; a message sent while the recipient was offline arrives when it returns; an agent posts to a channel | M4 (agent tools: M8) |
+| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, attach from any of the chief's stations, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a station; reattach from a second station; a node that is not a station of the chief cannot steer. CI: a fake ACP agent | M5 (M6 for keys and other secrets set from a station, and for projects); decisions 9, 11 |
+| M9 | Chat v2: durable history and outbox, receipts, channels shared by the chief and agents, delivery to all of the chief's stations, offline delivery through airspace, chat tools for agents | history survives a restart; a message sent while the recipient was offline arrives when it returns; an agent posts to a channel | M4 (agent tools: M8) |
 | M10 | Sockets: `chief forward -L` with a safehouse-side target policy | a station reaches a safehouse's localhost service; a disallowed target is refused | M5 |
 | M11 | Airspace III and files: large media (resume, streaming, range reads, audits), push/pull between nodes, browsing workspaces, file tools for agents | a multi-gigabyte upload survives an interruption; another node streams a range of it; a tower that dropped a block is caught and refilled | M4 (safehouse side: M5) |
-| M12 | Locks: named leases with TTL and fencing tokens, lock tools for agents | two agents contend; a chief can inspect and break, attributed | M5 (agent tools: M8) |
+| M12 | Locks: named leases with TTL and fencing tokens, lock tools for agents | two agents contend; the chief can inspect and break | M5 (agent tools: M8) |
 | M13 | Linux GUI: a third client of the station socket | a message sent from the CLI appears in the GUI | M1+ |
 | M14 | iOS app: (a) foreground chat, airspace browsing and session control, (b) push | (a) works on a device; (b) a notification arrives while the phone sleeps | M9; decision 12; **needs:** Mac, iPhone, Apple Developer membership |
-| M15 | Handlers: a node that creates, admits and removes safehouses in nspawn containers (maybe QEMU VMs). To be designed; can move earlier once it is | a chief asks a handler for a safehouse and gets one that is isolated from the host and from other safehouses | M5; decision 14 |
+| M15 | Handlers: a node that creates, admits and removes safehouses in nspawn containers (maybe QEMU VMs). To be designed; can move earlier once it is | the chief asks a handler for a safehouse and gets one that is isolated from the host and from other safehouses | M5; decision 14 |
 
 The order after M3 is open to change: M4 comes early because chat history, offline delivery, git and
 agent workspaces all build on it. Network management grows one view per milestone: `chief network`
@@ -42,7 +48,7 @@ Feature; there are no `decision` / `verify` labels, so those are marked by title
 - **Roadmap** — one tracking issue with every milestone as a sub-issue. Status lives there; the table
   lives in `docs/ROADMAP.md`.
 - **Milestones** — one Feature issue each (M0–M15): scope, done-when, dependencies, what is needed
-  from the team. Later ones start as stubs and are split into Tasks when they become active.
+  from the owner. Later ones start as stubs and are split into Tasks when they become active.
 - **Tasks** — sub-issues for the active milestones only, one per reviewable PR. M0: workspace and
   crate skeletons; CI and guards; CLAUDE.md, docs, README. M1: dev tower; base crate (frames, key
   files); endpoint, dial-by-id and gate; link + chat protocol; station core with integration tests;
@@ -425,24 +431,25 @@ run time.
 
 Each is a `Decision:` issue with a recommendation, attached to the milestone it gates.
 
-1. **Chief key model (M3).** Planned: a stable chief id with one admin key per device, never copied.
-   Alternatives: one chief key that the chief copies between devices (a copy cannot be revoked on
-   its own); or no admin keys — a chief is the set of their stations' keys (then the always-on
-   daemon holds admin power). Also to settle: an admin key kept only on the phone, which is the one
-   option that holds against a compromised workstation, and expiring station leases. With a
-   Nitrokey HSM, how many tokens: one for the network plus a spare in a safe, brought out for each
-   enrollment (enough for a small team, since enrollments are rare and every one is still signed by
-   a chief's own key); or one per chief, so each can enroll alone and a lost token is revoked on its
-   own.
-2. **Disputes and recovery (M3).** What settles two chiefs removing each other, and what happens when
-   a chief loses every admin key: an offline recovery key recorded in genesis (an HSM-held key is
-   the natural one); the earliest-admitted chief wins; or countersignatures once there are three
-   chiefs.
-3. **Safehouse isolation (M5).** How a safehouse puts each chief's terminals and agents under their own
-   OS account (root helper, systemd transient units, or containers), and what the warning for a
+1. **Chief key model (M3).** Settled by the owner: one chief per network, with a station on each
+   device. Planned: one admin key per device, never copied. Alternatives: one chief key that
+   the chief copies between devices (a copy cannot be revoked on its own); or no admin keys — the
+   chief is the set of their stations' keys (then the always-on daemon holds admin power). Also to
+   settle: an admin key kept only on the phone, which is the one option that holds against a
+   compromised workstation, and expiring station leases. With a Nitrokey HSM: one token plus a
+   spare in a safe, brought out for each enrollment (planned).
+2. **Disputes and recovery (M3).** With one chief there is nobody to dispute with but a thief:
+   what settles a stolen device and the chief's other device revoking each other, and what
+   happens when the chief loses every admin key. An offline recovery key recorded in genesis
+   that outranks every admin key (an HSM-held key is the natural one); or the earliest-added
+   admin key wins.
+3. **Safehouse isolation (M5).** How a safehouse keeps terminals and agents under OS accounts
+   apart from the daemon's (root helper, systemd transient units, or containers); whether there
+   is one account per project (planned, so that one project's agents cannot read another's
+   secrets and files) or one for all agents; and what the warning for a
    machine that also runs a station checks. A same-account sandbox is not enough on current
-   kernels (handlers may later move this boundary to one safehouse per chief or per job, decision
-   14): Landlock cannot yet block
+   kernels (handlers may later move this boundary to one safehouse per project or per job,
+   decision 14): Landlock cannot yet block
    connecting to a Unix socket, and same-user processes can attach to each other.
 4. **Airspace engine (M4).** `iroh-blobs` 0.x behind our own interfaces (planned), or our own small
    block protocol over iroh from the start. Includes how hard a tower syncs to disk before it
@@ -457,13 +464,12 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 7. **Codex browser login (M6).** Settled by the owner: dropped, with every other sign-in flow.
    Harnesses authenticate with API keys only.
 8. **Harness API keys (M6).** API keys only is decided. Settled by the owner: a harness's API
-   key is a secret, and secrets come in user, team and project scopes, so a key may be a
-   chief's own, a team's or a project's; where a key is kept is now part of decision 19. Still
-   open here: whether the harness process gets the key or a proxy on the safehouse
-   adds it to requests, so that an agent never holds it; whether cloud-provider credentials for
-   Claude (Bedrock, Vertex, Foundry) are in scope
-   (planned: not at first); whether presets also switch off a harness's other sign-in methods where
-   it has a setting for that.
+   key is a secret, in the user scope or a project's; where a key is kept is part of
+   decision 19. Still open here: whether the harness process gets the key or a proxy on the
+   safehouse adds it to requests, so that an agent never holds it; whether cloud-provider
+   credentials for Claude (Bedrock, Vertex, Foundry) are in scope (planned: not at first);
+   whether presets also switch off a harness's other sign-in methods where it has a setting for
+   that.
 9. **Harness transport, per harness (M8).** ACP adapters or native protocols. For Claude: the ACP
    adapter (an Agent SDK app), `claude -p` stream-json on the unmodified CLI, or Claude's own
    background sessions. For Codex, `codex app-server`. With API keys only, the Agent SDK terms on
@@ -474,7 +480,7 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 11. **Vendor remote features (M8).** Claude Remote Control overlaps part of M8/M14 but is relayed by
     Anthropic. Offer it as an optional preset, or disable it by default on safehouses.
 12. **The phone (M14).** Whether it embeds a station (planned) or remote-controls the chief's workstation
-    station; and push — only the app's publisher can send it, so either each team signs its own app
+    station; and push — only the app's publisher can send it, so either each chief signs their own app
     or the project runs a push gateway.
 13. **Bootstrap record (M2).** Decided by both agents (#38): SRV with one target per tower, as
     first specified, looked up behind the `Locator` trait of `numbers::bootstrap`, so that another
@@ -484,9 +490,9 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     tower would need a certificate for the shared name. The resolver is in the build already,
     through iroh. If SRV proves awkward on phones, a TXT record listing tower URLs keeps one name
     per tower.
-14. **Handlers (M15).** What a handler is: how a chief asks for a safehouse, whether a handler may
+14. **Handlers (M15).** What a handler is: how the chief asks for a safehouse, whether a handler may
     enroll one under a chief-signed, expiring grant or every admission needs the chief (and the HSM);
-    nspawn or QEMU; one safehouse per chief or per job; what the handler host itself must never
+    nspawn or QEMU; one safehouse per project or per job; what the handler host itself must never
     expose to a safehouse.
 15. **Smaller ones.** GTK4 / libadwaita / relm4 / VTE assumed for the GUI (M13). Router port
     mapping: decided by both agents on #42: off. A station never asks a router to forward a port; a
@@ -508,26 +514,23 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     connected. A denying tower is shown and taken out of the relay map only when another tower is
     not denied; the station limits its own attempts and DNS queries, not iroh's own retries.
 18. **Projects (M6).** Project secrets need a project, and nothing else defines one yet. What a
-    project is: a signed record of a name and member chiefs, with an airspace space of its own
-    (planned), or nothing more than a restricted airspace space, or a git repo. Who creates one
-    and changes its members (planned: any chief creates, members change membership, every change
-    attributed); how a repo, a workspace and a session come to belong to one (planned: a session
-    is started for a project by name, and M7 and M8 attach repos and workspaces to it); whether
-    project membership is a roster statement, which towers would then see, or a record among
-    members (planned: among members).
-19. **Secrets: storage, delivery and resolution (M6).** Planned: sealed in airspace, one space
-    per scope, wrapped to the stations of the chiefs the scope covers and never to a safehouse;
-    a station opens what a start asks for and sends it to the safehouse over the link. Open:
-    the resolution order (planned: project, then user, then team; the alternative puts a
-    chief's own secret first); whether a safehouse keeps a delivered secret in the chief's
-    account between sessions, so that a session can restart with no station online, or only
-    for the life of a process; whether a team secret can be limited to named safehouses;
-    whether any chief may set a team secret (planned) or it takes more than one; whether
-    secrets other than a harness's key reach a session only when its harness definition names
-    them (planned) or all of a scope's secrets do.
+    project is: a signed record of a name, with an airspace space of its own and an OS account
+    on each safehouse it runs on (planned); or nothing more than a name on secrets and
+    sessions; or a git repo. It has no members: a network has one chief. How a repo, a
+    workspace and a session come to belong to one (planned: a session is started for a project
+    by name, and M7 and M8 attach repos and workspaces to it); whether a project is a roster
+    statement, which towers would then see, or a record among members (planned: among members).
+19. **Secrets: storage and delivery (M6).** Settled by the owner: two scopes, user and project;
+    no team scope. A project's secret is taken before the user's. Planned: sealed in airspace,
+    one space per scope, wrapped to the chief's stations and never to a safehouse; a station
+    opens what a start asks for and sends it to the safehouse over the link. Open: whether a
+    safehouse keeps a delivered secret between sessions, so that a session can restart with no
+    station online, or only for the life of a process; whether a secret can be limited to named
+    safehouses; whether secrets other than a harness's key reach a session only when its harness
+    definition names them (planned) or all of a scope's secrets do.
 20. **Linked towers: forwarding and replication (M3, M4).** Required by the owner: towers
     replicate between each other and forward to each other, so that members on different towers
-    can work together. Open is how. Forwarding: inside the embedded relay server, if it has a
+    can work together; with one chief these are the chief's own stations and safehouses. Open is how. Forwarding: inside the embedded relay server, if it has a
     place to hand on a packet for a node it does not hold (to be verified against the iroh-relay
     source; a fork is not wanted); or a forwarding service of our own on the towers' own
     endpoints, which members then use as a path; and, in either case, how towers learn which
@@ -536,34 +539,35 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     without trusting each other's word (planned: everything replicated is either signed by a
     member or addressed by its hash, so a tower verifies what it takes). Also: full mesh
     (planned, the set is capped at eight) or less; whether a tower forwards for a node the
-    roster lists but its own allowlist has not caught up with; what a network of one team with
-    towers run by different people needs beyond this.
+    roster lists but its own allowlist has not caught up with.
 
-**Needs from the team:** a public host and DNS zone (M2 demo; nothing else waits on it); a ruling
+**Needs from the owner:** a public host and DNS zone (M2 demo; nothing else waits on it); a ruling
 on hard rule 10 for `crates/chief-ffi`, whose generated bindings use `unsafe` (M2 FFI smoke check,
 #83); Nitrokey HSM 2
-tokens, one plus a spare or one per chief (M3 manual check — CI uses a software token); two or three
+tokens, one plus a spare (M3 manual check — CI uses a software token); two or three
 tower hosts once airspace should be durable (M4 demo — CI uses in-process towers); an Anthropic API
 key and an OpenAI API key for the manual checks (M5, M6, M8 — CI uses fake harness CLIs); a Mac,
 an iPhone and an Apple Developer membership (M14, and an early device spike worth doing right after
 M2). iOS cannot be built in this environment.
 
-**Vendor terms.** Harnesses authenticate with API keys only: each chief uses a key the vendor
+**Vendor terms.** Harnesses authenticate with API keys only: the chief uses a key the vendor
 issued to them or to their organisation, under that vendor's API terms, with the unmodified
 official CLI. theCompany drives or relays no subscription sign-in (hard rule 3). Revisit before
-distributing beyond the team or hosting it for others.
+distributing it or hosting it for others.
 
 **Interpretations of the original request (correct if wrong):**
 
 - The original rule "agents never operate on dead-drop or chief nodes … strictly confined to handler
   nodes" now reads "never on towers or stations, strictly confined to safehouses", and is also read
   as "never on the new handlers": a handler creates safehouses but runs no agents itself.
-- A chief may have several stations; the phone app counts as one.
+- There is one chief per network, and no teams. The chief has several stations, one per device; the
+  phone app counts as one. An earlier reading had several co-equal chiefs in a small team; the
+  owner corrected it.
 - Tower "discovery" means finding a node's current address by its id. Who is in the network comes
   from the signed roster, never from a tower.
 - SRV bootstrap lands in M2 together with the TLS tower; M1's dev tower is given by URL.
 - "Towers replicate between each other and forward; peers on different towers must be able to
-  collaborate": inside one network. Two members whose tower sets share no tower, or who cannot
+  collaborate": inside one network. Two of the chief's nodes whose tower sets share no tower, or who cannot
   both reach the same tower, still chat, share airspace and drive safehouses, because their
   towers pass traffic and stored data on to each other. It is not read as joining two networks
   with separate rosters.
@@ -571,12 +575,13 @@ distributing beyond the team or hosting it for others.
   address records it learns from nodes it is connected to (and from M3 the signed roster's tower
   set), then every tower of its own set. A tower set that a peer sends is shown as candidates and
   not used on its own (decision 16).
-- Airspace starts with one team-wide space that every member can read; restricted spaces come
+- Airspace starts with one network-wide space that every member node can read; restricted spaces come
   later, the first of them with secrets (M6).
-- "User, team and project secrets": a user is a chief, the team is the whole network, and a
-  project is a named group of chiefs inside it, which this feature introduces (decision 18).
-  Secrets are a feature of their own, for any named value; harness API keys are their first use
-  and replace the per-safehouse `chief apikey` commands planned before.
+- Secrets: asked for as "user, team and project"; with one chief and no teams the scopes are
+  user (the chief's own) and project. A project is a name for a piece of work, which this
+  feature introduces (decision 18). Secrets are a feature of their own, for any named value;
+  harness API keys are their first use and replace the per-safehouse `chief apikey` commands
+  planned before.
 - "Text objects" are named, versioned documents; git repos are a real remote, not snapshots.
 - "Files" (push/pull between two nodes, browsing a safehouse's workspace) stays a separate, smaller
   feature built on airspace's block transfer.

@@ -6,16 +6,16 @@ and the open decisions are in [ROADMAP.md](ROADMAP.md).
 ## Context
 
 **theCompany** is the project; **`numbers`**
-is its p2p network, giving a small self-hosted team **chat, sockets, files, locks** and a
+is its p2p network, giving one person and their coding agents **chat, sockets, files, locks** and a
 **persistence layer** for working with coding agents.
 
 The cast:
 
 | Name | What it is |
 |---|---|
-| **chief** | A person on the team. An identity, not a machine: a chief owns stations and their own (user) secrets, harness API keys among them, signs admin actions, and agent sessions run under their name. |
-| **station** | A chief's node: a daemon on the chief's workstation. The `chief` CLI, the Linux GUI and the iOS app are frontends to a station. |
-| **safehouse** | A node that runs agents in arbitrary harnesses (Claude Code and Codex first). At first a chief sets one up by hand. |
+| **chief** | The one person a network belongs to. An identity, not a machine: the chief owns every station, safehouse and secret of the network, signs admin actions, and agent sessions run under their name. A network has exactly one chief; there are no teams. |
+| **station** | One of the chief's nodes, one per device: a laptop, a desktop, a phone. A daemon; the `chief` CLI, the Linux GUI and the iOS app are frontends to a station. |
+| **safehouse** | A node that runs agents in arbitrary harnesses (Claude Code and Codex first). At first the chief sets one up by hand. |
 | **handler** | Later: the node that sets safehouses up, creating each in an isolated environment (an nspawn container, maybe a full QEMU VM). To be fleshed out. |
 | **tower** | An untrusted node: relays traffic, lets nodes find each other, and is the final store for encrypted blocks. Towers are linked: they forward traffic to each other and replicate what they keep, so members on different towers work together. A DNS SRV record leads a newcomer to its first tower. Never a member. |
 | **agent** | A harness process on a safehouse. Agents run nowhere else. |
@@ -23,10 +23,10 @@ The cast:
 
 Decided: **Rust**; **iroh** as transport (1.0 since June 2026, now 1.5.0: stable API and wire
 protocol, dial-by-public-key QUIC, hole punching, relay fallback, official iOS support); the audience
-is a **small trusted team** — chiefs are co-equal, every action is attributable to a person, one
-person can be removed cleanly, **secrets come in three scopes — user (one chief), team and
-project — and a harness's API key is one of them** (a chief's own key by default, a team's or a
-project's where the team sets one), and harnesses
+is **one person, the chief, with several devices and their agents** — a network has exactly one
+chief and no teams; the chief has a station on each device, every device can be revoked on its
+own, and every action names the device that signed it; **secrets come in two scopes — user (the
+chief's own) and project — and a harness's API key is one of them**, and harnesses
 authenticate with **API keys only** (no subscription sign-in is driven, relayed or supported); work is
 **tracked in GitHub issues**; in airspace, **every tower keeps every block and a write counts as
 stored once two towers confirm it**; **towers forward to each other and replicate between each
@@ -35,7 +35,7 @@ and always warned against, but the two packages do not conflict**; the **SRV rec
 access — a node already on the network finds other nodes through the network first and falls back
 to SRV last**; a network can **require a Nitrokey HSM to set up new nodes — and only for that, never
 for day-to-day use**. We build feature by feature. The first slice is a minimal tower and station,
-just enough for two chiefs to chat.
+just enough for two stations to chat.
 
 How far this has been checked: the transport, tower, login and first-slice parts were reviewed
 against the published sources of iroh 1.5.0, Claude Code 2.1.328 and Codex 0.170, with a second
@@ -52,7 +52,7 @@ dependency set builds, and loopback tests exercise the M1 dev tower.
 ```
  chief ── `chief` CLI / GUI ──local socket── station ─┐                         ┌─ safehouse ── agents
  (a person)                                           ├── E2E-encrypted QUIC ───┤   (claude, codex, …)
- chief ── iOS app (station built in) ─────────────────┘  direct when possible   └─ safehouse ── agents
+ └────── iOS app (station built in) ───────────────────┘  direct when possible   └─ safehouse ── agents
                          └────────── relayed through a tower when not ──────────┘
  tower: forwards ciphertext by node id; keeps encrypted blocks; never a member (SRV finds the first one)
 ```
@@ -60,88 +60,94 @@ dependency set builds, and loopback tests exercise the M1 dev tower.
 | Node | Binary | Trust | Does | Never |
 |---|---|---|---|---|
 | tower | `tower` | untrusted with content; relied on, with checks, to keep blocks | relays ciphertext, passing it to another tower when the receiver is connected there; rendezvous by node id; stores encrypted blocks and replicates them, and the roster, with the other towers | reads traffic or stored data, holds member or airspace keys, runs agents |
-| safehouse | `safehouse` | member, admitted by a chief | hosts agents and terminals, and holds the secrets its sessions run on (harness API keys among them); serves files, sockets, locks; keeps working copies of airspace | admin actions; starts anything on a station |
-| station | `station` | member, commissioned by its chief | its chief's presence on the network: chat, management, driving safehouses; keeps working copies of airspace | spawns agents; executes anything for a peer |
-| handler (later) | `handler` | member, admitted by a chief | creates and removes safehouses in isolated environments on a chief's request | runs agents itself; admin actions |
+| safehouse | `safehouse` | member, admitted by the chief | hosts agents and terminals, and holds the secrets its sessions run on (harness API keys among them); serves files, sockets, locks; keeps working copies of airspace | admin actions; starts anything on a station |
+| station | `station` | member, commissioned by the chief | the chief's presence on the network from one device: chat, management, driving safehouses; keeps working copies of airspace | spawns agents; executes anything for a peer |
+| handler (later) | `handler` | member, admitted by the chief | creates and removes safehouses in isolated environments on the chief's request | runs agents itself; admin actions |
 
-A chief can have several stations (desktop, laptop, phone). Safehouses belong to the team, not to one
-chief.
+The chief has several stations (desktop, laptop, phone). Every station, safehouse and handler of a
+network belongs to its one chief. Somebody else who wants the same runs a network of their own;
+two networks do not meet.
 
 ### Identity and trust
 
 - **Node key** (ed25519) — one per station, safehouse and tower. Its public half is the node's id and
   address (iroh `EndpointId`); iroh mutually authenticates and end-to-end encrypts every connection
   with it. The daemon holds it (0600 file; Keychain on iOS).
-- **Chief** — a stable id (the hash of the statement that admitted them), not a key. A chief acts
-  through **admin keys**: one per device they administer from, created there and never copied. On a
+- **Chief** — the one identity of the network, fixed by genesis. Not a key: the chief acts
+  through **admin keys**, one per device they administer from, created there and never copied. On a
   workstation it is a passphrase-protected file kept by the frontend, not by the station; on the
   phone, a Keychain item behind biometrics. Admin keys sign every admin action, so each change names
-  a person, and they commission that chief's stations. A station on a device without an admin key
-  does everything except administer. Losing a device costs one key revocation and one station
-  decommission; the chief, their accounts on safehouses and their secrets stay (**decision 1**).
-- **What a station may do** is act as its own chief on each safehouse: that chief's terminals,
-  sessions, files and chat. Anything that changes what other chiefs' sessions run, or what a node
-  allows others — shared harness definitions, forward-target policy, grants, the tower set — is an
-  admin-signed statement. So a stolen station is that chief on every safehouse until
-  it is decommissioned, but cannot change membership or shared configuration.
+  the device it came from, and they commission the chief's stations. A station on a device without
+  an admin key does everything except administer. Losing a device costs one key revocation and one
+  station decommission; everything else stays (**decision 1**).
+- **What a station may do** is act as the chief on every safehouse: terminals, sessions, files and
+  chat. Anything that changes what a node allows — who is in the network, harness definitions a
+  safehouse offers, forward-target policy, grants, the tower set — is an admin-signed statement.
+  So a stolen station is the chief on every safehouse until it is decommissioned, but cannot change
+  membership or configuration.
 - **What the split protects.** The admin key at rest (a stolen disk or backup, a leaked station data
   dir) and against a bug that leaks station memory. It does not protect against code running as the
   chief's own OS user, which can wait for the next unlock.
 - **Hardware token (Nitrokey HSM).** A network can be created with **enrollment
   requires the HSM**. Setting up a new node then needs a second signature from an *enrollment key*
-  that lives only on a Nitrokey HSM: admitting a chief, commissioning a station, admitting a
-  safehouse (later a handler), adding an admin key — and changing this rule. The chief's ordinary
-  admin key still signs first, so every enrollment names a person. The frontend signs through
+  that lives only on a Nitrokey HSM: commissioning a station, admitting a safehouse (later a
+  handler), adding an admin key — and changing this rule. An ordinary admin key still signs
+  first, so every enrollment names a device. The frontend signs through
   PKCS#11; the key never leaves the token, signing needs the token and its PIN, and the roster can
-  demand the token's own proof that the key was generated inside it.
+  demand the token's own proof that the key was generated inside it. With one chief this rule is
+  what stands between a stolen device with an unlocked admin key and new nodes of the thief's.
   **Nothing else needs the token.** Not daily use — chat, airspace, driving safehouses, secrets,
-  sessions — and not routine administration either: removing a node or a chief, settings, shared
-  harness definitions and issuing an invite are signed by the ordinary admin key alone. The token
+  sessions — and not routine administration either: removing a node, revoking an admin key,
+  settings and harness definitions are signed by an ordinary admin key alone. The token
   can stay in a drawer between enrollments, and a compromised node can be removed without fetching
   it.
   Two limits: node keys cannot live on the token, because iroh needs the raw key and the token has
   no Ed25519, so the HSM backs *who may enroll*, not each node's transport key; and the token signs
   with ECDSA P-256, so roster signatures carry an algorithm tag. A phone cannot enroll under this
-  rule. How many tokens a team has is part of **decision 1**.
+  rule. One token plus a spare is the plan (**decision 1**).
 
 Membership is a **roster**: a hash-linked log (a DAG — each statement names its parents) of
-statements signed by admin keys. The network id is the hash of genesis. Nobody shares a secret, so
-removing a person needs no rotation. Authorization everywhere is remote node id → roster → "station
-of chief *C*" or "safehouse" → policy for that protocol, default deny.
+statements signed by admin keys. The network id is the hash of genesis. No node shares a secret
+with another to be a member, so removing a device needs no rotation of membership. Authorization
+everywhere is remote node id → roster → "station of the chief" or "safehouse" → policy for that
+protocol, default deny.
 
 Rules the membership milestone (M3) implements:
 
-- **Statements:** genesis; admit/remove chief; add/revoke admin key; commission/decommission station;
-  admit/remove safehouse; invite; tower set (each tower's URL and node id); settings. A node's entry
+- **Statements:** genesis, which names the chief's first admin key; add/revoke admin key;
+  commission/decommission station; admit/remove safehouse; pairing ticket; tower set (each tower's
+  URL and node id); settings. There is no statement that admits a second chief. A node's entry
   carries an encryption public key, which airspace needs later. Statements carry no display names,
   because towers receive the roster; names travel between members.
-- **Who may sign what:** only a chief's own admin keys add that chief's admin keys and commission
-  that chief's stations. Any chief may admit a chief or a safehouse and may remove anything. A
+- **Who may sign what:** any unrevoked admin key signs anything; they are all the chief's. A
   decommissioned station id never comes back.
-- **Invites:** the ticket's secret seeds a throwaway node key. The signed invite lists that join id
-  and an expiry, and towers and nodes let unexpired join ids through for joining only. The joiner
-  dials an inviter's station with it, so the handshake proves the secret, and sends a request signed
-  by its new admin key naming its first station. The inviter's frontend shows a fingerprint over the
-  whole request; the chief compares it out of band and signs one admit that embeds it. Only a signed
-  admit consumes an invite; failed attempts do not.
-- **Removal is strong:** statements by a removed chief that the removal did not already know about
-  are void, with everything that depends on them. `chief remove` lists what that chief admitted or
-  commissioned so the subtree can go in the same action. A signer picks its own parents, so "who was
-  first" cannot settle two chiefs removing each other (**decision 2**).
-- **Removal suspends at once and purges later.** Suspending closes that chief's links, terminals and
-  forwards, stops their sessions and locks their harness profiles, and their stations are given no
-  further version of a team or project secret. Purging (secret and file
-  deletion) waits until the removal is settled: acknowledged by a station of every remaining chief,
-  or older than a grace period, or forced with `chief purge`. `chief network` lists nodes that have
-  not acknowledged it. A chief-signed staleness limit makes a safehouse that has heard from no other
-  chief for too long refuse privileged calls.
+- **Pairing a new device.** The chief adds a phone or a second laptop from a device that already
+  has an admin key. The ticket's secret seeds a throwaway node key. The signed ticket lists that
+  join id and an expiry, and towers and nodes let unexpired join ids through for joining only. The
+  new device dials the issuing station with it, so the handshake proves the secret, and sends a
+  request signed by its new admin key naming its station. The issuing frontend shows a fingerprint
+  over the whole request; the chief compares it on the two screens and signs one statement that
+  adds the admin key and commissions the station. A safehouse is admitted the same way, without an
+  admin key. Only a signed statement consumes a ticket; failed attempts do not.
+- **Revocation is strong:** statements by a revoked admin key that the revocation did not already
+  know about are void, with everything that depends on them. `chief device revoke` lists what that
+  key signed so the subtree can go in the same action. A signer picks its own parents, so "who was
+  first" cannot settle a stolen device and the chief's other device revoking each other
+  (**decision 2**).
+- **Revocation suspends at once and purges later.** Suspending closes that station's links,
+  terminals and forwards, and it is given no further version of any secret. Purging what the
+  revoked node kept waits until the revocation is settled: acknowledged by every remaining
+  station, or older than a grace period, or forced with `chief purge`. `chief network` lists
+  nodes that have not acknowledged it. A staleness limit makes a safehouse that has heard from no
+  station for too long refuse privileged calls.
 - **Sync:** every link opens by comparing roster heads and syncs before anything privileged.
 - **Encoding:** signed statements are fixed binary bytes, never JSON, stored and forwarded verbatim,
   in one envelope (domain tag, id, sequence, parents, signer, algorithm) that airspace names reuse
   later. A node that meets a statement type it does not know stops and reports "upgrade required".
 
-M1 has none of this yet: a station keeps a manual peer book (name → station ids), and "chief" is just
-the name you give the person behind a station.
+M1 and M2 have none of this yet: a station keeps a manual peer book (name → station ids). Built
+before the single-chief model, their code and tests speak of peers and of "two chiefs"; under this
+model the peers in a peer book are the chief's own other nodes.
 
 ### Towers
 
@@ -156,14 +162,14 @@ again. So a station watches its home tower (below).
   development and tests. A node that is already on the network finds towers and other nodes through
   the network first, in this order: paths and addresses it already holds; what the network tells it,
   which is other nodes' signed address records, passed on by any connected node, and from M3 a
-  signed roster statement carried in invites; then every tower in its own set, which is the towers
+  signed roster statement carried in pairing tickets; then every tower in its own set, which is the towers
   it was configured with and the ones it remembered across restarts; and only then the SRV record
   again. A changed SRV record therefore matters to newcomers and to a node that has lost every
   tower, not to a running network.
 - **Towers named by a peer are candidates.** Stations exchange the HTTPS
   entries of their working tower sets over an established link. What a peer sends is checked,
   kept as candidates with the peer's name, and shown. A station never connects to a candidate,
-  never adds one to its relay map and never passes one on. A chief may take one into the set
+  never adds one to its relay map and never passes one on. The chief may take one into the set
   with an explicit command (decided in #73). Automatic use would be an exception to hard rule 8
   and is the owner's to grant.
 - **A station watches its home tower.** After some seconds with no home or a disconnected home,
@@ -240,14 +246,14 @@ this protocol:
 
 | Caller → callee | Allowed |
 |---|---|
-| station → safehouse | everything inside the caller's chief's own account; shared configuration only as admin-signed statements |
+| station → safehouse | everything the chief may do there: terminals, sessions, files, secrets for a start; configuration only as admin-signed statements |
 | station → station | chat, roster sync, airspace blocks and names |
 | safehouse → station | chat, roster sync, airspace blocks and names, answers on streams the station opened, file offers into quarantine |
 | safehouse → safehouse | airspace blocks and names; anything else only under an admin-signed grant naming both |
 | member → tower | relay; on the tower's own endpoint: roster feed, block storage, leases |
 | tower → tower | pulls blocks it should hold from towers in the signed set |
 
-`numbers/join/0` (M3) is the only surface open to non-members: invite redemption and bounded delivery
+`numbers/join/0` (M3) is the only surface open to non-members: pairing-ticket redemption and bounded delivery
 of roster proofs. Control messages are length-prefixed JSON frames (size-capped, read deadlines,
 unknown fields tolerated); bulk data is raw stream bytes. One link instead of one ALPN per feature
 keeps authorization in one place and hides from the tower which feature is in use.
@@ -407,10 +413,10 @@ encrypted blocks**.
 - **Stations and safehouses** hold working copies — what they wrote, what they use, what they are told
   to keep — and serve blocks to each other when that is faster than a tower. They do not count
   toward the two-tower rule.
-- **Keys.** Each *space* (a named collection; one team-wide space to start, and from M6 the spaces
-  that hold secrets, which are the first that not every member can read) has a key, wrapped to the
-  encryption key of every member node the space is for. Removing a person changes the key for new writes; what they
-  could already read stays readable to them. Agents never hold airspace keys: the safehouse reads and
+- **Keys.** Each *space* (a named collection; one network-wide space to start, and from M6 the
+  spaces that hold secrets, which only stations can read) has a key, wrapped to the
+  encryption key of every member node the space is for. Removing a node changes the key for new
+  writes; what it could already read stays readable to it. Agents never hold airspace keys: the safehouse reads and
   writes for them.
 - **Names.** "The current version of this document" or "this branch" is a small signed record naming
   its predecessor, its sequence number and the roster state it was signed under. Towers hold these
@@ -424,7 +430,7 @@ encrypted blocks**.
 What is stored:
 
 - **Text objects** — named, versioned documents. Each version is immutable; the name moves.
-- **Git repos** — a real remote: `git clone numbers://team/repo`. A push becomes one encrypted bundle
+- **Git repos** — a real remote: `git clone numbers://<network>/repo`. A push becomes one encrypted bundle
   plus a new signed manifest of the repo's branches; towers know nothing about git. Stock git does
   the pack work: on a station inside the helper that the chief's own git starts (the station daemon
   still spawns nothing), on a safehouse inside the daemon, which ties an agent's rights to its session.
@@ -451,14 +457,14 @@ structurally:
 - Only safehouses serve `pty` and `agent`, and only a safehouse accepts a secret's value over
   `secret`; a station has no code that answers them.
 - On a safehouse the daemon runs as its own OS account, holds the node key and never executes harness
-  code in-process. Each chief maps to a dedicated OS account (or container), and every terminal and
-  session of that chief is spawned under it. That, not an environment variable, is what separates
-  one person's secrets, harness API keys among them, from another's and from the safehouse's key
-  (**decision 3**).
+  code in-process. Terminals and sessions are spawned under OS accounts (or containers) of their
+  own, never the daemon's: one per project, and one for work outside any project. That, not an
+  environment variable, is what separates one project's secrets and files from another project's
+  agents, and all of them from the safehouse's key (**decision 3**).
 - Agents never hold node keys or airspace keys. They reach chat, files, locks and airspace only through
-  an MCP bridge the safehouse injects per session, attributed as (safehouse, session, owner chief) and
-  granted no more than the owner has. That owner is the safehouse's assertion: a station accepts it as
-  a chief's only when one of that chief's stations started the session.
+  an MCP bridge the safehouse injects per session, attributed as (safehouse, session, project) and
+  granted no more than the session's project has. What an agent sends is the safehouse's
+  assertion and peer input to a station (hard rule 8), never the chief's word.
 - **A station and a safehouse on one machine** is never suggested and always warned against, but not
   blocked. Docs and demos always put the safehouse on another machine; the safehouse warns at
   start-up, and `chief safehouses` shows the warning, when it finds a station on its host. The two
@@ -473,19 +479,18 @@ disconnects, journals its events so a second station or a waking phone can attac
 serializes prompts and holds permission requests until answered. Stations never speak a harness
 protocol.
 
-- Harness definitions are data, so new ones need no code and no SSH. One a chief pushes for
-  themselves is private to them; one shared on a safehouse is an admin-signed statement. Kinds:
+- Harness definitions are data, so new ones need no code and no SSH. A definition a safehouse
+  offers is an admin-signed statement. Kinds:
   - `pty` — any command in a safehouse-hosted terminal (server-side screen model, reattachable). The
     universal fallback; it ships with the safehouse, so `claude` and `codex` are usable, with an API
     key set by hand, before M6 exists.
   - `acp` — a generic Agent Client Protocol client, with the safehouse as the only ACP client. Covers
     Claude Code and Codex through the ACP project's adapters and about fifteen other agents natively.
   - native adapters where they are better (**decision 9**, per harness).
-- A session belongs to the chief who started it and runs on the API key that chief's scopes
-  resolve to: their own, their project's or the team's (see the next two sections). Only the owner's
-  stations may prompt, approve or type; other chiefs may watch and stop. Shared steering can be
-  offered: every session runs on an API key, so the vendors' terms for subscription accounts do not
-  stand in the way.
+- Every session is the chief's. Any of the chief's stations may attach, prompt, approve and type,
+  so a session started from the laptop is picked up on the phone; no other node may. A session
+  runs on the API key its scopes resolve to: its project's, else the chief's own (see the next
+  two sections).
 
 ### Secrets
 
@@ -494,67 +499,63 @@ token, a password. Harness API keys are the first use and the reason this is bui
 the design is specific to them. Planned for M6, after airspace (M4) and safehouses (M5). This
 section is the plan; what is still open is **decisions 8, 18 and 19**.
 
-Every secret lives in exactly one **scope**:
+Every secret lives in exactly one **scope**. There are two, because a network has one chief and
+no teams:
 
-| Scope | Whose it is | Who may set and remove it | Who may use it |
-|---|---|---|---|
-| **user** | one chief | that chief | that chief's terminals and sessions |
-| **team** | the whole network | any chief, attributed | every chief's terminals and sessions |
-| **project** | one project | a chief who is a member of the project, attributed | terminals and sessions that a member starts for that project |
+| Scope | What it is for | Which sessions may use it |
+|---|---|---|
+| **user** | the chief's own, for everything | every terminal and session |
+| **project** | one project | terminals and sessions started for that project |
 
 - **Names.** A secret has a name of capital letters, digits and underscores (`ANTHROPIC_API_KEY`),
-  unique within its scope. The same name may exist in several scopes.
+  unique within its scope. The same name may exist in both scopes and in several projects.
 - **Resolution.** When a terminal or session starts, each name it asks for is resolved to one
-  value, the most specific scope first: the session's project, then the chief who starts it,
-  then the team. So a team key is the default for everybody, a chief's own key replaces it for
-  that chief, and a project's key replaces both for work on that project. The order is part of
-  **decision 19**. What a session was given — names and scopes, never values — is recorded
-  with the session and shown by `chief sessions`.
-- **A project** is new with this feature: a named group of chiefs with the repos and sessions
-  that belong to it. What exactly a project is, who creates one and how a session comes to
-  belong to one is **decision 18**. Until projects exist a session has no project, and user and
-  team scopes work without them.
+  value: the session's project first, then the user scope. So the chief's own key is the
+  default, and a project's key replaces it for work on that project. What a session was given —
+  names and scopes, never values — is recorded with the session and shown by `chief sessions`.
+- **A project** is new with this feature: a name for a piece of work, with the repos, sessions
+  and secrets that belong to it. It has no members, because there is nobody to be one but the
+  chief. What exactly a project is and how a session comes to belong to one is **decision 18**.
+  Until projects exist a session has no project, and the user scope works without them.
 - **At rest: sealed, in airspace.** Each scope has a space of its own whose key is wrapped only
-  to the stations of the chiefs the scope covers: a user space to that chief's stations, the
-  team space to every chief's stations, a project space to its members' stations. A secret is a
-  versioned text object in that space, so it follows a chief to all their stations, survives a
-  lost device, and a tower holds ciphertext only (hard rule 2). Setting, replacing and removing
-  are signed records naming the chief; a list shows names, scopes, who set each and when.
+  to the chief's stations, never to a safehouse. A secret is a versioned text object in that
+  space, so it is on the laptop and the phone alike, survives a lost device, and a tower holds
+  ciphertext only (hard rule 2). Setting, replacing and removing are signed records; a list
+  shows names, scopes, which device set each and when.
 - **Write-only from outside.** `chief secret set` reads the value without echo, or from stdin,
   never from the command line. No command, API call, event, log line or error returns a value
   or a part of one; `chief secret list` shows names and metadata. A frontend never receives a
   stored value from its station. There is deliberately no `chief secret show`.
-- **To a safehouse: only for a start, only what was asked for.** A safehouse node is not among
-  the nodes a secrets space is wrapped to. When a chief starts a terminal or a session, their
-  station resolves the names the harness definition asks for, opens them and sends them over
-  the encrypted station–safehouse link on the `secret` stream; the safehouse places them in
-  that chief's OS account and hands them to the process. A safehouse therefore holds the
-  secrets of the sessions it has run, not the team's whole set. Whether it keeps them between
-  sessions, so that a session can restart while every station of its chief is offline, is part
-  of **decision 19**.
+- **To a safehouse: only for a start, only what was asked for.** When the chief starts a
+  terminal or a session, the station resolves the names the harness definition asks for, opens
+  them and sends them over the encrypted station–safehouse link on the `secret` stream; the
+  safehouse places them in the OS account of that session's project and hands them to the
+  process. A safehouse therefore holds the secrets of the sessions it has run, not the whole
+  set, and one project's agents cannot read another project's. Whether it keeps them between
+  sessions, so that a session can restart while every station is offline, is part of
+  **decision 19**.
 - **The process can read what it is given.** A harness needs its key, so an agent in a session
-  can read every secret that session was started with, and so can the chief at a terminal. A
-  team or project secret is therefore readable, in practice, by every chief the scope covers.
-  A spending limit at the vendor is the control for an API key; hiding a key from the agent
-  behind a proxy on the safehouse is part of **decision 8**.
-- **Removal means rotation.** Removing a chief from the team or from a project re-keys that
-  space for new writes, but cannot take back what the chief could already read. `chief remove`
-  and the project's equivalent list every secret the removed chief could open, and each stays
-  marked "set before a removal" until somebody sets it again with a new value from the vendor.
+  can read every secret that session was started with. A spending limit at the vendor is the
+  control for an API key; hiding a key from the agent behind a proxy on the safehouse is part of
+  **decision 8**.
+- **Revocation means rotation.** Revoking a station or removing a safehouse re-keys the spaces
+  for new writes, but cannot take back what that node could already read. The command lists
+  every secret the node could open or was given, and each stays marked "set before a
+  revocation" until it is set again with a new value from the vendor.
 - **Never in the open** (hard rule 3). A value never reaches a tower or airspace unsealed, a
-  chief outside its scope, a log, an error or an event. A station keeps opened values in memory
-  for as long as a start takes.
+  session of another project, a log, an error or an event. A station keeps opened values in
+  memory for as long as a start takes.
 
-Commands (M6): `chief secret set|list|rm NAME` with `--user` (the default), `--team` or
-`--project <project>`; `chief project …` as decision 18 settles it.
+Commands (M6): `chief secret set|list|rm NAME`, in the user scope unless `--project <project>`
+is given; `chief project …` as decision 18 settles it.
 
 ### Harness API keys, on secrets
 
 Harnesses authenticate with **API keys only**. theCompany drives no sign-in: no browser flow, no
 device code, no pasted code and no callback relay, and a station never opens a URL for a harness.
-A chief creates the key in the vendor's console and stores it as a secret, in the scope it is
-meant for: `chief secret set ANTHROPIC_API_KEY` for their own, `--team` for one the team shares,
-`--project <project>` for one a project is billed on.
+The chief creates the key in the vendor's console and stores it as a secret:
+`chief secret set ANTHROPIC_API_KEY` for the one used everywhere, `--project <project>` for one a
+project is billed on.
 
 A harness definition names the secret its harness authenticates with and how the harness takes
 it. The two presets:
@@ -565,41 +566,36 @@ it. The two presets:
 | Codex | `OPENAI_API_KEY` | `codex login --with-api-key` reads it from stdin, refusing a terminal, and keeps it in Codex's own store: `auth.json` under `CODEX_HOME`, or the OS credential store |
 
 - **Which key a session runs on** follows the resolution rule above: the project's, else the
-  chief's own, else the team's. With none in any scope the start fails and says which name is
-  missing, in which scopes it looked.
-- **Attribution.** A session still belongs to the chief who started it and is recorded under
-  their name with the scope its key came from. At the vendor, usage on a team or project key
-  is no longer attributable to one person; a team that needs that gives each chief their own.
+  chief's own. With none in either scope the start fails and says which name is missing.
 - **Status.** `chief harness status <safehouse>` says for each harness which scope a start
   would take its key from, when that secret was set and whether the vendor last rejected it. It
   never returns the key or a part of it: the safehouse answers from its own record and never
   passes on what a harness CLI prints (`codex login status` prints part of the key). A key the
-  vendor rejects is reported to the stations of the chief whose session met it, by name and
-  scope.
+  vendor rejects is reported to the chief's stations, by name and scope.
 - **No lifecycle to manage.** A key has no session to renew. Replacing one is `chief secret
   set` again; running sessions keep the value they started with.
 - theCompany never reads, copies or moves a harness's own credential files. A subscription sign-in
   typed by hand into a terminal on a safehouse is outside what theCompany supports.
 
-Before M6 nothing changes: with the `pty` preset of M5 a chief sets a key by hand in their own
-account on the safehouse.
+Before M6 nothing changes: with the `pty` preset of M5 the chief sets a key by hand on the
+safehouse.
 
 Still open: for harness keys (**decision 8**), whether the harness process gets the key or a
 proxy adds it; whether cloud-provider credentials count; whether presets also switch off a
 harness's other sign-in methods where it has a setting for that. For secrets (**decisions 18
-and 19**), what a project is; the resolution order; whether a safehouse keeps a secret between
-sessions and in what form.
+and 19**), what a project is; whether a safehouse keeps a secret between sessions and in what
+form.
 
 ### Handlers (later)
 
-A **handler** is the node that sets safehouses up. To start with there are none: a chief sets a
+A **handler** is the node that sets safehouses up. To start with there are none: the chief sets a
 safehouse up by hand — a machine, VM or container of their choosing, the `safehouse` package, and an
-invite. Longer term a handler runs on a host and, on a chief's request, creates an isolated
+pairing ticket. Longer term a handler runs on a host and, on the chief's request, creates an isolated
 environment (a systemd-nspawn container, or possibly a full QEMU VM), starts a safehouse in it, gets
 it admitted, and later tears it down. A handler runs no agents itself. The design leaves room for
-it: a safehouse is already a self-contained node that joins by invite, and nothing ties it to the
-machine it runs on. What a handler may do without a chief's signature, and whether isolation then
-moves from OS accounts inside one safehouse to one safehouse per chief or per job, is **decision
+it: a safehouse is already a self-contained node that joins by a pairing ticket, and nothing ties it to the
+machine it runs on. What a handler may do without the chief's signature, and whether isolation then
+moves from OS accounts inside one safehouse to one safehouse per project or per job, is **decision
 14**. We flesh this out later.
 
 ## Repo layout
