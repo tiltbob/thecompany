@@ -393,10 +393,11 @@ depends on `chief` for the API types, never the reverse.
 
 ## Appendix: verified facts the first milestones rely on
 
-These notes draw on published sources. CI checks the M0 `numbers` dependency set with
-`cargo check -p numbers --locked` and tests the M1 [dev tower](../crates/tower/src/lib.rs) over
-loopback. The iroh snippets behind these facts were also compiled and run in a loopback lab (see
-[notes/iroh-snippets.md](notes/iroh-snippets.md)); the measured numbers below come from it.
+These notes draw on published sources. CI checks the isolated `numbers` dependency set with
+`cargo check -p numbers --locked` and tests the M1 [dev tower](../crates/tower/src/lib.rs) and
+[endpoint and gate](../crates/numbers/src/endpoint.rs) over loopback. The iroh snippets were also
+compiled in a harness, and equivalent loopback lab tests supplied the measured numbers below
+(see [notes/iroh-snippets.md](notes/iroh-snippets.md)).
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
   (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and
