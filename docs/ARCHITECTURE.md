@@ -387,19 +387,17 @@ depends on `chief` for the API types, never the reverse.
 
 These notes draw on published sources. CI checks the isolated `numbers` dependency set with
 `cargo check -p numbers --locked` and tests the M1 [dev tower](../crates/tower/src/lib.rs) and
-[endpoint and gate](../crates/numbers/src/endpoint.rs) over loopback.
+[endpoint and gate](../crates/numbers/src/endpoint.rs) over loopback. The remaining iroh examples
+are source references.
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
-  (MSRV 1.91). `iroh-relay` uses the same settings, with `server` in `tower` only. `numbers`
-  uses `n0-future 0.3` for address lookup. `n0-dns-resolver 0.1` serves SRV in M2. Keep
-  `iroh/test-utils`, `fast-apple-datapath` (private Apple APIs), and `portmapper` out of the
-  libraries. Install the rustls crypto provider only in a binary's `main`.
-- **Endpoint.** `iroh::Endpoint::builder(presets::Minimal)` configures ring for that endpoint.
-  `numbers` supplies the node key, custom relay map, lookup and hook, and disables port mapping.
-  `.clear_ip_transports()` gives a relay-only endpoint. To bind a loopback-only endpoint, clear
-  IP transports first and then call `.bind_addr((Ipv4Addr::LOCALHOST, 0))?`. Binding only an
-  IPv4 address otherwise leaves the default IPv6 socket. `Builder::transport_config` sets the
-  M1 limits of 16 incoming bidirectional streams and zero unidirectional streams.
+  (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and
+  `n0-error 1`; `n0-dns-resolver 0.1` for SRV in M2. Never enable `iroh/test-utils`. Keep
+  `fast-apple-datapath` (private Apple APIs) and `portmapper` out of the libraries. Install the
+  rustls crypto provider only in a binary's `main`.
+- **Endpoint.** `Endpoint::builder(presets::Minimal)` with `.secret_key`, `.relay_mode(RelayMode::
+  Custom(map))`, `.address_lookup(..)`, `.hooks(..)`, `.portmapper_config(PortmapperConfig::Disabled)`;
+  `.clear_ip_transports()` gives a relay-only endpoint; tests add `.bind_addr((LOCALHOST, 0))`.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842; against a plain-HTTP tower that
   stalls every net report about 3 s. Use `iroh::RelayConfig::new(url, None)` for `http://` towers.
   Switch off only the captive-portal check (`NetReportConfig::default()` with
@@ -418,15 +416,13 @@ These notes draw on published sources. CI checks the isolated `numbers` dependen
   80, captive-portal responder); ACME is tls-alpn-01 on port 443 only and needs `cache_path`; QAD
   needs TLS; `Server::spawn` cannot add HTTP routes. A relay and a separate iroh endpoint can run in
   one process; the relay does not advertise that endpoint's id.
-- **Router and gate.** Use the endpoint's `router_builder().accept(ALPN, proto).spawn()` to keep
-  the incoming filter in place. `spawn` sets the endpoint ALPNs. Dropping the `Router` aborts it,
-  so call `router.shutdown().await`.
+- **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
+  `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
-  right after `open_bi`. `EndpointHooks::after_handshake` uses the authenticated remote id and
-  negotiated ALPN in both directions. It runs after iroh registers the connection. The pre-handshake
-  filter limits address disclosure by dropping unknown relay-claimed ids and requiring address
-  validation for direct attempts. A hostile tower can forge the claimed id. The hook owns no
-  endpoint handle.
+  right after `open_bi`. `EndpointHooks::after_handshake` runs for every ALPN in both directions (keep
+  it ALPN-aware; it must not hold an `Endpoint`) and only after iroh has registered the connection, so
+  only the pre-handshake filter limits address disclosure — and for relayed attempts the claimed id
+  comes from the tower.
 - **Liveness.** An endpoint binds with an empty relay map and takes towers later through
   `insert_relay` / `remove_relay`. A first home tower comes only from a net report, which re-runs
   every 20–26 s or when the relay map changes, so a station started before its tower can take that

@@ -18,7 +18,9 @@ use tokio::time::timeout;
 
 const ALPN: &[u8] = b"test/endpoint/0";
 const OTHER_ALPN: &[u8] = b"test/endpoint/1";
-const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+const TEST_TIMEOUT: Duration = Duration::from_secs(45);
+// Under load a home relay may be selected on the next net report.
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const IGNORE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -67,6 +69,14 @@ async fn bind_direct(authorizer: &Arc<Authorizer>) -> Endpoint {
         authorizer,
     )
     .await
+}
+
+async fn wait_for_tower(first: &Endpoint, second: &Endpoint) {
+    timeout(ONLINE_TIMEOUT, async {
+        tokio::join!(first.iroh().online(), second.iroh().online());
+    })
+    .await
+    .expect("endpoints did not come online through the tower");
 }
 
 fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {
@@ -131,7 +141,7 @@ async fn authorized_endpoints_dial_by_id_through_the_tower() {
 
         assert!(first.iroh().bound_sockets().is_empty());
         assert!(second.iroh().bound_sockets().is_empty());
-        tokio::join!(first.iroh().online(), second.iroh().online());
+        wait_for_tower(&first, &second).await;
         let (first_dial, second_dial) = tokio::join!(
             first.iroh().connect(second_id, ALPN),
             second.iroh().connect(first_id, ALPN),
@@ -190,7 +200,7 @@ async fn relayed_stranger_is_ignored_before_dispatch() {
         let (caller_id, callee_id) = (caller.iroh().id(), callee.iroh().id());
         caller_auth.replace_peers([(callee_id, "callee".into())]);
         let (router, mut receipts) = observe(&callee, &[ALPN]);
-        tokio::join!(caller.iroh().online(), callee.iroh().online());
+        wait_for_tower(&caller, &callee).await;
 
         let refused = timeout(IGNORE_TIMEOUT, caller.iroh().connect(callee_id, ALPN)).await;
         assert!(
