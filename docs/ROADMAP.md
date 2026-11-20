@@ -15,9 +15,9 @@ Each milestone is one small, demoable PR series with an automated check and a ma
 | M3 | Membership: chief ids and admin keys, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, invites, station commissions, roster sync, signed address records passed between nodes, removal, the tower's own endpoint with a roster-fed allowlist; `chief network` | a second chief joins by invite through an allowlisting tower and chats without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while removal and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); a chief revokes one of their two devices and keeps working from the other; a removed chief is refused by every node after sync | M1 (allowlist feed: M2); decisions 1, 2; **needs:** Nitrokey HSM 2 tokens |
 | M4 | Airspace I: sealed blocks on towers and members, spaces and keys, names, leases and quotas, the two-tower rule with tower-to-tower pull; text objects; `chief airspace` | an object written on one station is read on another after the first went offline; the tower's disk holds only ciphertext; "stored" needs two towers; a rolled-back name is refused; unleased blocks lapse | M3; decisions 4, 5, 6 |
 | M5 | Safehouse, set up by hand by a chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, per-chief OS accounts, confinement checks | a chief runs `claude` and `codex` on a safehouse with API keys set by hand; an agent process cannot read the safehouse's key or another chief's home | M3; decision 3 |
-| M6 | Harness API keys for Claude and Codex: set, status, replace and remove from a chief | both harnesses run on a safehouse on keys set from a chief with no SSH; a key never appears in a log, an error or an event; CI uses a fake harness CLI | M5; decision 8; **needs:** an Anthropic and an OpenAI API key (manual check only) |
+| M6 | Secrets, then harness API keys on them. (a) Secrets in three scopes — user (one chief), team, project — sealed in airspace spaces of their own; projects; `chief secret`, `chief project`; delivery to a safehouse for a terminal or session. (b) Harness API keys for Claude and Codex as secrets: the presets name the secret, a start resolves it project, then user, then team; `chief harness status` | (a) a secret set on one station is listed on the chief's other station, with no command returning its value; a team secret reaches every chief, a project secret only its members; a session gets exactly the names its harness asks for; after a chief is removed, every secret they could open is listed for rotation; the tower's disk holds only ciphertext. (b) both harnesses run on a safehouse on keys set from a chief with no SSH, once from the user scope and once from the team scope; a value never appears in a log, an error or an event; CI uses a fake harness CLI | M4, M5; decisions 8, 18, 19; **needs:** an Anthropic and an OpenAI API key (manual check only) |
 | M7 | Airspace II: git repos — remote helper, bundles and manifests, mirrors on safehouses, compaction | `git clone`, `fetch` and `push` between a station and a safehouse with only towers always on; a non-fast-forward push is refused; two racing pushes leave one tip and one conflict ref | M4 (safehouse side: M5); decision 10 |
-| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, ownership policy, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a chief; reattach from a second station; a non-owner cannot steer. CI: a fake ACP agent | M5 (M6 for keys set from a chief); decisions 9, 11 |
+| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, ownership policy, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a chief; reattach from a second station; a non-owner cannot steer. CI: a fake ACP agent | M5 (M6 for keys and other secrets set from a chief, and for projects); decisions 9, 11 |
 | M9 | Chat v2: durable history and outbox, receipts, channels, delivery to all of a chief's stations, offline delivery through airspace, chat tools for agents | history survives a restart; a message sent while the recipient was offline arrives when it returns; an agent posts to a channel | M4 (agent tools: M8) |
 | M10 | Sockets: `chief forward -L` with a safehouse-side target policy | a station reaches a safehouse's localhost service; a disallowed target is refused | M5 |
 | M11 | Airspace III and files: large media (resume, streaming, range reads, audits), push/pull between nodes, browsing workspaces, file tools for agents | a multi-gigabyte upload survives an interruption; another node streams a range of it; a tower that dropped a block is caught and refilled | M4 (safehouse side: M5) |
@@ -453,10 +453,12 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
    always-on safehouse should order writes instead.
 7. **Codex browser login (M6).** Settled by the owner: dropped, with every other sign-in flow.
    Harnesses authenticate with API keys only.
-8. **Harness API keys (M6).** API keys only is decided. Open: where a key is kept on the
-   safehouse and in what form; whether the harness process gets the key or a proxy on the safehouse
-   adds it to requests, so that an agent never holds it; one key per chief (planned) or a key a team
-   shares; whether cloud-provider credentials for Claude (Bedrock, Vertex, Foundry) are in scope
+8. **Harness API keys (M6).** API keys only is decided. Settled by the owner: a harness's API
+   key is a secret, and secrets come in user, team and project scopes, so a key may be a
+   chief's own, a team's or a project's; where a key is kept is now part of decision 19. Still
+   open here: whether the harness process gets the key or a proxy on the safehouse
+   adds it to requests, so that an agent never holds it; whether cloud-provider credentials for
+   Claude (Bedrock, Vertex, Foundry) are in scope
    (planned: not at first); whether presets also switch off a harness's other sign-in methods where
    it has a setting for that.
 9. **Harness transport, per harness (M8).** ACP adapters or native protocols. For Claude: the ACP
@@ -501,6 +503,24 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     connected, for some seconds, at a growing, capped interval, and never while the home tower is
     connected. A denying tower is shown and taken out of the relay map only when another tower is
     not denied; the station limits its own attempts and DNS queries, not iroh's own retries.
+18. **Projects (M6).** Project secrets need a project, and nothing else defines one yet. What a
+    project is: a signed record of a name and member chiefs, with an airspace space of its own
+    (planned), or nothing more than a restricted airspace space, or a git repo. Who creates one
+    and changes its members (planned: any chief creates, members change membership, every change
+    attributed); how a repo, a workspace and a session come to belong to one (planned: a session
+    is started for a project by name, and M7 and M8 attach repos and workspaces to it); whether
+    project membership is a roster statement, which towers would then see, or a record among
+    members (planned: among members).
+19. **Secrets: storage, delivery and resolution (M6).** Planned: sealed in airspace, one space
+    per scope, wrapped to the stations of the chiefs the scope covers and never to a safehouse;
+    a station opens what a start asks for and sends it to the safehouse over the link. Open:
+    the resolution order (planned: project, then user, then team; the alternative puts a
+    chief's own secret first); whether a safehouse keeps a delivered secret in the chief's
+    account between sessions, so that a session can restart with no station online, or only
+    for the life of a process; whether a team secret can be limited to named safehouses;
+    whether any chief may set a team secret (planned) or it takes more than one; whether
+    secrets other than a harness's key reach a session only when its harness definition names
+    them (planned) or all of a scope's secrets do.
 
 **Needs from the team:** a public host and DNS zone (M2 demo; nothing else waits on it); a ruling
 on hard rule 10 for `crates/chief-ffi`, whose generated bindings use `unsafe` (M2 FFI smoke check,
@@ -529,7 +549,12 @@ distributing beyond the team or hosting it for others.
   address records it learns from nodes it is connected to (and from M3 the signed roster's tower
   set), then every tower of its own set. A tower set that a peer sends is shown as candidates and
   not used on its own (decision 16).
-- Airspace starts with one team-wide space that every member can read; restricted spaces come later.
+- Airspace starts with one team-wide space that every member can read; restricted spaces come
+  later, the first of them with secrets (M6).
+- "User, team and project secrets": a user is a chief, the team is the whole network, and a
+  project is a named group of chiefs inside it, which this feature introduces (decision 18).
+  Secrets are a feature of their own, for any named value; harness API keys are their first use
+  and replace the per-safehouse `chief apikey` commands planned before.
 - "Text objects" are named, versioned documents; git repos are a real remote, not snapshots.
 - "Files" (push/pull between two nodes, browsing a safehouse's workspace) stays a separate, smaller
   feature built on airspace's block transfer.

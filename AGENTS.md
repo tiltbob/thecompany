@@ -52,11 +52,13 @@ The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed. Tes
    documented exception, in a frontend started by the chief: the git helper running git.
 2. **Towers never hold keys.** A tower sees ciphertext only. The tower binary contains no sealing or
    key code.
-3. **Harness credentials.** Harnesses authenticate with API keys only. Never drive, relay or
-   automate a subscription sign-in (claude.ai, ChatGPT), never parse, copy or move a harness's own
-   credential files, and never inject tokens. An API key is entered by its chief and passed to the
-   safehouse that chief names: never log it, echo it, return it from an API or put it in an error or
-   an event, and never give it to a tower, another chief or airspace.
+3. **Harness credentials and secrets.** Harnesses authenticate with API keys only. Never drive,
+   relay or automate a subscription sign-in (claude.ai, ChatGPT), never parse, copy or move a
+   harness's own credential files, and never inject tokens. An API key is a secret. A secret is
+   entered by a chief into one scope — that chief (user), the team, or a project — and is opened
+   only for chiefs that scope covers and for their sessions on the safehouses they use: never log
+   a secret's value, echo it, return it from an API or put it in an error or an event, and never
+   give it in the clear to a tower, to airspace or to a chief outside its scope.
 4. **One station per identity.** A station takes an exclusive lock on its data dir. Two processes
    must never share a node key.
 5. **Frontends hold no network state.** `chief` and `chief-cli` depend on `numbers-base` only, never
