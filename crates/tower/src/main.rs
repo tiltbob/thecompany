@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Parser, Subcommand};
 use numbers_tower::{CertSource, DEFAULT_BIND, TLS_LOG_TARGET, Tower, TowerConfig, config};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -26,10 +27,17 @@ const RELAY_SERVER_TARGET: &str = "iroh_relay::server";
 const ACME_SPAN: &str = "acme";
 /// How iroh-relay's debug message for a deployed certificate starts: `acme event: {ok:?}` with
 /// tokio-rustls-acme's `EventOk::DeployedNewCert` or `DeployedCachedCert`.
-const DEPLOYED_PREFIX: &str = "acme event: Deployed";
+const DEPLOYED: &[&str] = &["acme event: Deployed"];
+/// How iroh-relay's error messages start, `error: {err:?}` with tokio-rustls-acme 0.10.0's
+/// `EventError` (`src/state.rs:63-78`): an order (retried with a growing delay,
+/// `src/state.rs:417-426`), and the four cache errors (`CertCacheLoad`, `CertCacheStore`,
+/// `AccountCacheLoad`, `AccountCacheStore`), which are not retried.
+const ERRORS: &[&str] = &["error: Order(", "error: CertCache", "error: AccountCache"];
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "tower",
+    bin_name = "tower",
     about = "Run a loopback-only development relay, or a production tower with `serve`",
     args_conflicts_with_subcommands = true
 )]
@@ -66,24 +74,66 @@ fn access_label(listed: Option<usize>) -> String {
     }
 }
 
-/// What the start line says about where the certificate comes from.
-fn certificate_label(config: &TowerConfig) -> &'static str {
-    match config.tls.as_ref().map(|tls| &tls.source) {
-        None => "none",
-        Some(CertSource::Files { .. }) => "files",
-        Some(CertSource::Acme {
-            production: true, ..
-        }) => "acme production",
-        Some(CertSource::Acme { .. }) => "acme staging",
-        Some(_) => "other",
+/// What the start line says about a listener: its port, never its address (for a tower reached
+/// by an IP literal the address is the tower's identity, and logs get pasted into issues), or
+/// `off`.
+fn port_label(addr: Option<SocketAddr>) -> String {
+    addr.map_or_else(|| "off".to_owned(), |addr| addr.port().to_string())
+}
+
+/// Where the certificate comes from, as the start line says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Certificate {
+    /// A dev tower, with no certificate.
+    None,
+    /// PEM files.
+    Files,
+    /// Let's Encrypt's staging directory, which stations do not trust.
+    AcmeStaging,
+    /// Let's Encrypt's production directory.
+    AcmeProduction,
+    /// A source this binary does not know.
+    Other,
+}
+
+impl Certificate {
+    fn of(config: &TowerConfig) -> Self {
+        match config.tls.as_ref().map(|tls| &tls.source) {
+            None => Self::None,
+            Some(CertSource::Files { .. }) => Self::Files,
+            Some(CertSource::Acme {
+                production: true, ..
+            }) => Self::AcmeProduction,
+            Some(CertSource::Acme { .. }) => Self::AcmeStaging,
+            Some(_) => Self::Other,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Files => "files",
+            Self::AcmeStaging => "acme staging",
+            Self::AcmeProduction => "acme production",
+            Self::Other => "other",
+        }
+    }
+
+    /// Whether the start warns that stations do not trust the certificate.
+    fn warns(self) -> bool {
+        self == Self::AcmeStaging
     }
 }
 
 /// A step of iroh-relay's ACME client that the binary reports, with no detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcmeNote {
-    /// A step failed: iroh-relay logged an error in its ACME span.
-    Failed,
+    /// An order failed; the ACME client retries it with a growing delay.
+    OrderFailed,
+    /// The cache directory could not be read or written; the ACME client does not retry that.
+    CacheFailed,
+    /// Another step failed.
+    StepFailed,
     /// A certificate was deployed, newly ordered or from the cache.
     Deployed,
 }
@@ -92,13 +142,23 @@ enum AcmeNote {
 ///
 /// iroh-relay 1.5.0 (`src/server.rs:777-783`) logs each event of its ACME client in a span
 /// named `acme`, under its own target: `error!("error: {err:?}")` for a failure and
-/// `debug!("acme event: {ok:?}")` for a step. Both carry the domain, so the log filter drops
-/// them. This layer looks only at the target, the span's name, the level and whether a debug
-/// message starts with `acme event: Deployed`; it never keeps or prints a field. It sends the
-/// note over a channel, since an event logged while the dispatcher is busy with this one would
-/// be dropped. If iroh-relay's wording changes, the notes stop; nothing else breaks.
+/// `debug!("acme event: {ok:?}")` for a step. The error's text can carry the domain; the
+/// step's does not (tokio-rustls-acme 0.10.0's `EventOk` variants have no fields, and the span
+/// has none). The log filter ([`shown`]) drops both, as it drops every event that is not the
+/// tower's own. This layer looks only at the target, the span's name, the level and how the message
+/// starts ([`ERRORS`], [`DEPLOYED`]); it never keeps or prints a field. It sends the note over
+/// a channel, since an event logged while the dispatcher is busy with this one would be
+/// dropped. If iroh-relay's or tokio-rustls-acme's wording changes, an error becomes the
+/// neutral note and a deployment is no longer reported; nothing else breaks.
 struct AcmeWatch {
     notes: UnboundedSender<AcmeNote>,
+}
+
+/// The per-layer filter `main` installs in front of [`AcmeWatch`]: events of iroh-relay's
+/// server module, ERROR to DEBUG. It is kept wider than [`AcmeWatch::on_event`]'s own check, so
+/// the filter can only let too much through, never too little; the layer decides the rest.
+fn acme_filter(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target().starts_with(RELAY_SERVER_TARGET) && *metadata.level() <= Level::DEBUG
 }
 
 impl<S> Layer<S> for AcmeWatch
@@ -114,11 +174,19 @@ where
             return;
         }
         let note = match *metadata.level() {
-            Level::ERROR => Some(AcmeNote::Failed),
-            Level::DEBUG => {
-                let mut message = StartsWithDeployed::default();
+            Level::ERROR => {
+                let mut message = MessageStart::new(ERRORS);
                 event.record(&mut message);
-                message.yes().then_some(AcmeNote::Deployed)
+                Some(match message.found() {
+                    Some(0) => AcmeNote::OrderFailed,
+                    Some(_) => AcmeNote::CacheFailed,
+                    None => AcmeNote::StepFailed,
+                })
+            }
+            Level::DEBUG => {
+                let mut message = MessageStart::new(DEPLOYED);
+                event.record(&mut message);
+                message.found().map(|_| AcmeNote::Deployed)
             }
             _ => None,
         };
@@ -129,24 +197,60 @@ where
     }
 }
 
-/// Whether a formatted message starts with [`DEPLOYED_PREFIX`]. It compares as the message is
-/// written and stops at the first byte that differs; it keeps nothing.
-#[derive(Default)]
-struct StartsWithDeployed {
+/// Which of a few prefixes a formatted message starts with. It compares the bytes as the
+/// message is written, in as many pieces as it comes, and stops as soon as the answer is
+/// known; it keeps no byte of the message, only how many bytes matched and which prefixes are
+/// still possible.
+struct MessageStart {
+    prefixes: &'static [&'static str],
     matched: usize,
-    differs: bool,
+    /// Bit `i` is set while `prefixes[i]` can still match.
+    possible: u32,
 }
 
-impl fmt::Write for StartsWithDeployed {
+impl MessageStart {
+    fn new(prefixes: &'static [&'static str]) -> Self {
+        Self {
+            prefixes,
+            matched: 0,
+            possible: (1 << prefixes.len()) - 1,
+        }
+    }
+
+    /// The index of the first prefix the message starts with, if any.
+    fn found(&self) -> Option<usize> {
+        (0..self.prefixes.len()).find(|&index| {
+            self.possible & (1 << index) != 0
+                && self
+                    .prefixes
+                    .get(index)
+                    .is_some_and(|p| p.len() <= self.matched)
+        })
+    }
+
+    /// Whether more bytes could still change the answer.
+    fn undecided(&self) -> bool {
+        (0..self.prefixes.len()).any(|index| {
+            self.possible & (1 << index) != 0
+                && self
+                    .prefixes
+                    .get(index)
+                    .is_some_and(|p| p.len() > self.matched)
+        })
+    }
+}
+
+impl fmt::Write for MessageStart {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        let prefix = DEPLOYED_PREFIX.as_bytes();
         for &byte in text.as_bytes() {
-            if self.matched == prefix.len() {
+            if !self.undecided() {
                 return Err(fmt::Error);
             }
-            if prefix.get(self.matched) != Some(&byte) {
-                self.differs = true;
-                return Err(fmt::Error);
+            for (index, prefix) in self.prefixes.iter().enumerate() {
+                let bytes = prefix.as_bytes();
+                if self.matched < bytes.len() && bytes.get(self.matched) != Some(&byte) {
+                    self.possible &= !(1 << index);
+                }
             }
             self.matched += 1;
         }
@@ -154,13 +258,7 @@ impl fmt::Write for StartsWithDeployed {
     }
 }
 
-impl StartsWithDeployed {
-    fn yes(&self) -> bool {
-        !self.differs && self.matched == DEPLOYED_PREFIX.len()
-    }
-}
-
-impl Visit for StartsWithDeployed {
+impl Visit for MessageStart {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if field.name() == "message" {
             // Stops early by design; the error only means "decided".
@@ -178,26 +276,94 @@ impl Visit for StartsWithDeployed {
 /// Logs a note under the binary's own target, as a fixed line.
 fn log_acme_note(note: AcmeNote) {
     match note {
-        AcmeNote::Failed => tracing::warn!(
+        AcmeNote::OrderFailed => tracing::warn!(
             target: LOG_TARGET,
-            "ACME: a certificate step failed; the tower retries with a growing delay"
+            "ACME: a certificate order failed; the tower retries with a growing delay"
         ),
+        AcmeNote::CacheFailed => tracing::warn!(
+            target: LOG_TARGET,
+            "ACME: the cache directory could not be read or written; certificates are not kept \
+             across restarts"
+        ),
+        AcmeNote::StepFailed => {
+            tracing::warn!(target: LOG_TARGET, "ACME: a certificate step failed")
+        }
         AcmeNote::Deployed => tracing::info!(target: LOG_TARGET, "ACME: a certificate is in use"),
+    }
+}
+
+/// Where a command-line error goes, and with which exit status.
+#[derive(Debug, PartialEq, Eq)]
+struct Rendered {
+    text: String,
+    status: u8,
+    to_stdout: bool,
+}
+
+/// Renders a clap error for printing. Help is clap's own text, on standard output, with exit
+/// status 0. Every other error is a fixed text of ours on standard error with exit status 2:
+/// clap's own messages repeat what was typed (a value, an unknown argument), and under a service
+/// manager standard error goes to the journal. A flag's own name may be shown; a typed value
+/// never.
+fn render(error: &clap::Error) -> Rendered {
+    let fixed = |line: String| Rendered {
+        text: format!("tower: {line}\nsee `tower --help`\n"),
+        status: 2,
+        to_stdout: false,
+    };
+    // The argument clap names for this error, when it is ours. For an unknown argument clap
+    // puts what was typed in the same place, so it is read only for the kinds below.
+    let our_argument = || match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(arg)) => arg.clone(),
+        Some(ContextValue::Strings(args)) => args.join(", "),
+        _ => "an argument".to_owned(),
+    };
+    match error.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => Rendered {
+            text: error.render().to_string(),
+            status: 0,
+            to_stdout: true,
+        },
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            fixed(format!("invalid value for {}", our_argument()))
+        }
+        ErrorKind::MissingRequiredArgument => fixed(format!(
+            "a required argument is missing: {}",
+            our_argument()
+        )),
+        ErrorKind::ArgumentConflict => {
+            fixed("arguments that cannot be used together were given".to_owned())
+        }
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            fixed("unknown argument".to_owned())
+        }
+        _ => fixed("invalid command line".to_owned()),
     }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let rendered = render(&error);
+            if rendered.to_stdout {
+                print!("{}", rendered.text);
+            } else {
+                eprint!("{}", rendered.text);
+            }
+            return ExitCode::from(rendered.status);
+        }
+    };
     let (notes, mut received) = unbounded_channel();
     // Colour only on a terminal: journald and files get plain text. The fmt layer writes to
     // standard output.
     let log = tracing_subscriber::fmt::layer()
         .with_ansi(io::stdout().is_terminal())
         .with_filter(filter_fn(|metadata| shown(metadata.target())));
-    let acme = AcmeWatch { notes }.with_filter(filter_fn(|metadata| {
-        metadata.target() == RELAY_SERVER_TARGET && *metadata.level() <= Level::DEBUG
-    }));
+    let acme = AcmeWatch { notes }.with_filter(filter_fn(acme_filter));
     tracing_subscriber::registry().with(log).with(acme).init();
     tokio::spawn(async move {
         while let Some(note) = received.recv().await {
@@ -239,24 +405,22 @@ async fn run(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-/// Loads the config on the blocking pool, starts the tower, and logs its listeners. The log
-/// line names no host name, URL, id or path (hard rule 9).
+/// Loads the config on the blocking pool, starts the tower, and logs its listeners' ports. The
+/// log line names no host name, URL, address, id or path (hard rule 9).
 async fn serve(path: PathBuf) -> Result<Tower, Box<dyn Error + Send + Sync>> {
     let config = tokio::task::spawn_blocking(move || config::load(&path)).await??;
-    let certificate = certificate_label(&config);
+    let certificate = Certificate::of(&config);
     let tower = Tower::spawn(config).await?;
-    let or_off =
-        |addr: Option<SocketAddr>| addr.map_or_else(|| "off".to_owned(), |a| a.to_string());
     tracing::info!(
         target: LOG_TARGET,
-        https = %or_off(tower.https_addr()),
-        http = %tower.http_addr(),
-        qad = %or_off(tower.qad_addr()),
+        https = %port_label(tower.https_addr()),
+        http = %port_label(Some(tower.http_addr())),
+        qad = %port_label(tower.qad_addr()),
         access = %access_label(tower.listed()),
-        certificate,
+        certificate = certificate.label(),
         "tower listening"
     );
-    if certificate == "acme staging" {
+    if certificate.warns() {
         tracing::warn!(
             target: LOG_TARGET,
             "the certificate comes from Let's Encrypt's staging directory, which stations do not \
@@ -288,6 +452,8 @@ fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+    use std::net::SocketAddr;
     use std::path::Path;
 
     use clap::Parser;
@@ -295,14 +461,13 @@ mod tests {
     use numbers_tower::DEFAULT_BIND;
 
     use numbers_tower::{TlsTower, TowerConfig};
-    use tracing::Level;
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        AcmeNote, AcmeWatch, Args, Command, RELAY_SERVER_TARGET, access_label, certificate_label,
-        shown,
+        AcmeNote, AcmeWatch, Args, Certificate, Command, ERRORS, MessageStart, access_label,
+        acme_filter, port_label, render, shown,
     };
 
     #[test]
@@ -343,6 +508,87 @@ mod tests {
     }
 
     #[test]
+    fn serve_needs_a_config_file() {
+        let error = Args::try_parse_from(["tower", "serve"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    /// What was typed, the program's own path included, never appears in what the binary prints
+    /// for a command-line error; each error has its fixed line, on standard error, with exit
+    /// status 2.
+    #[test]
+    fn command_line_errors_are_fixed_text_without_what_was_typed() {
+        const MARKER: &str = "typed-host.example.invalid";
+        let program = format!("/opt/{MARKER}/tower");
+        let flag = format!("--{MARKER}");
+        let address = format!("{MARKER}:443");
+        let cases: [(Vec<&str>, &str); 5] = [
+            (
+                vec![&program, "--bind", &address],
+                "tower: invalid value for --bind <BIND>",
+            ),
+            (vec![&program, MARKER], "tower: unknown argument"),
+            (
+                vec![&program, "serve", "--config", "x", &flag],
+                "tower: unknown argument",
+            ),
+            (
+                vec![&program, "serve", "--config", "x", MARKER],
+                "tower: unknown argument",
+            ),
+            (
+                vec![&program, "serve"],
+                "tower: a required argument is missing: --config <CONFIG>",
+            ),
+        ];
+        for (args, line) in cases {
+            let error = Args::try_parse_from(&args).unwrap_err();
+            let rendered = render(&error);
+            assert_eq!(
+                rendered.text,
+                format!("{line}\nsee `tower --help`\n"),
+                "{line}"
+            );
+            assert!(!rendered.text.contains(MARKER), "{line}");
+            assert_eq!((rendered.status, rendered.to_stdout), (2, false), "{line}");
+        }
+        let error = Args::try_parse_from([
+            program.as_str(),
+            "--bind",
+            "127.0.0.1:3340",
+            "serve",
+            "--config",
+            "x",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            render(&error).text,
+            "tower: arguments that cannot be used together were given\nsee `tower --help`\n"
+        );
+    }
+
+    /// Help is clap's own, for `tower` whatever the program's path, on standard output with
+    /// exit status 0.
+    #[test]
+    fn help_names_the_program_tower() {
+        const MARKER: &str = "typed-host.example.invalid";
+        let program = format!("/opt/{MARKER}/not-tower");
+        for args in [
+            vec![program.as_str(), "--help"],
+            vec![program.as_str(), "serve", "--help"],
+        ] {
+            let error = Args::try_parse_from(&args).unwrap_err();
+            let rendered = render(&error);
+            assert_eq!((rendered.status, rendered.to_stdout), (0, true));
+            assert!(rendered.text.contains("Usage: tower"), "help names tower");
+            assert!(
+                !rendered.text.contains(MARKER),
+                "help shows the typed program path"
+            );
+        }
+    }
+
+    #[test]
     fn the_log_filter_shows_the_towers_own_targets_only() {
         assert!(shown("numbers_tower::cli"));
         assert!(shown(numbers_tower::TLS_LOG_TARGET));
@@ -365,69 +611,133 @@ mod tests {
         assert_eq!(access_label(Some(3)), "3 ids listed");
         assert_eq!(access_label(Some(0)), "0 ids listed");
         assert_eq!(access_label(None), "open");
+        let addr: SocketAddr = "203.0.113.5:8443".parse().unwrap();
+        assert_eq!(port_label(Some(addr)), "8443");
+        assert_eq!(port_label(None), "off");
+        let v6: SocketAddr = "[2001:db8::5]:443".parse().unwrap();
+        assert_eq!(port_label(Some(v6)), "443");
+    }
+
+    /// The certificate label, and the staging warning decided from the source itself.
+    #[test]
+    fn the_certificate_label_and_the_staging_warning() {
         let files = TowerConfig::tls(TlsTower::new("tower1.example.com", "c.pem", "k.pem"));
-        assert_eq!(certificate_label(&files), "files");
         let acme = |production| {
             TowerConfig::tls(
                 TlsTower::acme("tower1.example.com", "mailto:ops@example.com", "/c")
                     .production(production),
             )
         };
-        assert_eq!(certificate_label(&acme(false)), "acme staging");
-        assert_eq!(certificate_label(&acme(true)), "acme production");
-        assert_eq!(certificate_label(&TowerConfig::dev(DEFAULT_BIND)), "none");
+        for (config, label, warns) in [
+            (files, "files", false),
+            (acme(false), "acme staging", true),
+            (acme(true), "acme production", false),
+            (TowerConfig::dev(DEFAULT_BIND), "none", false),
+        ] {
+            let certificate = Certificate::of(&config);
+            assert_eq!((certificate.label(), certificate.warns()), (label, warns));
+        }
     }
 
-    /// Exactly the two notes come out, and nothing of the events' text.
+    /// The matcher works when the message comes in pieces, and a prefix that matches only in
+    /// part is no match.
     #[test]
-    fn the_acme_layer_reports_failures_and_deployments_only() {
+    fn the_message_start_matches_across_pieces() {
+        let found = |pieces: &[&str]| {
+            let mut start = MessageStart::new(ERRORS);
+            for piece in pieces {
+                if start.write_str(piece).is_err() {
+                    break;
+                }
+            }
+            start.found()
+        };
+        assert_eq!(found(&["err", "or: Or", "der(x)"]), Some(0));
+        assert_eq!(found(&["error: Cert", "Cache", "Load(..)"]), Some(1));
+        assert_eq!(found(&["error: AccountCacheStore(..)"]), Some(2));
+        assert_eq!(found(&["error: Ord"]), None);
+        assert_eq!(found(&["error: Orders(x)"]), None);
+        assert_eq!(found(&["error: CertCach"]), None);
+        assert_eq!(found(&["error: CachedCertParse(..)"]), None);
+        assert_eq!(found(&[""]), None);
+    }
+
+    /// Each kind of ACME event gives its note, through real tracing macros, and nothing of the
+    /// events' text comes out.
+    #[test]
+    fn the_acme_layer_reports_each_kind_of_event() {
         #[derive(Debug)]
         enum EventOk {
             DeployedNewCert,
             DeployedCachedCert,
             CertCacheStore,
         }
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        enum EventError {
+            Order(&'static str),
+            CertCacheLoad(&'static str),
+            CertCacheStore(&'static str),
+            AccountCacheLoad(&'static str),
+            AccountCacheStore(&'static str),
+            CachedCertParse(&'static str),
+            NewCertParse(&'static str),
+            Ord(&'static str),
+        }
         let (notes, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let layer = AcmeWatch { notes }.with_filter(filter_fn(|metadata| {
-            metadata.target() == RELAY_SERVER_TARGET && *metadata.level() <= Level::DEBUG
-        }));
+        let layer = AcmeWatch { notes }.with_filter(filter_fn(acme_filter));
         let subscriber = tracing_subscriber::registry().with(layer);
         const RELAY: &str = "iroh_relay::server";
+        const HOST: &str = "qzx-host.example";
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(target: RELAY, "acme");
             let entered = span.enter();
-            tracing::error!(target: RELAY, "error: {:?}", "order for qzx-host.example failed");
+            tracing::error!(target: RELAY, "error: {:?}", EventError::Order(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::CertCacheLoad(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::CertCacheStore(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::AccountCacheLoad(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::AccountCacheStore(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::CachedCertParse(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::NewCertParse(HOST));
+            tracing::error!(target: RELAY, "error: {:?}", EventError::Ord(HOST));
             tracing::debug!(target: RELAY, "acme event: {:?}", EventOk::CertCacheStore);
             tracing::debug!(target: RELAY, "acme event: {:?}", EventOk::DeployedNewCert);
             tracing::debug!(target: RELAY, "acme event: {:?}", EventOk::DeployedCachedCert);
             tracing::info!(target: RELAY, "acme event: {:?}", EventOk::DeployedNewCert);
-            // Another target in the same span.
-            tracing::error!(target: "iroh_relay::server::x", "error: {:?}", "qzx-host.example");
+            // Other targets in the same span. `acme_filter` lets the first through (it starts
+            // the same way), so only the target check in `on_event` rejects it; the filter
+            // rejects the second.
+            let order = EventError::Order(HOST);
+            tracing::error!(target: "iroh_relay::server::x", "error: {:?}", order);
+            tracing::error!(target: "x::iroh_relay::server", "error: {:?}", order);
             drop(entered);
             // The same target outside the span, and in another span.
-            tracing::error!(target: RELAY, "error: {:?}", "qzx-host.example");
+            tracing::error!(target: RELAY, "error: {:?}", EventError::Order(HOST));
             tracing::debug!(target: RELAY, "acme event: {:?}", EventOk::DeployedNewCert);
             let other = tracing::info_span!(target: RELAY, "relay");
             let _other = other.enter();
-            tracing::error!(target: RELAY, "error: {:?}", "qzx-host.example");
+            tracing::error!(target: RELAY, "error: {:?}", EventError::Order(HOST));
         });
         let mut seen = Vec::new();
         while let Ok(note) = received.try_recv() {
             seen.push(note);
         }
+        use AcmeNote::{CacheFailed, Deployed, OrderFailed, StepFailed};
         assert_eq!(
             seen,
-            vec![AcmeNote::Failed, AcmeNote::Deployed, AcmeNote::Deployed]
+            vec![
+                OrderFailed,
+                CacheFailed,
+                CacheFailed,
+                CacheFailed,
+                CacheFailed,
+                StepFailed,
+                StepFailed,
+                StepFailed,
+                Deployed,
+                Deployed,
+            ]
         );
-        for note in seen {
-            assert!(!format!("{note:?}").contains("qzx"));
-        }
-    }
-
-    #[test]
-    fn serve_needs_a_config_file() {
-        let error = Args::try_parse_from(["tower", "serve"]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     /// The systemd unit in `packaging/systemd/`, as shipped.

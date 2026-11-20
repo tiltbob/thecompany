@@ -342,7 +342,10 @@ name = "chief-cli"
 version = "0.0.0"
 dependencies = [
  "chief",
- "numbers-base",
+ "clap",
+ "numbers-station",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2053,6 +2056,7 @@ dependencies = [
 name = "numbers"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "iroh",
  "iroh-relay",
  "n0-dns-resolver",
