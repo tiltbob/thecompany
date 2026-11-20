@@ -53,8 +53,11 @@ pub struct LinkConfig {
     ///
     /// This may equal or exceed [`Self::send_deadline`], which still bounds a send.
     /// The progress check after writing a message needs a positive interval shorter
-    /// than the remaining send budget. A wait for stream credit also allows time for
-    /// a transport keepalive, and its progress observation can span several sends.
+    /// than the remaining send budget. For stream credit, the progress window is
+    /// `max(connect_timeout, 6 seconds + 2 × RTT)`. Each check uses the selected path's
+    /// round-trip estimate or zero when the estimate is unavailable. A send that first
+    /// observes a stall can close the link only if its remaining budget exceeds that
+    /// window. Otherwise the observation carries over to a later send on the same connection.
     pub connect_timeout: Duration,
     /// Budget for one send, including any dials and retries.
     pub send_deadline: Duration,
@@ -740,17 +743,24 @@ async fn open_chat_stream(
     if !check_progress {
         return open.await;
     }
-    // A blocked noq open queues STREAMS_BLOCKED without waking the driver. A quiet
-    // connection may need the next keepalive and time for the peer's ACK to arrive.
-    let window = config
-        .connect_timeout
-        .max(QUIC_KEEPALIVE + STREAM_CREDIT_MARGIN);
     let check = async {
         loop {
             let remaining = config.send_deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break;
             }
+            // A blocked noq open queues STREAMS_BLOCKED without waking the driver.
+            // A quiet connection may need a keepalive and a round trip for the peer's
+            // ACK, with room for another round trip if a probe needs retransmission.
+            let rtt = connection
+                .paths()
+                .iter()
+                .find(|path| path.is_selected())
+                .and_then(|path| connection.rtt(path.id()))
+                .unwrap_or_default();
+            let keepalive_window =
+                (QUIC_KEEPALIVE + STREAM_CREDIT_MARGIN).saturating_add(rtt.saturating_mul(2));
+            let window = config.connect_timeout.max(keepalive_window);
             let Some(wait) = peer.stream_credit_wait(connection, window)? else {
                 break;
             };
