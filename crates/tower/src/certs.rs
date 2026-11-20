@@ -63,7 +63,7 @@ use zeroize::Zeroizing;
 
 use crate::TowerError;
 
-const LOG_TARGET: &str = "numbers_tower::tls";
+use crate::TLS_LOG_TARGET as LOG_TARGET;
 
 /// The largest certificate or key file the tower reads, in bytes: 64 KiB.
 ///
@@ -165,7 +165,9 @@ impl Failure {
 ///
 /// Before opening, the path must name a regular file. `std::fs::metadata` follows symbolic
 /// links and does not block on a FIFO; anything but a regular file is refused, since opening a
-/// FIFO without a writer, or reading a terminal or a device, can block.
+/// FIFO without a writer, or reading a terminal or a device, can block. The check and the open
+/// are two steps, not one: someone who can replace the file between them can still make the
+/// open block.
 fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, TlsFileProblem> {
     let unreadable = |error: std::io::Error| TlsFileProblem::Unreadable(error.kind());
     if !std::fs::metadata(path).map_err(unreadable)?.is_file() {

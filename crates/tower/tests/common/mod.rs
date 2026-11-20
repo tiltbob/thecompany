@@ -25,7 +25,7 @@ pub const DENY_REASON: &str = "not on this tower's list";
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Under load a home relay may be selected only on the next net report (20-26 s later).
 pub const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long an unlisted endpoint must stay offline, and how soon it must see the denial.
+/// How long an unlisted endpoint must stay offline.
 pub const DENIED_WITHIN: Duration = Duration::from_secs(10);
 
 /// Starts a tower and parses its URL.
@@ -115,6 +115,9 @@ pub async fn online(endpoint: &Endpoint) {
 }
 
 /// Waits until the home relay reports a denial, and returns its reason.
+///
+/// The endpoint first has to choose the tower as its home relay, which under load may happen
+/// only with the next net report, so the wait has the same bound as coming online.
 pub async fn denial(endpoint: &Endpoint) -> String {
     let mut watcher = endpoint.home_relay_status();
     let wait = async {
@@ -131,10 +134,10 @@ pub async fn denial(endpoint: &Endpoint) -> String {
             }
         }
     };
-    match timeout(DENIED_WITHIN, wait).await {
+    match timeout(ONLINE_TIMEOUT, wait).await {
         Ok(reason) => reason,
         Err(_) => panic!(
-            "no denial within 10 s; home relay status: {}",
+            "no denial within 30 s; home relay status: {}",
             status(endpoint)
         ),
     }
