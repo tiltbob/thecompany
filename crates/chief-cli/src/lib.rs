@@ -103,8 +103,8 @@
 //! (each bounded by the transport's call timeout); what the station shows meanwhile is still
 //! printed. The exit is then 0 if the station accepted every line that was sent, and no line was
 //! too long or not UTF-8, and the input did not fail; otherwise 1. Blank lines (of at most 16384
-//! bytes) do not count. The outcome of the last message is
-//! not waited for (it is in `log`); `send` is the command that waits for the outcome.
+//! bytes) do not count. The outcome of the last message is not waited for (it is in `log`);
+//! `send` is the command that waits for the outcome.
 //!
 //! # Output (stable: scripts parse it)
 //!
