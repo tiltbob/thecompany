@@ -399,10 +399,26 @@ impl<T: Transport> Client<T> {
     /// longer [`MessageStatus::Sending`].
     ///
     /// It subscribes before it sends, so the outcome cannot slip past, even when it arrives before
-    /// the answer to the send. On [`Event::Resync`] it re-reads the message with
-    /// [`Client::message`]. If the re-read message has another `id` than the one sent, the station
-    /// restarted and the `seq` names another message: that gives [`ApiError::Disconnected`], as does
-    /// a subscription that ends first. Other errors of the calls are passed through.
+    /// the answer to the send; then it waits with [`Client::wait_for_outcome`], whose docs say
+    /// how. The errors of the subscribe and the send are passed through, and so are those of the
+    /// wait. So an error does not say whether the station accepted the message: a caller that
+    /// must know makes the three steps itself.
+    pub async fn send_and_wait(&self, peer: &str, body: &str) -> Result<Message, ApiError> {
+        let mut events = self.subscribe().await?;
+        let sent = self.send(peer, body).await?;
+        self.wait_for_outcome(&mut events, sent).await
+    }
+
+    /// Waits for the outcome of `sent`, the message the station answered a [`Request::Send`]
+    /// with, on `events`, a subscription opened before that send: returns the message once its
+    /// status is no longer [`MessageStatus::Sending`], and `sent` itself at once if its status
+    /// already is final.
+    ///
+    /// It reads `events` until an [`Event::Message`] with the `seq` of `sent` arrives, and skips
+    /// every other event. On [`Event::Resync`] it re-reads the message with [`Client::message`].
+    /// If the message it got has another `id` than `sent`, the station restarted and the `seq`
+    /// names another message: that gives [`ApiError::Disconnected`], as does a subscription that
+    /// ends first. Errors of the re-read are passed through.
     ///
     /// The outcome's event comes also when the message has left the log meanwhile (rule 7 in
     /// [`crate::api`]), and an outcome that arrives as an event is returned. But every
@@ -410,11 +426,19 @@ impl<T: Transport> Client<T> {
     /// re-read gives [`ApiError::MessageNotFound`], which is returned: whether or not the gap hid
     /// the outcome's event, and also when the outcome has not happened yet.
     ///
-    /// The station's send deadline bounds the wait; a caller that wants a shorter bound wraps the
-    /// call in a timeout.
-    pub async fn send_and_wait(&self, peer: &str, body: &str) -> Result<Message, ApiError> {
-        let mut events = self.subscribe().await?;
-        let sent = self.send(peer, body).await?;
+    /// Under that precondition the station's send deadline bounds the wait: the outcome comes as
+    /// an event, or a `Resync` makes it re-read the message. A caller that wants a shorter bound
+    /// wraps the call in a timeout. Every error here comes after the station accepted the
+    /// message.
+    ///
+    /// If the precondition is broken, with `events` opened after the send, an outcome pushed in
+    /// between is missed, and the wait lasts until the next [`Event::Resync`] or the end of the
+    /// subscription, which may never come: then only the caller's own timeout bounds it.
+    pub async fn wait_for_outcome(
+        &self,
+        events: &mut Subscription,
+        sent: Message,
+    ) -> Result<Message, ApiError> {
         if sent.status != MessageStatus::Sending {
             return Ok(sent);
         }
