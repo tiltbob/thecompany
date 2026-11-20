@@ -498,11 +498,15 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `Error::source`. The ACME client's events are logged under the target `iroh_relay::server` in
   a span named `acme` (`src/server.rs:777-783`): `debug!("acme event: {ok:?}")` for a step
   (tokio-rustls-acme 0.10.0 `EventOk`: `DeployedCachedCert`, `DeployedNewCert`,
-  `CertCacheStore`, `AccountCacheStore`, `src/state.rs:56`) and `error!("error: {err:?}")` for a
-  failure, which carries the domain. After a failure it waits 2^n seconds, n growing to 16
-  (`src/state.rs:424-425`). Its cache writes use `fs::create_dir_all` and `fs::write` with the
-  process's default modes (`src/caches/dir.rs:36-38`), so the tower creates the directory with
-  mode 0700 itself. tracing-subscriber 0.3.23's fmt layer writes to standard output
+  `CertCacheStore`, `AccountCacheStore`, `src/state.rs:56`; no variant has a field) and
+  `error!("error: {err:?}")` for a failure (`EventError`, `src/state.rs:63-78`: `Order`, the four
+  cache errors `CertCacheLoad`, `CertCacheStore`, `AccountCacheLoad`, `AccountCacheStore`,
+  `CachedCertParse`, `NewCertParse`), whose text can carry the domain. Only a failed order sets a
+  wait before the next attempt, 2^n seconds with n growing to 16 (`src/state.rs:417-426`); a
+  cache error is reported once and sets no wait: a failed load is not tried again (`:398`,
+  `:409`) and a failed store is not repeated (`:259`, `:449`). Its cache writes use
+  `fs::create_dir_all` and `fs::write` with the process's default modes
+  (`src/caches/dir.rs:36-38`), so the tower creates the directory with mode 0700 itself. tracing-subscriber 0.3.23's fmt layer writes to standard output
   (`src/fmt/fmt_layer.rs:749`).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
