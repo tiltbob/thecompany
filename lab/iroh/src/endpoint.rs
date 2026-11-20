@@ -8,7 +8,7 @@ use iroh::{Endpoint, NetReportConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
 
 use crate::Res;
 use crate::gate::{Authorizer, Gate, HookLog};
-use crate::lookup::TowerLookup;
+use crate::lookup::{MapLookup, TowerLookup};
 
 /// How the relay map is built (T5/T6 compare the variants).
 #[derive(Debug, Clone)]
@@ -21,6 +21,8 @@ pub enum Relays {
     BareFrom(RelayUrl),
     /// `RelayMap::empty()`: towers come later via `insert_relay`.
     Empty,
+    /// M2: a map shared with the caller (and with `MapLookup` when `lookup` is None).
+    Shared(RelayMap),
 }
 
 impl Relays {
@@ -30,6 +32,7 @@ impl Relays {
             Relays::BareCustom(urls) => RelayMode::custom(urls.iter().cloned()),
             Relays::BareFrom(url) => RelayMode::Custom(RelayMap::from(url.clone())),
             Relays::Empty => RelayMode::Custom(RelayMap::empty()),
+            Relays::Shared(map) => RelayMode::Custom(map.clone()),
         }
     }
     pub fn urls(&self) -> Vec<RelayUrl> {
@@ -38,6 +41,7 @@ impl Relays {
             Relays::BareCustom(urls) => urls.clone(),
             Relays::BareFrom(url) => vec![url.clone()],
             Relays::Empty => Vec::new(),
+            Relays::Shared(map) => map.urls(),
         }
     }
 }
@@ -57,6 +61,10 @@ pub struct EpConfig {
     pub hook_log: Arc<HookLog>,
     pub alpn_aware_gate: bool,
     pub no_hooks: bool,
+    /// M2: roots for the tower's TLS certificate (None = iroh's default, embedded WebPKI roots).
+    pub ca_tls: Option<iroh::tls::CaTlsConfig>,
+    /// M2: iroh's own resolver (None = system DNS without the public fallback).
+    pub dns: Option<DnsResolver>,
 }
 
 impl EpConfig {
@@ -73,6 +81,8 @@ impl EpConfig {
             hook_log: Arc::default(),
             alpn_aware_gate: true,
             no_hooks: false,
+            ca_tls: None,
+            dns: None,
         }
     }
 }
@@ -94,15 +104,23 @@ pub fn dns_resolver() -> DnsResolver {
 }
 
 pub fn builder(cfg: &EpConfig) -> Res<Builder> {
-    let lookup = TowerLookup::new(cfg.lookup.clone().unwrap_or_else(|| cfg.relays.urls()));
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&cfg.secret))
-        .relay_mode(cfg.relays.mode())
-        .address_lookup(lookup)
+        .relay_mode(cfg.relays.mode());
+    builder = match (&cfg.relays, &cfg.lookup) {
+        (Relays::Shared(map), None) => builder.address_lookup(MapLookup::new(map.clone())),
+        _ => builder.address_lookup(TowerLookup::new(
+            cfg.lookup.clone().unwrap_or_else(|| cfg.relays.urls()),
+        )),
+    };
+    builder = builder
         .portmapper_config(PortmapperConfig::Disabled)
         .net_report_config(cfg.net_report.clone())
         .transport_config(transport_config())
-        .dns_resolver(dns_resolver());
+        .dns_resolver(cfg.dns.clone().unwrap_or_else(dns_resolver));
+    if let Some(ca) = &cfg.ca_tls {
+        builder = builder.ca_tls_config(ca.clone());
+    }
     if !cfg.no_hooks {
         builder = builder.hooks(Gate {
             auth: cfg.auth.clone(),

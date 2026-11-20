@@ -12,6 +12,8 @@ use iroh_lab::endpoint::{self, EpConfig};
 use iroh_lab::gate::{self, FilterLog, LINK_ALPN, OTHER_ALPN};
 use iroh_lab::link::Link;
 
+pub mod dns;
+
 pub fn lo0() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }

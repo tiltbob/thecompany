@@ -28,3 +28,28 @@ impl AddressLookup for TowerLookup {
         Some(stream::once(Ok(item)).boxed())
     }
 }
+
+/// M2: answers every id with the URLs of a shared `RelayMap`, so `insert_relay` / `remove_relay`
+/// on the endpoint that was built from the same map show up here (T23 checks it).
+#[derive(Debug, Clone)]
+pub struct MapLookup {
+    map: iroh::RelayMap,
+}
+
+impl MapLookup {
+    pub fn new(map: iroh::RelayMap) -> Self {
+        Self { map }
+    }
+}
+
+impl AddressLookup for MapLookup {
+    fn resolve(&self, id: EndpointId) -> Option<BoxStream<Result<Item, Error>>> {
+        let urls: Vec<RelayUrl> = self.map.urls();
+        if urls.is_empty() {
+            return None;
+        }
+        let data = EndpointData::from_iter(urls.into_iter().map(TransportAddr::Relay));
+        let item = Item::new(EndpointInfo::from_parts(id, data), "map", None);
+        Some(stream::once(Ok(item)).boxed())
+    }
+}

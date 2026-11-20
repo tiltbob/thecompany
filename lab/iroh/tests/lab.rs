@@ -1156,6 +1156,9 @@ async fn t12_peer_killed() -> Res {
                 cb.relay_only = relay_only;
                 let b = node(cb, true).await?;
                 let exe = std::env::current_exe()?;
+                // Lab only (T12): re-runs this test binary as a peer to SIGKILL. The root
+                // clippy.toml forbids Command for the workspace crates (hard rule 1).
+                #[allow(clippy::disallowed_types)]
                 let mut child = std::process::Command::new(exe)
                     .args([
                         "--exact",

@@ -1400,8 +1400,12 @@ version = "0.0.0"
 dependencies = [
  "iroh",
  "iroh-relay",
+ "n0-dns-resolver",
  "n0-error",
  "n0-future",
+ "rcgen",
+ "rustls",
+ "simple-dns",
  "tempfile",
  "tokio",
 ]
