@@ -23,7 +23,8 @@ RestartPreventExitStatus=2 78
 
 # A user allocated at start and released at stop. It also implies a private /tmp,
 # ProtectSystem=strict, ProtectHome=read-only, NoNewPrivileges=yes, RestrictSUIDSGID=yes and
-# RemoveIPC=yes. The lines at the end repeat two of them and make ProtectHome stricter.
+# RemoveIPC=yes (systemd.exec(5) of systemd 255). NoNewPrivileges= and ProtectSystem= below
+# repeat two of them, and ProtectHome= below is stricter than the implied value.
 DynamicUser=yes
 
 # /var/lib/numbers-tower, owned by the dynamic user and writable despite ProtectSystem=strict.
@@ -37,10 +38,79 @@ StateDirectoryMode=0700
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# The sandbox: each line below takes something away from the service. packaging/systemd/README.md
+# says how a refusal shows in the journal and how to take one line out on a host with a drop-in.
+#
+# Repeated from DynamicUser= above, so that they still hold if a drop-in sets DynamicUser=no:
+# the manual implies them only while DynamicUser= is on.
 NoNewPrivileges=yes
 ProtectSystem=strict
+# /home, /root and /run/user are inaccessible and empty, not only read-only.
 ProtectHome=yes
+# Only IPv4, IPv6 and local (AF_UNIX) sockets can be made.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Kernel variables in /proc/sys, /sys and a few other /proc files are read-only for the
+# service. Reading /sys still works; ProcSubset=pid below hides /proc/sys altogether.
+ProtectKernelTunables=yes
+# No loading or unloading of kernel modules, and /usr/lib/modules is inaccessible.
+ProtectKernelModules=yes
+# No reading of or writing to the kernel log buffer (syslog(2), /dev/kmsg, /proc/kmsg). The
+# tower logs to stderr, which this does not touch.
+ProtectKernelLogs=yes
+# The control group tree under /sys/fs/cgroup is read-only for the service.
+ProtectControlGroups=yes
+# No setting of the system clock or the hardware clock. adjtimex(2) and clock_adjtime(2) are
+# refused even for reading; the tower reads the clock with clock_gettime(2).
+ProtectClock=yes
+# The service gets its own copy of the host name and cannot change the host name or the domain
+# name. The tower takes its host name from tower.toml.
+ProtectHostname=yes
+# No creating or entering namespaces (unshare(2), clone(2) and setns(2) with namespace flags).
+# From systemd 251 on, clone3(2) is refused with ENOSYS, and libc falls back to clone(2). Under
+# systemd 250, clone3(2) is not covered. systemd makes the mount and UTS namespaces of the lines
+# above before this applies; the tower's threads need none.
+RestrictNamespaces=yes
+# No realtime scheduling (SCHED_FIFO, SCHED_RR, SCHED_DEADLINE), with which a process can keep
+# the CPUs from the rest of the host. The tower uses the normal policy.
+RestrictRealtime=yes
+# The execution domain of personality(2) cannot be changed.
+LockPersonality=yes
+# A private /dev with only the pseudo devices (null, zero, full, random, urandom, the TTY
+# subsystem). It is read-only except /dev/pts and the host's /dev/shm, /dev/mqueue and
+# /dev/hugepages, which are bound into it where the host has them and stay as writable as there.
+# No device node can be made, no other device can be opened except for reading a real-time clock
+# (ProtectClock= above allows that), and the raw I/O port calls are refused. The tower needs no
+# other device.
+PrivateDevices=yes
+# No memory can be writable and executable at once, and no mapping can be made executable later.
+# The tower generates no code at run time.
+MemoryDenyWriteExecute=yes
+# Only system calls of the architecture systemd was built for. A call through another ABI's entry
+# point (i386 on x86-64) gets SIGSYS, so it cannot get around the filters of this unit.
+SystemCallArchitectures=native
+# Only the system calls of systemd's @system-service set. A call outside it fails with EPERM
+# instead of killing the service. systemd 250 to 254 answer a call newer than themselves with
+# EPERM too, so a newer libc that tries one is not killed, though it may report the error
+# instead of falling back (fallbacks look for ENOSYS, which systemd 255 returns for calls it does
+# not know). The set leaves out the calls that ProtectKernelTunables=, ProtectKernelModules=,
+# ProtectKernelLogs=, ProtectClock=, ProtectHostname= and PrivateDevices= refuse above. Those
+# lines stay: each does more than refuse calls (read-only or hidden paths, a smaller capability
+# bounding set, the device policy, its own host name), and they keep refusing the calls if a
+# drop-in takes this filter out.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The service's /proc shows no process of another user.
+ProtectProc=invisible
+# The service's /proc holds only the process directories: /proc/sys, /proc/net, /proc/meminfo
+# and the other files about the kernel are hidden. The tower reads only /proc/self there
+# (maps, cgroup and mountinfo, seen when it was traced).
+ProcSubset=pid
+# What the service creates is private to its user. The tower makes its ACME cache directory
+# 0700 itself; this makes the key files that the ACME client creates in it 0600 instead of 0644.
+# A file that exists already keeps its mode when it is rewritten, as the ACME client does on a
+# renewal, so a cache written under an earlier unit keeps its 0644 files.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
