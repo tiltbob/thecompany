@@ -19,7 +19,6 @@ doc = false
 [dependencies]
 chief.workspace = true
 clap.workspace = true
-numbers-base.workspace = true
 # `rt` and `io-std` for the binary's runtime and stdin, `io-util` for reading lines, `macros` for
 # `select!` in `chat`; never `process`.
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt"] }

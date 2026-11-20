@@ -7,7 +7,7 @@
 //! is bounded. Ids are placeholders (AGENTS.md, hard rule 9).
 
 use chief::api::*;
-use chief::client::{Client, Subscription, Transport};
+use chief::client::{Client, SUBSCRIPTION_CAPACITY, Subscription, Transport};
 use chief::fake::{FAKE_TOWER_URL, FakeStation, SendOutcome};
 use chief::paths::PathEnv;
 use chief_cli::{
@@ -26,6 +26,11 @@ use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::Notify;
 
 const BOUND: Duration = Duration::from_secs(30);
+
+/// 2023-11-14T22:13:20Z, the fixed clock of the tests that print times.
+const T0: u64 = 1_700_000_000_000;
+/// 2023-11-14T22:13:00Z.
+const MINUTE: u64 = T0 - 20_000;
 
 async fn bounded<F: Future>(test: F) -> F::Output {
     tokio::time::timeout(BOUND, test)
@@ -226,8 +231,9 @@ async fn station_text_cannot_reach_the_terminal_raw() {
     bounded(async {
         let fake = fake_with_peers().await;
         let c = Client::new(fake.clone());
-        // An outgoing body is not stripped by the station: it is what this chief typed. The CLI
-        // still filters it, like everything else it prints.
+        // An outgoing body keeps its control characters in the station: it is what this chief
+        // typed. The CLI still replaces them with spaces, like everything else it prints.
+        fake.set_now_ms(T0);
         let evil = "\x1b[2J\x1b]0;owned\x07hello\nforged 9 line";
         let (exit, _, _) = exec(&c, &["send", "bob", evil]).await;
         assert_eq!(exit, Exit::Done);
@@ -235,7 +241,10 @@ async fn station_text_cannot_reach_the_terminal_raw() {
         assert_eq!(exit, Exit::Done);
         assert_eq!(err, "");
         assert_eq!(out.lines().count(), 1, "{out:?}");
-        assert!(out.ends_with("-> bob (delivered)  [2J ]0;owned hello forged 9 line\n"));
+        assert_eq!(
+            out,
+            "1 2023-11-14T22:13:20Z -> bob (delivered)  [2J ]0;owned hello forged 9 line\n"
+        );
         assert_clean(&out);
 
         fake.set_tower_state(TowerState::Failing {
@@ -515,42 +524,35 @@ async fn log_prints_everything_oldest_first() {
             exec(&c, &["log"]).await,
             (Exit::Done, "no messages\n".to_owned(), String::new())
         );
+        fake.set_now_ms(T0);
         fake.receive("bob", "hello there").unwrap();
+        fake.set_now_ms(T0 + 5_000);
         exec(&c, &["send", "bob", "hi bob"]).await;
         fake.set_outcome(SendOutcome::Fail(FailReason::NoAnswer));
+        fake.set_now_ms(T0 + 60_000);
         exec(&c, &["send", "alice", "hi alice"]).await;
+        fake.set_now_ms(T0 + 3_600_000);
         fake.receive("alice", "late").unwrap();
 
-        let all = fake.messages();
-        let expected: String = all.iter().map(|m| format!("{}\n", line(m))).collect();
-        let (exit, out, err) = exec(&c, &["log"]).await;
-        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
-        assert_eq!(out, expected);
-        let t = |i: usize| format_time(all[i].at_ms);
         assert_eq!(
-            out,
-            format!(
-                "1 {} <- bob hello there\n\
-                 2 {} -> bob (delivered) hi bob\n\
-                 3 {} -> alice (failed: no answer) hi alice\n\
-                 4 {} <- alice late\n",
-                t(0),
-                t(1),
-                t(2),
-                t(3)
+            exec(&c, &["log"]).await,
+            (
+                Exit::Done,
+                "1 2023-11-14T22:13:20Z <- bob hello there\n\
+                 2 2023-11-14T22:13:25Z -> bob (delivered) hi bob\n\
+                 3 2023-11-14T22:14:20Z -> alice (failed: no answer) hi alice\n\
+                 4 2023-11-14T23:13:20Z <- alice late\n"
+                    .to_owned(),
+                String::new()
             )
         );
 
         // A peer filter.
-        let (exit, out, _) = exec(&c, &["log", "bob"]).await;
-        assert_eq!(exit, Exit::Done);
+        let bob = "1 2023-11-14T22:13:20Z <- bob hello there\n\
+                   2 2023-11-14T22:13:25Z -> bob (delivered) hi bob\n";
         assert_eq!(
-            out,
-            format!(
-                "1 {} <- bob hello there\n2 {} -> bob (delivered) hi bob\n",
-                t(0),
-                t(1)
-            )
+            exec(&c, &["log", "bob"]).await,
+            (Exit::Done, bob.to_owned(), String::new())
         );
 
         // An unknown peer is an error; a removed one still has its messages.
@@ -563,8 +565,10 @@ async fn log_prints_everything_oldest_first() {
             )
         );
         exec(&c, &["peer", "rm", "bob"]).await;
-        let (exit, out, _) = exec(&c, &["log", "bob"]).await;
-        assert_eq!((exit, out.lines().count()), (Exit::Done, 2));
+        assert_eq!(
+            exec(&c, &["log", "bob"]).await,
+            (Exit::Done, bob.to_owned(), String::new())
+        );
         // A peer in the book with no messages.
         exec(&c, &["peer", "add", "carol", "STATION-C"]).await;
         assert_eq!(
@@ -635,8 +639,10 @@ async fn chat_backlog_then_live_then_end_of_input() {
     bounded(async {
         let fake = fake_with_peers().await;
         let c = Client::new(fake.clone());
-        for i in 0..60 {
+        // 60 messages, one a second from 22:13:00.
+        for i in 0..60u64 {
             let peer = if i % 2 == 0 { "bob" } else { "alice" };
+            fake.set_now_ms(MINUTE + i * 1000);
             fake.receive(peer, &format!("old {i}")).unwrap();
         }
         let command = parse(&["chat", "bob"]);
@@ -644,37 +650,41 @@ async fn chat_backlog_then_live_then_end_of_input() {
         let drive = async {
             // The backlog: the last 50 messages of every peer, oldest first.
             out.wait_for(|s| s.lines().count() == 50).await;
-            let backlog: String = fake.messages()[10..]
-                .iter()
-                .map(|m| format!("{}\n", line(m)))
+            let backlog: String = (10..60u64)
+                .map(|i| {
+                    let peer = if i % 2 == 0 { "bob" } else { "alice" };
+                    format!("{} 2023-11-14T22:13:{i:02}Z <- {peer} old {i}\n", i + 1)
+                })
                 .collect();
             assert_eq!(out.text(), backlog);
 
             // Live, from another peer too.
-            let live = fake.receive("alice", "live one").unwrap();
-            let expected = format!("{}\n", line(&live));
-            out.wait_for(|s| s.ends_with(&expected)).await;
+            fake.set_now_ms(MINUTE + 60_000);
+            fake.receive("alice", "live one").unwrap();
+            out.wait_for(|s| s.ends_with("61 2023-11-14T22:14:00Z <- alice live one\n"))
+                .await;
 
             // A typed line goes to bob; its outcome comes back as a change.
             fake.set_outcome(SendOutcome::Hold);
+            fake.set_now_ms(MINUTE + 120_000);
             input.write_all(b"hello bob\r\n\n   \n").await.unwrap();
-            out.wait_for(|s| s.contains("-> bob (sending) hello bob\n"))
+            out.wait_for(|s| s.ends_with("62 2023-11-14T22:15:00Z -> bob (sending) hello bob\n"))
                 .await;
-            let sent = fake.messages().last().unwrap().clone();
-            assert_eq!(sent.body, "hello bob");
             fake.resolve(
-                sent.seq,
+                62,
                 MessageStatus::Failed {
                     reason: FailReason::NoAnswer,
                 },
             )
             .unwrap();
-            let change = format!("{} -> bob now (failed: no answer)\n", sent.seq);
-            out.wait_for(|s| s.ends_with(&change)).await;
+            out.wait_for(|s| s.ends_with("62 -> bob now (failed: no answer)\n"))
+                .await;
 
             fake.set_outcome(SendOutcome::Deliver);
+            fake.set_now_ms(MINUTE + 180_000);
             input.write_all(b"second\n").await.unwrap();
-            out.wait_for(|s| s.contains("now (delivered)\n")).await;
+            out.wait_for(|s| s.ends_with("63 -> bob now (delivered)\n"))
+                .await;
             drop(input);
         };
         let (exit, ()) = tokio::join!(session, drive);
@@ -694,10 +704,17 @@ async fn chat_backlog_then_live_then_end_of_input() {
             })
         );
         let text = out.text();
-        let tail: Vec<&str> = text.lines().skip(51).collect();
-        assert_eq!(tail.len(), 4, "{text}");
-        assert!(tail[2].ends_with("-> bob (sending) second"), "{}", tail[2]);
-        assert!(tail[3].ends_with("-> bob now (delivered)"), "{}", tail[3]);
+        let tail: Vec<&str> = text.lines().skip(50).collect();
+        assert_eq!(
+            tail,
+            [
+                "61 2023-11-14T22:14:00Z <- alice live one",
+                "62 2023-11-14T22:15:00Z -> bob (sending) hello bob",
+                "62 -> bob now (failed: no answer)",
+                "63 2023-11-14T22:16:00Z -> bob (sending) second",
+                "63 -> bob now (delivered)",
+            ]
+        );
     })
     .await;
 }
@@ -723,6 +740,81 @@ async fn chat_ends_with_exit_3_when_the_station_stops() {
         assert_eq!(err.text(), "the station stopped; the chat has ended\n");
     })
     .await;
+}
+
+/// How the station goes away under a chat that fell behind.
+#[derive(Clone, Copy, Debug)]
+enum Gone {
+    /// Every call fails with `Stopping`; the subscription stays open.
+    CallsFail,
+    /// The station stops: calls fail and the subscription ends.
+    Stops,
+    /// The station restarts as `INSTANCE-2` and logs a message there.
+    Restarts,
+}
+
+/// Runs a chat until its backlog is shown, stops polling it while more messages arrive than its
+/// subscription holds (so its next read is a `Resync` and a re-read of the log), makes the station
+/// go away as `gone` says, then lets the chat run to its end.
+async fn chat_lags_then(gone: Gone) {
+    let fake = fake_with_peers().await;
+    fake.set_now_ms(T0);
+    fake.receive("bob", "before").unwrap();
+    let c = Client::new(fake.clone());
+    let command = parse(&["chat", "bob"]);
+    let (session, out, err, input) = chat(&c, &command);
+    let mut session = pin!(session);
+    tokio::select! {
+        exit = &mut session => panic!("the chat ended early: {exit:?}"),
+        () = out.wait_for(|s| s.lines().count() == 1) => {}
+    }
+    // The chat is not polled now: these overflow its subscription.
+    for i in 0..=SUBSCRIPTION_CAPACITY {
+        fake.receive("alice", &format!("missed {i}")).unwrap();
+    }
+    let calls_before = fake.requests().len();
+    match gone {
+        Gone::CallsFail => fake.fail_calls(Some(ApiError::Stopping)),
+        Gone::Stops => fake.stop(),
+        Gone::Restarts => {
+            fake.restart("INSTANCE-2");
+            fake.receive("bob", "from the new instance").unwrap();
+        }
+    }
+    let exit = session.await;
+    drop(input);
+    assert_eq!(exit, Exit::NoStation, "{gone:?}");
+    if let Gone::CallsFail = gone {
+        // The chat did try to re-read the log, and that call is what failed.
+        assert!(fake.requests().len() > calls_before);
+    }
+    // Nothing of the gap, nothing of a new instance: only the backlog.
+    assert_eq!(
+        out.text(),
+        "1 2023-11-14T22:13:20Z <- bob before\n",
+        "{gone:?}"
+    );
+    // One plain line, no error repeated.
+    assert_eq!(
+        err.text(),
+        "the station stopped; the chat has ended\n",
+        "{gone:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_ends_when_a_reread_after_a_resync_fails() {
+    bounded(chat_lags_then(Gone::CallsFail)).await;
+}
+
+#[tokio::test]
+async fn chat_ends_when_the_station_stops_during_a_resync() {
+    bounded(chat_lags_then(Gone::Stops)).await;
+}
+
+#[tokio::test]
+async fn chat_ends_when_the_station_restarts_under_it() {
+    bounded(chat_lags_then(Gone::Restarts)).await;
 }
 
 #[tokio::test]
@@ -840,7 +932,7 @@ async fn transport_errors_exit_3() {
                 ApiError::NotRunning {
                     socket: "/run/x.sock".to_owned(),
                 },
-                "no station is running (no socket at /run/x.sock)\n\
+                "no station is running (socket: /run/x.sock)\n\
                  start one with: station run --tower <URL>\n",
             ),
         ];

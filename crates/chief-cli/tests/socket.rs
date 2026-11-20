@@ -10,7 +10,7 @@
 use chief::api::FailReason;
 use chief::client::{Client, SocketTransport};
 use chief::fake::{FakeStation, SendOutcome};
-use chief_cli::{Cli, Command, Exit, format_message, run};
+use chief_cli::{Cli, Command, Exit, run};
 use clap::Parser;
 use numbers_station::ipc::{IpcConfig, IpcServer};
 use std::future::Future;
@@ -94,6 +94,8 @@ async fn id_through_the_socket() {
 async fn send_and_log_through_the_socket() {
     bounded(async {
         let rig = rig().await;
+        // 2023-11-14T22:13:20Z for every message.
+        rig.fake.set_now_ms(1_700_000_000_000);
         assert_eq!(
             exec(&rig.client, &["send", "bob", "on my way"]).await,
             (Exit::Done, "delivered to bob\n".to_owned(), String::new())
@@ -117,19 +119,17 @@ async fn send_and_log_through_the_socket() {
             )
         );
         rig.fake.receive("bob", "see you").unwrap();
-        let expected: String = rig
-            .fake
-            .messages()
-            .iter()
-            .map(|m| format!("{}\n", format_message(m)))
-            .collect();
-        let (exit, out, err) = exec(&rig.client, &["log"]).await;
-        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
-        assert_eq!(out, expected);
-        assert_eq!(out.lines().count(), 3);
-        assert!(out.contains("-> bob (delivered) on my way\n"));
-        assert!(out.contains("-> bob (failed: no answer) are you there\n"));
-        assert!(out.ends_with("<- bob see you\n"));
+        assert_eq!(
+            exec(&rig.client, &["log"]).await,
+            (
+                Exit::Done,
+                "1 2023-11-14T22:13:20Z -> bob (delivered) on my way\n\
+                 2 2023-11-14T22:13:20Z -> bob (failed: no answer) are you there\n\
+                 3 2023-11-14T22:13:20Z <- bob see you\n"
+                    .to_owned(),
+                String::new()
+            )
+        );
         rig.server.shutdown().await;
     })
     .await;
@@ -175,6 +175,7 @@ impl Shared {
 async fn chat_through_the_socket() {
     bounded(async {
         let rig = rig().await;
+        rig.fake.set_now_ms(1_700_000_000_000);
         rig.fake.receive("bob", "earlier").unwrap();
         let command = parse(&["chat", "bob"]);
         let (input, reader) = tokio::io::duplex(1024);
@@ -190,14 +191,17 @@ async fn chat_through_the_socket() {
         );
         let drive = async {
             out.wait_for(|s| s.ends_with("<- bob earlier\n")).await;
-            let live = rig.fake.receive("bob", "live").unwrap();
-            let expected = format!("{}\n", format_message(&live));
-            out.wait_for(|s| s.ends_with(&expected)).await;
+            rig.fake.set_now_ms(1_700_000_001_000);
+            rig.fake.receive("bob", "live").unwrap();
+            out.wait_for(|s| s.ends_with("<- bob live\n")).await;
             drop(input);
         };
         let (exit, ()) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::Done);
-        assert_eq!(out.text().lines().count(), 2);
+        assert_eq!(
+            out.text(),
+            "1 2023-11-14T22:13:20Z <- bob earlier\n2 2023-11-14T22:13:21Z <- bob live\n"
+        );
         assert_eq!(err.text(), "");
 
         // The server going away ends a chat with exit 3.
@@ -239,7 +243,7 @@ const EVERY_COMMAND: [&[&str]; 9] = [
 async fn assert_no_station(path: &Path) {
     let client = Client::new(SocketTransport::new(path));
     let message = format!(
-        "no station is running (no socket at {})\nstart one with: station run --tower <URL>\n",
+        "no station is running (socket: {})\nstart one with: station run --tower <URL>\n",
         path.display()
     );
     for args in EVERY_COMMAND {

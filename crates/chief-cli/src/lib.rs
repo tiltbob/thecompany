@@ -20,12 +20,16 @@
 //!                                  from stdin is sent to <peer>; end of input ends the chat
 //! ```
 //!
+//! End of input ends `chat` at once: the outcome of a message sent just before is not waited for
+//! (it is in `log`); `send` is the command that waits for the outcome.
+//!
 //! # Output (stable: scripts parse it)
 //!
-//! Every line goes through [`say`], which replaces control characters with spaces (hard rule 8):
-//! nothing a peer or a tower wrote can move the cursor, clear the screen or forge a line. Fields
-//! are separated by one space; peer names, station ids, URLs, times and status words contain no
-//! space, so only the last field of a line may.
+//! Every line goes through [`say`], which replaces every control character with a space, as the
+//! station does (rule 9 in `chief::api`, hard rule 8): nothing a peer or a tower wrote can move
+//! the cursor, clear the screen or forge a line. Fields are separated by one space; peer names,
+//! station ids, URLs, times and status words contain no space, so only the last field of a line
+//! may.
 //!
 //! - `id`: the station id, alone on its line.
 //! - A message (`log`, `chat`): `<seq> <time> <arrow> <peer> [(<status>)] <body>`. The time is UTC,
@@ -130,7 +134,10 @@ pub enum Command {
         /// Only the messages exchanged with this peer
         peer: Option<String>,
     },
-    /// Show the last 50 messages, then follow live; each line typed is sent to <PEER>
+    /// Show the last 50 messages, then follow live; each line typed is sent to the peer
+    ///
+    /// End of input (Ctrl-D) ends the chat at once, without waiting for the outcome of a message
+    /// just sent; `chief send` is the command that waits for it.
     Chat {
         /// The peer that typed lines go to (messages of every peer are shown)
         peer: String,
@@ -282,13 +289,14 @@ where
     }
 }
 
-/// Writes `text` and a newline to `w`, with every control character in `text` (as
-/// [`char::is_control`] defines them: newline, tab, escape and the rest) replaced by a space, as
-/// the station does with peer text (rule 9 in `chief::api`).
+/// Writes `text` and a newline to `w`. It replaces every control character in `text` with a
+/// space: every `char` for which [`char::is_control`] is true (C0, DEL and C1, so newline,
+/// carriage return, tab and escape too), the same words and the same rule as rule 9 in
+/// `chief::api` for the station.
 ///
 /// The one way this crate prints anything, so that no text from a station, a peer or a tower
-/// reaches the terminal unfiltered (hard rule 8). The station strips peer text already; a
-/// terminal is the last place to find out it did not.
+/// reaches the terminal unfiltered (hard rule 8). The station replaces control characters in peer
+/// text already; a terminal is the last place to find out it did not.
 pub fn say(w: &mut dyn Write, text: &str) -> io::Result<()> {
     let clean: String = text
         .chars()
@@ -430,7 +438,7 @@ type Outcome = Result<Exit, Stop>;
 fn report(err: &mut dyn Write, error: &ApiError) -> Exit {
     let lines = match error {
         ApiError::NotRunning { socket } => vec![
-            format!("no station is running (no socket at {socket})"),
+            format!("no station is running (socket: {socket})"),
             "start one with: station run --tower <URL>".to_owned(),
         ],
         ApiError::IncompatibleApi { station, client } => vec![format!(

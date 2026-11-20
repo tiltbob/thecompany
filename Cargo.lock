@@ -343,7 +343,6 @@ version = "0.0.0"
 dependencies = [
  "chief",
  "clap",
- "numbers-base",
  "numbers-station",
  "tempfile",
  "tokio",
