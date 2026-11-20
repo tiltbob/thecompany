@@ -26,11 +26,9 @@ impl ProtocolHandler for ObserveAccept {
 #[tokio::test]
 async fn router_ignores_unknown_relayed_peer_before_handshake() {
     timeout(Duration::from_secs(45), async {
-        let tower = Tower::spawn(TowerConfig {
-            bind: (Ipv4Addr::LOCALHOST, 0).into(),
-        })
-        .await
-        .unwrap_or_else(|_| panic!("start loopback tower"));
+        let tower = Tower::spawn(TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into()))
+            .await
+            .unwrap_or_else(|_| panic!("start loopback tower"));
         let config = EndpointConfig {
             towers: TowerSet::from_url(tower.url()).expect("parse loopback tower URL"),
             ip_transport: IpTransport::RelayOnly,

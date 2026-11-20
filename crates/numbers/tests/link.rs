@@ -246,10 +246,7 @@ async fn simultaneous_sends_finish_in_both_directions_over_the_relay() {
     checked(
         timeout(CASE_TIMEOUT, async {
             let tower = checked(
-                Tower::spawn(TowerConfig {
-                    bind: (Ipv4Addr::LOCALHOST, 0).into(),
-                })
-                .await,
+                Tower::spawn(TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into())).await,
                 "start loopback tower",
             );
             let relay_config = EndpointConfig {

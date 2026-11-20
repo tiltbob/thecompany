@@ -182,6 +182,12 @@ impl ReceiptWindow {
         }
     }
 
+    /// Checks for a receipt by peer and message ID, preserving FIFO order.
+    pub fn contains(&self, peer: &str, id: &str) -> bool {
+        let key: ReceiptKey = (peer.into(), id.into());
+        self.seen.contains(&key)
+    }
+
     /// Records an accepted message, returning `true` for a new receipt or `false` for a retry.
     ///
     /// Authorize the peer and validate the message before calling this with its ID and the
@@ -392,7 +398,11 @@ mod tests {
     #[test]
     fn receipts_use_local_peer_name_and_message_id() {
         let mut receipts = ReceiptWindow::new(3);
+        assert!(!receipts.contains("sender", "message"));
         assert!(receipts.record("sender", "message"));
+        assert!(receipts.contains("sender", "message"));
+        assert!(!receipts.contains("other", "message"));
+        assert!(!receipts.contains("sender", "another"));
         // The caller resolves a retry from another station of this peer to the same local name.
         assert!(!receipts.record("sender", "message"));
         assert!(receipts.record("other", "message"));
@@ -410,8 +420,11 @@ mod tests {
         let mut receipts = ReceiptWindow::new(2);
         assert!(receipts.record("sender", "first"));
         assert!(receipts.record("other", "second"));
+        assert!(receipts.contains("sender", "first"));
         assert!(!receipts.record("sender", "first"));
         assert!(receipts.record("other", "third"));
+        assert!(!receipts.contains("sender", "first"));
+        assert!(receipts.contains("other", "second"));
         assert_eq!(receipts.order.len(), 2);
         assert_eq!(receipts.seen.len(), 2);
         assert!(!receipts.record("other", "second"));
