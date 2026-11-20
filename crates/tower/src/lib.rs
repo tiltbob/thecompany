@@ -16,15 +16,31 @@ const CLIENT_RX_BYTES_PER_SECOND: NonZeroU32 =
     NonZeroU32::new(2 * 1024 * 1024).expect("client receive rate is nonzero");
 
 /// Configuration for a plain-HTTP development tower.
+///
+/// Build it with [`TowerConfig::dev`] or [`Default`]. The struct is `#[non_exhaustive]` so that
+/// later fields do not break callers outside this crate.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct TowerConfig {
     /// A loopback socket address. Port zero lets the operating system choose a port.
     pub bind: SocketAddr,
 }
 
+impl TowerConfig {
+    /// The development tower that listens on `bind`.
+    ///
+    /// A dev tower speaks plain HTTP, without TLS. It accepts only a loopback bind address, and
+    /// [`Tower::spawn`] refuses any other. It has no allowlist: any client that can reach the
+    /// port may use the relay.
+    pub fn dev(bind: SocketAddr) -> Self {
+        Self { bind }
+    }
+}
+
 impl Default for TowerConfig {
+    /// The dev tower on [`DEFAULT_BIND`].
     fn default() -> Self {
-        Self { bind: DEFAULT_BIND }
+        Self::dev(DEFAULT_BIND)
     }
 }
 
@@ -75,6 +91,13 @@ impl Tower {
     }
 
     /// Requests graceful shutdown and waits for the relay to stop.
+    ///
+    /// The tower stops accepting connections and shuts the relay server down. It does not
+    /// promise that every client sees the disconnect at once: with iroh-relay 1.5, a client
+    /// that connected within about the last second sometimes still reported itself connected
+    /// for some seconds afterwards (8 of 180 runs), but never when shutdown came at least one
+    /// second later. A test that restarts a tower should therefore check that its clients
+    /// noticed.
     pub async fn shutdown(self) -> Result<(), TowerError> {
         self.server
             .shutdown()
@@ -98,11 +121,9 @@ mod tests {
     #[tokio::test]
     async fn serves_http_on_the_bound_port_and_closes_on_shutdown() {
         timeout(Duration::from_secs(5), async {
-            let tower = Tower::spawn(TowerConfig {
-                bind: (Ipv4Addr::LOCALHOST, 0).into(),
-            })
-            .await
-            .unwrap();
+            let tower = Tower::spawn(TowerConfig::dev((Ipv4Addr::LOCALHOST, 0).into()))
+                .await
+                .unwrap();
             let authority = tower.url().strip_prefix("http://").unwrap();
             let addr: SocketAddr = authority.parse().unwrap();
             assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
@@ -127,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_loopback_addresses() {
         let bind = (Ipv4Addr::UNSPECIFIED, 0).into();
-        let result = Tower::spawn(TowerConfig { bind }).await;
+        let result = Tower::spawn(TowerConfig::dev(bind)).await;
         assert!(matches!(result, Err(TowerError::NonLoopbackBind(addr)) if addr == bind));
     }
 }

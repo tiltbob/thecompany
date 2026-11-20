@@ -52,7 +52,10 @@
 //!    applied before it answered a snapshot call is in that snapshot. Events for changes that the
 //!    snapshot already holds are harmless: rule 2 skips the messages, and the full-state events
 //!    arrive in order, so the state is right again once the client has read the events queued so
-//!    far.
+//!    far. A frontend that must know that its subscription and its snapshots come from one
+//!    instance (rule 1) reads [`Request::Status`] before (a) and again after (b): an instance id
+//!    never comes back, so two equal ids mean that one instance answered everything in between.
+//!    [`crate::client::Client::follow_log`] does this.
 //! 4. **Event order.** One subscription delivers events in the order in which the station applied
 //!    the changes. The station pushes the events of a change before it answers the call that caused
 //!    it. In-process, the event is therefore queued before the answer arrives. Over the socket, calls
@@ -93,7 +96,8 @@
 //!    already in the answer to `Send`.
 //! 8. **Incoming messages.** The station logs a message from a peer as [`Direction::Incoming`] with
 //!    [`MessageStatus::Received`] and rev 0, with [`Message::at_ms`] set to the time it arrived, and
-//!    pushes its event. The station remembers the newest [`RECEIPT_WINDOW`] accepted messages by
+//!    pushes its event. It refuses, and does not log, a message whose id does not have the form of
+//!    [`Message::id`]. The station remembers the newest [`RECEIPT_WINDOW`] accepted messages by
 //!    peer and id, across all peers. A message whose peer and id are among them is acknowledged to
 //!    the sender again, is not logged again and produces no event. Older ones are forgotten, so a
 //!    message resent after that many newer ones is logged as a new message, and a restart forgets
@@ -119,6 +123,12 @@
 //!     then `None`, and `None` on every later call. It never resumes. To go on, the client
 //!     subscribes again, follows rule 3 and compares [`Status::instance_id`] with the one it held
 //!     (rule 1). While the station shuts down, calls fail with [`ApiError::Stopping`].
+//! 12. **A call without an answer.** A call that ends with [`ApiError::Disconnected`] or
+//!     [`ApiError::Timeout`], or whose caller stopped waiting for it, may still have been carried
+//!     out. The station finishes a change it has accepted whether or not anyone still waits for
+//!     the answer, and pushes the change's events as always. A frontend that needs to know reads
+//!     the state again (the log, the peer book) before it repeats a change; a repeated
+//!     [`Request::Send`] is a second message.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -143,6 +153,10 @@ pub const API_VERSION: u32 = 1;
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
 pub const BODY_MAX_BYTES: usize = 16 * 1024;
+
+/// The longest [`Message::id`], in bytes (64). An id is 1 to this many ASCII letters, digits,
+/// underscores or hyphens. Equal to the chat protocol's cap.
+pub const MESSAGE_ID_MAX_BYTES: usize = 64;
 
 /// The longest peer name, in bytes. See [`check_peer_name`].
 pub const PEER_NAME_MAX_BYTES: usize = 32;
@@ -361,6 +375,10 @@ pub struct Message {
     pub rev: u32,
     /// The chat message id both stations share, as text. Opaque to frontends. The sending station
     /// makes it; the receiving station uses it to drop duplicates (rule 8).
+    ///
+    /// Its form: 1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters, digits, underscores (`_`) or hyphens
+    /// (`-`). A station refuses a message from a peer whose id has another form, so a frontend
+    /// never sees one.
     pub id: String,
     /// The peer's name when the message entered the log. It stays when the peer is removed.
     pub peer: String,

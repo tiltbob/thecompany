@@ -17,14 +17,15 @@
 
 use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
-    LOG_PAGE_MAX_MESSAGES, Link, LogPage, Message, MessageStatus, Peer, PeerStation,
-    RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus, check_peer_name,
+    LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
+    PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
+    check_peer_name,
 };
 use crate::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,9 +72,11 @@ pub struct FakeStation {
 struct Inner {
     state: Mutex<State>,
     hook: Mutex<HookSlot>,
-    /// Woken when a subscription is added or a closed one is dropped.
+    /// Woken when a subscription is added, when the number of held subscribes changes, and when
+    /// the station stops or restarts.
     subscribers_changed: Notify,
-    /// Woken when held subscribes may go on.
+    /// Woken when held subscribes may go on or must give up: the hold is released, or the station
+    /// stops or restarts.
     subscribe_gate: Notify,
 }
 
@@ -85,9 +88,13 @@ struct State {
     next_seq: u64,
     next_id: u64,
     outcome: SendOutcome,
-    sinks: Vec<Arc<EventSink>>,
+    /// Owned here only: nothing else holds a sink, so dropping one ends its subscription.
+    sinks: Vec<EventSink>,
     requests: Vec<Request>,
     stopped: bool,
+    /// Grows by 1 on every stop and restart. A `subscribe` belongs to the generation it began in,
+    /// and gives up with [`ApiError::Stopping`] when that one has ended.
+    generation: u64,
     /// Every outgoing message that is still `Sending`, by `seq`, kept apart from the log so that
     /// its outcome is pushed even after the log has evicted it (rule 7).
     pending: BTreeMap<u64, Message>,
@@ -139,6 +146,7 @@ impl FakeStation {
             sinks: Vec::new(),
             requests: Vec::new(),
             stopped: false,
+            generation: 0,
             pending: BTreeMap::new(),
             receipts: VecDeque::new(),
             now_ms: None,
@@ -172,7 +180,20 @@ impl FakeStation {
     }
 
     /// Sets the state of the one tower and pushes [`Event::Status`].
+    ///
+    /// The text in the state (the `error` of [`TowerState::Failing`], the `reason` of
+    /// [`TowerState::Denied`]) came from outside, so every control character in it is replaced with
+    /// a space (rule 9) before it is stored and before the event is pushed.
     pub fn set_tower_state(&self, tower: TowerState) {
+        let tower = match tower {
+            TowerState::Failing { error } => TowerState::Failing {
+                error: scrub(&error),
+            },
+            TowerState::Denied { reason } => TowerState::Denied {
+                reason: scrub(&reason),
+            },
+            other @ (TowerState::Connecting | TowerState::Connected) => other,
+        };
         let mut state = self.state();
         for t in &mut state.status.towers {
             t.state = tower.clone();
@@ -210,59 +231,47 @@ impl FakeStation {
         Ok(whole)
     }
 
-    /// Logs a message from `peer` with a new id (rule 8) and pushes its event. Every control
-    /// character in `body` is replaced with a space (rule 9). Fails with [`ApiError::PeerNotFound`] for a peer not in
-    /// the book, and with [`ApiError::Stopping`] after [`FakeStation::stop`].
+    /// Logs a message from `peer` with a new id (rule 8) and pushes its event, as a station does
+    /// with a message that arrived from a peer's station. Every control character in `body` is
+    /// replaced with a space (rule 9).
+    ///
+    /// It follows the limits a station applies to what arrives, and a refused message changes
+    /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
+    /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
+    /// peer not in the book; [`ApiError::Invalid`] with field `body` for an empty body or one over
+    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). Only a message that
+    /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
+    /// with [`ApiError::Internal`] in the one case where that new id is already in the receipt
+    /// window, which happens only when a test passed an id of the fake's own form to
+    /// [`FakeStation::receive_with_id`].
     pub fn receive(&self, peer: &str, body: &str) -> Result<Message, ApiError> {
-        let id = {
-            let mut state = self.state();
-            state.new_id()
-        };
-        self.receive_with_id(peer, &id, body)?
+        self.state()
+            .receive(peer, None, body)?
             .ok_or_else(|| ApiError::Internal {
                 detail: "a new id was already logged".to_owned(),
             })
     }
 
-    /// Logs a message from `peer` with the chat id `id`, unless the pair is among the newest
-    /// [`RECEIPT_WINDOW`] accepted ones, across all peers: then it logs nothing, pushes nothing,
-    /// leaves the window as it is and returns `None` (rule 8). After that many newer accepted
-    /// messages the pair is forgotten and the id is logged again as a new message. The window does
-    /// not depend on the log's capacity. Errors as [`FakeStation::receive`].
+    /// Logs a message from `peer` with the chat id `id`, as [`FakeStation::receive`] does, unless
+    /// the pair is among the newest [`RECEIPT_WINDOW`] accepted ones, across all peers: then it
+    /// logs nothing, pushes nothing, leaves the window as it is and returns `None` (rule 8). After
+    /// that many newer accepted messages the pair is forgotten and the id is logged again as a new
+    /// message. The window does not depend on the log's capacity.
+    ///
+    /// A refused message changes nothing: no receipt, no log entry, no event, no `seq` used. The
+    /// checks run in this order: [`ApiError::Stopping`] after [`FakeStation::stop`];
+    /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
+    /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
+    /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
+    /// `body` for an empty body or one over [`BODY_MAX_BYTES`] (counted before control characters
+    /// are replaced); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
         id: &str,
         body: &str,
     ) -> Result<Option<Message>, ApiError> {
-        let mut state = self.state();
-        if state.stopped {
-            return Err(ApiError::Stopping);
-        }
-        if !state.peers.contains_key(peer) {
-            return Err(ApiError::PeerNotFound {
-                name: peer.to_owned(),
-            });
-        }
-        // Rule 8: a duplicate inside the window is dropped and does not move the window.
-        if state.receipts.iter().any(|(p, i)| p == peer && i == id) {
-            return Ok(None);
-        }
-        state.receipts.push_back((peer.to_owned(), id.to_owned()));
-        while state.receipts.len() > RECEIPT_WINDOW {
-            state.receipts.pop_front();
-        }
-        let body: String = body
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        Ok(Some(state.append(
-            peer,
-            id.to_owned(),
-            Direction::Incoming,
-            body,
-            MessageStatus::Received,
-        )))
+        self.state().receive(peer, Some(id), body)
     }
 
     /// Gives a held outgoing message its final status (`Delivered` or `Failed`): rev 1 and its
@@ -281,34 +290,47 @@ impl FakeStation {
         self.state().finish(seq, status)
     }
 
-    /// Stops the station: every later call and subscribe fails with [`ApiError::Stopping`], and
-    /// every subscription ends (rule 11).
+    /// Stops the station: every subscription ends (rule 11), and every later call and subscribe
+    /// fails with [`ApiError::Stopping`], at once also while [`FakeStation::hold_subscribes`] is
+    /// on. A subscribe that is waiting at that hold wakes up and fails with
+    /// [`ApiError::Stopping`] too: it belonged to the instance that stopped, and never attaches to
+    /// a later one.
     pub fn stop(&self) {
-        let mut state = self.state();
-        state.stopped = true;
-        state.sinks.clear();
+        {
+            let mut state = self.state();
+            state.stopped = true;
+            state.generation += 1;
+            state.sinks.clear();
+        }
+        self.inner.subscribe_gate.notify_waiters();
         self.inner.subscribers_changed.notify_waiters();
     }
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, and calls are answered again
-    /// after a [`FakeStation::stop`]. The peer book, the send outcome and the other test settings
-    /// stay, as a station's peer book survives a restart.
+    /// link is down, and calls are answered again after a [`FakeStation::stop`]. A subscribe that
+    /// is waiting at [`FakeStation::hold_subscribes`] wakes up and fails with
+    /// [`ApiError::Stopping`]: it belonged to the old instance and never attaches to the new one.
+    /// The peer book, the send outcome and the other test settings, the hold of subscribes
+    /// included, stay, as a station's peer book survives a restart.
     pub fn restart(&self, instance_id: impl Into<String>) {
-        let mut state = self.state();
-        state.status.instance_id = instance_id.into();
-        state.sinks.clear();
-        state.log.clear();
-        state.pending.clear();
-        state.receipts.clear();
-        state.next_seq = 1;
-        state.stopped = false;
-        for stations in state.peers.values_mut() {
-            for station in stations {
-                station.link = Link::Down;
+        {
+            let mut state = self.state();
+            state.status.instance_id = instance_id.into();
+            state.sinks.clear();
+            state.log.clear();
+            state.pending.clear();
+            state.receipts.clear();
+            state.next_seq = 1;
+            state.stopped = false;
+            state.generation += 1;
+            for stations in state.peers.values_mut() {
+                for station in stations {
+                    station.link = Link::Down;
+                }
             }
         }
+        self.inner.subscribe_gate.notify_waiters();
         self.inner.subscribers_changed.notify_waiters();
     }
 
@@ -326,7 +348,8 @@ impl FakeStation {
     }
 
     /// While `true`, `subscribe` does not register its subscription and does not return: it waits
-    /// until this is set to `false` again. A test uses it to see that a transport's `subscribe`
+    /// until this is set to `false` again, or until the station stops or restarts, which makes it
+    /// fail with [`ApiError::Stopping`]. A test uses it to see that a transport's `subscribe`
     /// resolves only after the station registered the subscription (rule 3).
     pub fn hold_subscribes(&self, hold: bool) {
         self.state().hold_subscribes = hold;
@@ -340,7 +363,8 @@ impl FakeStation {
         self.state().held_subscribes
     }
 
-    /// Waits until exactly `n` `subscribe` calls are held. Bound it with a timeout.
+    /// Waits until exactly `n` `subscribe` calls are held. Bound it with a timeout. It holds nothing
+    /// of the station's but a borrow of the fake while it waits.
     pub async fn wait_for_held_subscribes(&self, n: usize) {
         loop {
             let notified = self.inner.subscribers_changed.notified();
@@ -360,37 +384,17 @@ impl FakeStation {
         state.sinks.len()
     }
 
-    /// Waits until exactly `n` subscriptions are alive. Wakes when one is added or dropped, so a
-    /// test can wait for a server to notice a client that went away. Bound it with a timeout.
+    /// Waits until exactly `n` subscriptions are alive, so a test can wait for a server to notice
+    /// a client that went away. Bound it with a timeout.
+    ///
+    /// It polls: it counts, and while the count is not `n` it yields to the runtime once (waking
+    /// itself) and counts again, because a client that drops its [`Subscription`] does not notify
+    /// the fake. Between counts it holds no sink and no future borrowed from one, so a waiting or
+    /// abandoned call never keeps a subscription open after [`FakeStation::stop`],
+    /// [`FakeStation::restart`] or anything else dropped the station's end of it.
     pub async fn wait_for_subscribers(&self, n: usize) {
-        loop {
-            let notified = self.inner.subscribers_changed.notified();
-            let mut notified = pin!(notified);
-            notified.as_mut().enable();
-            let sinks = {
-                let mut state = self.state();
-                state.sinks.retain(|s| !s.is_closed());
-                state.sinks.clone()
-            };
-            if sinks.len() == n {
-                return;
-            }
-            let mut closes: Vec<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = sinks
-                .iter()
-                .map(|s| Box::pin(s.closed()) as Pin<Box<dyn Future<Output = ()> + Send>>)
-                .collect();
-            std::future::poll_fn(|cx| {
-                if notified.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                for close in &mut closes {
-                    if close.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(());
-                    }
-                }
-                Poll::Pending
-            })
-            .await;
+        while self.subscriber_count() != n {
+            yield_once().await;
         }
     }
 
@@ -509,28 +513,44 @@ impl Transport for FakeStation {
     }
 
     async fn subscribe(&self) -> Result<Subscription, ApiError> {
+        // The subscribe belongs to the instance it began in: it fails once that one has stopped
+        // or restarted, also while it waits at the hold.
+        let generation = {
+            let state = self.state();
+            if state.stopped {
+                return Err(ApiError::Stopping);
+            }
+            state.generation
+        };
         let mut held: Option<HeldSubscribe<'_>> = None;
         loop {
+            // Registered before the look, so a release, stop or restart after it still wakes us.
             let gate = self.inner.subscribe_gate.notified();
             let mut gate = pin!(gate);
             gate.as_mut().enable();
-            if !self.state().hold_subscribes {
-                break;
+            let registered = {
+                let mut state = self.state();
+                if state.stopped || state.generation != generation {
+                    Some(Err(ApiError::Stopping))
+                } else if state.hold_subscribes {
+                    None
+                } else {
+                    let (sink, events) = subscription(SUBSCRIPTION_CAPACITY);
+                    state.sinks.push(sink);
+                    Some(Ok(events))
+                }
+            };
+            if let Some(result) = registered {
+                // Dropped with the state unlocked: it locks the state to count itself out.
+                drop(held);
+                self.inner.subscribers_changed.notify_waiters();
+                return result;
             }
             if held.is_none() {
                 held = Some(HeldSubscribe::new(self));
             }
             gate.await;
         }
-        drop(held);
-        let mut state = self.state();
-        if state.stopped {
-            return Err(ApiError::Stopping);
-        }
-        let (sink, events) = subscription(SUBSCRIPTION_CAPACITY);
-        state.sinks.push(Arc::new(sink));
-        self.inner.subscribers_changed.notify_waiters();
-        Ok(events)
     }
 }
 
@@ -554,6 +574,58 @@ impl Drop for HeldSubscribe<'_> {
 }
 
 impl State {
+    /// [`FakeStation::receive`] (`id` is `None`) and [`FakeStation::receive_with_id`]: the checks
+    /// in their order, then the receipt window, then the log.
+    fn receive(
+        &mut self,
+        peer: &str,
+        id: Option<&str>,
+        body: &str,
+    ) -> Result<Option<Message>, ApiError> {
+        if self.stopped {
+            return Err(ApiError::Stopping);
+        }
+        if !self.peers.contains_key(peer) {
+            return Err(ApiError::PeerNotFound {
+                name: peer.to_owned(),
+            });
+        }
+        if id.is_some_and(|id| !is_message_id(id)) {
+            return Err(invalid(
+                "id",
+                &format!("must be 1 to {MESSAGE_ID_MAX_BYTES} ASCII letters, digits, '_' or '-'"),
+            ));
+        }
+        if body.is_empty() {
+            return Err(invalid("body", "must not be empty"));
+        }
+        if body.len() > BODY_MAX_BYTES {
+            return Err(invalid(
+                "body",
+                &format!("must be at most {BODY_MAX_BYTES} bytes"),
+            ));
+        }
+        let id = match id {
+            Some(id) => id.to_owned(),
+            None => self.new_id(),
+        };
+        // Rule 8: a duplicate inside the window is dropped and does not move the window.
+        if self.receipts.iter().any(|(p, i)| p == peer && *i == id) {
+            return Ok(None);
+        }
+        self.receipts.push_back((peer.to_owned(), id.clone()));
+        while self.receipts.len() > RECEIPT_WINDOW {
+            self.receipts.pop_front();
+        }
+        Ok(Some(self.append(
+            peer,
+            id,
+            Direction::Incoming,
+            scrub(body),
+            MessageStatus::Received,
+        )))
+    }
+
     fn new_id(&mut self) -> String {
         let id = format!("FAKE-MSG-{}", self.next_id);
         self.next_id += 1;
@@ -751,6 +823,36 @@ fn page(log: &VecDeque<Message>, peer: Option<&str>, before: Option<u64>, limit:
         messages,
         next_before,
     }
+}
+
+/// Whether `id` has the form of [`Message::id`]: 1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
+/// digits, `_` or `-`.
+fn is_message_id(id: &str) -> bool {
+    (1..=MESSAGE_ID_MAX_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Rule 9: every control character replaced with a space.
+fn scrub(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Wakes its own task once and returns `Pending`, then is ready: one turn back to the runtime.
+fn yield_once() -> impl Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
 }
 
 fn invalid(field: &str, reason: &str) -> ApiError {

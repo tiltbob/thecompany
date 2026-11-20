@@ -43,7 +43,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|_| io::Error::other("failed to install the rustls ring provider"))?;
 
     let shutdown_signal = shutdown_signal()?;
-    let tower = Tower::spawn(TowerConfig { bind: args.bind }).await?;
+    let tower = Tower::spawn(TowerConfig::dev(args.bind)).await?;
     tracing::info!(target: LOG_TARGET, url = tower.url(), "dev tower listening");
     let signal_result = shutdown_signal.await;
     tower.shutdown().await?;

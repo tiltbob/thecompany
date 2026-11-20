@@ -913,3 +913,268 @@ async fn removing_a_peer_fails_its_evicted_pending_send_with_one_event() {
     );
     assert!(fake.messages().iter().all(|m| m.seq != held.seq));
 }
+
+// Subscribes and stopping (finding 5 of the review of #95).
+
+const BOUND: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn a_held_subscribe_fails_with_stopping_when_the_station_stops() {
+    let fake = station();
+    fake.hold_subscribes(true);
+    let c = client(&fake);
+    let mut subscribe = pin!(c.subscribe());
+    assert!(poll_once(subscribe.as_mut()).is_none());
+    assert_eq!(fake.held_subscribes(), 1);
+    fake.stop();
+    let result = tokio::time::timeout(BOUND, subscribe).await.unwrap();
+    assert_eq!(result.unwrap_err(), ApiError::Stopping);
+    assert_eq!(fake.held_subscribes(), 0);
+    tokio::time::timeout(BOUND, fake.wait_for_held_subscribes(0))
+        .await
+        .unwrap();
+    assert_eq!(fake.subscriber_count(), 0);
+}
+
+#[tokio::test]
+async fn a_held_subscribe_fails_with_stopping_on_restart_and_never_joins_the_new_instance() {
+    let (fake, c) = with_peers().await;
+    fake.hold_subscribes(true);
+    let mut subscribe = pin!(c.subscribe());
+    assert!(poll_once(subscribe.as_mut()).is_none());
+    assert_eq!(fake.held_subscribes(), 1);
+    fake.receive("bob", "old instance").unwrap();
+    fake.restart("INSTANCE-2");
+    let result = tokio::time::timeout(BOUND, subscribe).await.unwrap();
+    assert_eq!(result.unwrap_err(), ApiError::Stopping);
+    assert_eq!(fake.held_subscribes(), 0);
+    tokio::time::timeout(BOUND, fake.wait_for_held_subscribes(0))
+        .await
+        .unwrap();
+    assert_eq!(fake.subscriber_count(), 0);
+    // With the hold released, a new subscribe works and sees the new instance only.
+    fake.hold_subscribes(false);
+    let mut events = tokio::time::timeout(BOUND, c.subscribe())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fake.subscriber_count(), 1);
+    let got = fake.receive("bob", "new instance").unwrap();
+    assert_eq!(got.seq, 1);
+    assert_eq!(queued(&mut events), vec![Event::Message { message: got }]);
+}
+
+#[tokio::test]
+async fn a_subscribe_after_stop_fails_at_once_also_while_held() {
+    let fake = station();
+    fake.hold_subscribes(true);
+    fake.stop();
+    let c = client(&fake);
+    assert_eq!(
+        poll_once(c.subscribe()).map(|r| r.unwrap_err()),
+        Some(ApiError::Stopping)
+    );
+    assert_eq!(fake.held_subscribes(), 0);
+}
+
+/// Polls a `wait_for_subscribers` future once, leaves it alone, and checks that `end` still ends
+/// the subscription it could have held.
+async fn an_abandoned_wait_holds_no_subscription(end: impl FnOnce(&FakeStation)) {
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let mut waiting = pin!(fake.wait_for_subscribers(5));
+    assert!(poll_once(waiting.as_mut()).is_none());
+    end(&fake);
+    assert_eq!(
+        tokio::time::timeout(BOUND, events.next()).await.unwrap(),
+        None
+    );
+    // The waiting future is still alive here, and still not done.
+    assert!(poll_once(waiting.as_mut()).is_none());
+}
+
+#[tokio::test]
+async fn a_waiting_wait_for_subscribers_does_not_keep_a_subscription_open_after_stop() {
+    an_abandoned_wait_holds_no_subscription(|fake| fake.stop()).await;
+}
+
+#[tokio::test]
+async fn a_waiting_wait_for_subscribers_does_not_keep_a_subscription_open_after_restart() {
+    an_abandoned_wait_holds_no_subscription(|fake| fake.restart("INSTANCE-2")).await;
+}
+
+#[tokio::test]
+async fn wait_for_subscribers_notices_a_client_that_dropped_its_subscription() {
+    let fake = station();
+    let c = client(&fake);
+    let first = c.subscribe().await.unwrap();
+    let second = c.subscribe().await.unwrap();
+    let waiting = fake.clone();
+    let waiter = tokio::spawn(async move { waiting.wait_for_subscribers(1).await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    // Nothing tells the fake: the waiter has to notice by itself.
+    drop(second);
+    tokio::time::timeout(BOUND, waiter).await.unwrap().unwrap();
+    assert_eq!(fake.subscriber_count(), 1);
+    drop(first);
+}
+
+// Fixtures follow the contract (finding 7 of the review of #95).
+
+#[tokio::test]
+async fn tower_text_is_normalised_in_status_and_its_event() {
+    let fake = station();
+    let c = client(&fake);
+    let mut events = c.subscribe().await.unwrap();
+    fake.set_tower_state(TowerState::Failing {
+        error: "no\nroute\u{1b}[31m\t\u{85}!".into(),
+    });
+    let expected = TowerState::Failing {
+        error: "no route [31m  !".into(),
+    };
+    let status = c.status().await.unwrap();
+    assert_eq!(status.towers[0].state, expected);
+    assert_eq!(fake.status(), status);
+    fake.set_tower_state(TowerState::Denied {
+        reason: "not\r\nallowed\u{7f}".into(),
+    });
+    let denied = c.status().await.unwrap();
+    assert_eq!(
+        denied.towers[0].state,
+        TowerState::Denied {
+            reason: "not  allowed ".into()
+        }
+    );
+    assert_eq!(
+        queued(&mut events),
+        vec![Event::Status { status }, Event::Status { status: denied }]
+    );
+}
+
+#[tokio::test]
+async fn invalid_incoming_fixtures_are_refused_and_change_nothing() {
+    let (fake, c) = with_peers().await;
+    let mut events = c.subscribe().await.unwrap();
+    let first = fake.receive("bob", "first").unwrap();
+    assert_eq!(queued(&mut events).len(), 1);
+    let too_long = "x".repeat(BODY_MAX_BYTES + 1);
+    let id_too_long = "a".repeat(MESSAGE_ID_MAX_BYTES + 1);
+    let cases: [(&str, &str, &str); 9] = [
+        ("ID-X", &too_long, "body"),
+        ("ID-X", "", "body"),
+        ("", "hi", "id"),
+        ("ID\u{7}X", "hi", "id"),
+        ("ID-X\n", "hi", "id"),
+        (&id_too_long, "hi", "id"),
+        ("ID X", "hi", "id"),
+        ("ID.X", "hi", "id"),
+        ("ID-\u{e9}", "hi", "id"),
+    ];
+    for (id, body, field) in cases {
+        let err = fake.receive_with_id("bob", id, body).unwrap_err();
+        assert_eq!(invalid_field(err), field, "id {id:?}");
+    }
+    assert_eq!(invalid_field(fake.receive("bob", "").unwrap_err()), "body");
+    assert_eq!(
+        invalid_field(fake.receive("bob", &too_long).unwrap_err()),
+        "body"
+    );
+    // Nothing changed: the log, the events, the receipt window and the next seq.
+    assert_eq!(fake.messages(), vec![first]);
+    assert!(queued(&mut events).is_empty());
+    let accepted = fake
+        .receive_with_id("bob", "ID-X", "now valid")
+        .unwrap()
+        .unwrap();
+    assert_eq!((accepted.seq, accepted.id.as_str()), (2, "ID-X"));
+    assert_eq!(queued(&mut events).len(), 1);
+}
+
+#[tokio::test]
+async fn incoming_ids_of_the_api_form_are_accepted() {
+    let (fake, _c) = with_peers().await;
+    let longest = format!("{}_-x9", "Az9".repeat((MESSAGE_ID_MAX_BYTES - 4) / 3));
+    assert_eq!(longest.len(), MESSAGE_ID_MAX_BYTES);
+    for id in [longest.as_str(), "a", "0", "_", "-", "ID_x-9"] {
+        let got = fake.receive_with_id("bob", id, "hi").unwrap().unwrap();
+        assert_eq!(got.id, id);
+    }
+    // The ids the fake makes itself have the form too.
+    let made = fake.receive("bob", "hi").unwrap();
+    assert!(made.id.len() <= MESSAGE_ID_MAX_BYTES);
+    assert!(
+        made.id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    );
+}
+
+#[tokio::test]
+async fn incoming_fixture_checks_run_in_order() {
+    let (fake, _c) = with_peers().await;
+    fake.receive_with_id("bob", "DUP", "x").unwrap().unwrap();
+    // Each case fails every later check too; the first one decides.
+    assert_eq!(
+        fake.receive_with_id("carol", "", "").unwrap_err(),
+        ApiError::PeerNotFound {
+            name: "carol".into()
+        }
+    );
+    assert_eq!(
+        invalid_field(fake.receive_with_id("bob", "", "").unwrap_err()),
+        "id"
+    );
+    assert_eq!(
+        invalid_field(fake.receive_with_id("bob", "DUP", "").unwrap_err()),
+        "body"
+    );
+    assert_eq!(fake.receive_with_id("bob", "DUP", "x").unwrap(), None);
+    fake.stop();
+    assert_eq!(
+        fake.receive_with_id("carol", "", "").unwrap_err(),
+        ApiError::Stopping
+    );
+    assert_eq!(fake.receive("carol", "").unwrap_err(), ApiError::Stopping);
+}
+
+/// Rule 6 holds for everything the fixture API can put into the log: the largest body and the
+/// longest id it accepts still fit a page.
+#[tokio::test]
+async fn the_largest_incoming_messages_the_fixtures_accept_fit_a_page() {
+    let (fake, c) = with_peers().await;
+    // One byte over is refused, so nothing larger can enter the log.
+    assert_eq!(
+        invalid_field(
+            fake.receive("bob", &"\"".repeat(BODY_MAX_BYTES + 1))
+                .unwrap_err()
+        ),
+        "body"
+    );
+    // The largest JSON per body byte: '"' and '\' are escaped to two bytes; control characters,
+    // which JSON escapes to six, are replaced with spaces first (rule 9).
+    let quotes = "\"".repeat(BODY_MAX_BYTES);
+    let backslashes = "\\".repeat(BODY_MAX_BYTES);
+    // The longest id: MESSAGE_ID_MAX_BYTES bytes, none of which JSON escapes.
+    for i in 0..40 {
+        let body = if i % 2 == 0 { &quotes } else { &backslashes };
+        let id = format!("{i:0>width$}", width = MESSAGE_ID_MAX_BYTES);
+        assert_eq!(id.len(), MESSAGE_ID_MAX_BYTES);
+        fake.receive_with_id("bob", &id, body).unwrap().unwrap();
+    }
+    let size = |m: &Message| serde_json::to_vec(m).unwrap().len();
+    let mut before = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = c.log(None, before, u32::MAX).await.unwrap();
+        assert!(!page.messages.is_empty());
+        let total: usize = page.messages.iter().map(size).sum();
+        assert!(total <= LOG_PAGE_MAX_BYTES, "{total} bytes");
+        seen.splice(0..0, seqs(&page));
+        before = page.next_before;
+        if before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, (1..=40).collect::<Vec<_>>());
+}
