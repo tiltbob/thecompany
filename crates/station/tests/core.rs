@@ -528,6 +528,55 @@ async fn zero_timeouts_are_refused_without_locking_the_data_directory() {
     .await;
 }
 
+#[tokio::test]
+async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let Network { scratch, tower } = Network::start().await;
+            let (station, client) = start(config(
+                &scratch.path().join("station"),
+                tower.url(),
+                IpTransport::RelayOnly,
+            ))
+            .await;
+            wait_online(&client).await;
+            let mut events = subscribe(&client).await;
+            checked(tower.shutdown().await, "shut down loopback tower");
+            within(
+                ONLINE_TIMEOUT,
+                async {
+                    // Reports queued before the shutdown can still say Connected. Between retries
+                    // iroh publishes Connecting, so the state may move between Connecting and
+                    // Failing; it must not say Connected again while the tower stays down.
+                    let mut down = false;
+                    loop {
+                        let Event::Status { status } = next_event(&mut events).await else {
+                            continue;
+                        };
+                        let state = &status.towers[0].state;
+                        if *state == TowerState::Connected {
+                            assert!(!down, "a tower that is down was reported connected");
+                            continue;
+                        }
+                        down = true;
+                        if matches!(state, TowerState::Failing { .. }) {
+                            return;
+                        }
+                    }
+                },
+                "station reports the tower down, then failing",
+            )
+            .await;
+            let status = checked(client.status().await, "read station status");
+            assert!(status.towers[0].state != TowerState::Connected);
+            stop(station).await;
+        },
+        "tower failure test timed out",
+    )
+    .await;
+}
+
 struct WirePeer {
     id: NodeId,
     link: Link,
