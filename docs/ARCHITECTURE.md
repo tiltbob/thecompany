@@ -38,8 +38,8 @@ against the published sources of iroh 1.5.0, Claude Code 2.1.328 and Codex 0.170
 reviewer trying to refute each finding. The chief/station identity model and the first slice had one
 further review after the rewrite, without the refutation pass. Airspace's transfer and git parts
 were researched against current sources; its encryption format, naming rules and garbage collection
-have **not** had that scrutiny yet and get a design pass at the start of M4. Nothing has been
-compiled.
+have **not** had that scrutiny yet and get a design pass at the start of M4. The M0 `numbers`
+dependency set builds, and loopback tests exercise the M1 dev tower.
 
 ## Architecture
 
@@ -385,8 +385,9 @@ depends on `chief` for the API types, never the reverse.
 
 ## Appendix: verified facts the first milestones rely on
 
-Read from published sources, not compiled, except the dependency line, which CI builds
-(`cargo check -p numbers`).
+These notes draw on published sources. CI checks the M0 `numbers` dependency set with
+`cargo check -p numbers --locked` and tests the M1 [dev tower](../crates/tower/src/lib.rs) over
+loopback. The remaining iroh examples are source references.
 
 - **Dependencies.** `iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }`
   (MSRV 1.91); `iroh-relay` likewise, plus `server` in `tower` only; direct `n0-future 0.3` and

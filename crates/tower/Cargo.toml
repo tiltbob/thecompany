@@ -10,5 +10,17 @@ name = "tower"
 path = "src/main.rs"
 doc = false
 
+[dependencies]
+clap.workspace = true
+iroh-relay = { workspace = true, features = ["server"] }
+rustls.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+
 [lints]
 workspace = true
