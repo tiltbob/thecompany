@@ -293,6 +293,21 @@ up to 16 concurrent incoming streams per link and applies `send_deadline` to eac
 including waiting for the actor's reply. It refuses unauthorized chat on an established link by
 resetting the stream with code `403`. A full or closed chat mailbox returns `unavailable`.
 
+An opt-in M2 link opens one `{"proto":"towers","v":1}` stream in each direction per admitted
+transport. It sends the HTTPS projection captured at admission in a `towers` array of `{url,
+qad_port}` entries. The whole list contains at most eight distinct canonical HTTPS root URLs.
+A missing or null QAD port means off. An invalid list is rejected whole. This stream needs its own
+authorization after the link hello. Replacement starts a new attempt even if the path is the same.
+An attempt ends on a reply, connection closure or deadline, and sends never retry or dial.
+
+Tower receives share the 16-stream limit and deadline. One tower stream per transport can read a
+body or wait for mailbox space or the actor. A further recognized tower stream receives
+`unavailable`. Slow headers and flow-controlled replies still use slots within the shared limit
+and deadline. The separate mailbox holds up to 32 snapshots. ACK follows the station's
+whole-snapshot commit while the exact admitted connection and peer remain current. A queued
+snapshot can still commit after its sender's deadline if that lease remains current. The native
+link treats received URLs as data.
+
 ### Stations and the chief's frontends
 
 The station is the node; frontends hold no network state.
