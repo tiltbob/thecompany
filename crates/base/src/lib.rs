@@ -9,7 +9,9 @@ pub mod frame;
 #[cfg(unix)]
 pub mod keyfile;
 
-pub use frame::{FrameError, LOCAL_FRAME_MAX, WIRE_FRAME_MAX, read_frame, write_frame};
+pub use frame::{
+    FrameError, LOCAL_FRAME_MAX, WIRE_FRAME_MAX, encode_frame, read_frame, write_frame,
+};
 #[cfg(unix)]
 pub use keyfile::{
     KeyOrigin, PrivatePathError, StoredKey, check_private_dir, create_key_file, ensure_private_dir,

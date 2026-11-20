@@ -993,3 +993,34 @@ async fn a_client_is_cheap_to_share_over_an_arc() {
     assert_eq!(clone.peer_remove("bob").await, Ok(()));
     fake.assert_script_done();
 }
+
+#[tokio::test]
+async fn send_and_wait_returns_the_outcome_of_a_message_evicted_before_it() {
+    // A station that keeps 1 message: the sent one leaves the log before its outcome, and no
+    // Resync happens. The outcome's event must still come (rule 7).
+    let station = chief::fake::FakeStation::new("STATION-A", "INSTANCE-1").with_log_capacity(1);
+    let client = Client::new(station.clone());
+    client.peer_add("bob", "STATION-B").await.unwrap();
+    station.set_outcome(chief::fake::SendOutcome::Hold);
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+    let mut sent_tx = Some(sent_tx);
+    station.on_call(move |_, request| {
+        if matches!(request, Request::Send { .. })
+            && let Some(tx) = sent_tx.take()
+        {
+            let _ = tx.send(());
+        }
+    });
+    let waiting = tokio::spawn(async move { client.send_and_wait("bob", "on my way").await });
+    // The test runs on one thread: once the hook has fired, the send has been handled and the
+    // waiting task is parked on its subscription.
+    sent_rx.await.unwrap();
+    station.receive("bob", "newer").unwrap();
+    assert!(station.messages().iter().all(|m| m.seq != 1));
+    let delivered = station.resolve(1, MessageStatus::Delivered).unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("send_and_wait did not see the outcome of an evicted message")
+        .unwrap();
+    assert_eq!(outcome, Ok(delivered));
+}

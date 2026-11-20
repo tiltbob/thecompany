@@ -92,16 +92,22 @@ How two agents share the work is in [AGENTS.md](../AGENTS.md).
 | `crates/numbers/src/link.rs` | ALPN `numbers/0`; a hello frame each way (`v`, with `network` and `head` empty until M3); one link per peer — either side opens streams on it, and if both dialed, the one dialed by the lower node id is kept; `StreamHeader {proto, v}`; stream dispatch; timeouts from config |
 | `crates/numbers/src/proto/chat.rs` | `ChatMessage {id, sent_at_ms, body}` answered by `Ack` / `Nack`; one stream per message; 16 KiB body cap; the receiver dedupes on (peer, id); the sender's id and time are untrusted |
 | `crates/chief/src/api.rs` | the station API: `Request`, `Response`, `Event`, `ApiError`, `Status`, `Peer {name, stations: [{station_id, link}]}`, `Message {seq, rev, id, peer, direction, body, at_ms, status}`; FFI-exportable types only |
-| `crates/chief/src/client.rs` | `Transport` (methods return `impl Future + Send`; static dispatch), `SocketTransport`, `Client` with typed methods, a concrete `Subscription` whose `next()` is cancel-safe |
+| `crates/chief/src/client.rs` | `Transport` (methods return `impl Future + Send`; static dispatch), `Client` with typed methods, a concrete `Subscription` whose `next()` is cancel-safe; re-exports `SocketTransport` |
+| `crates/chief/src/socket.rs` | the local socket's envelope (`Hello`, `HelloReply`, `Open`, `Reply`; not part of the station API) and `SocketTransport`: one connection per call or subscription, the server's uid checked, a call timeout |
+| `crates/chief/src/paths.rs` | the default data dir and the socket path as pure functions of `XDG_DATA_HOME`, `XDG_RUNTIME_DIR` and `HOME`; the socket-path length check |
+| `crates/chief/src/follow.rs` | `Client::follow_log`: the attach order (subscribe, page the log, drop live events already seen), re-reading after `Resync`, ending with the subscription or the station instance |
+| `crates/chief/src/fake.rs` | `FakeStation` (feature `fake`, tests only): an in-memory station that follows the API rules, for tests of transports, the socket server and frontends |
 | `crates/station/src/lib.rs` | `Station::start(StationConfig)`: one actor owning the endpoint, the peer book (`peers.json`, written only by the actor) and a ring of the newest 1,000 messages; data-dir lock; never awaits the network at start; live events with `Resync` on lag; message outcome kept as state; strips control characters from peer text; usable in-process as a `Transport` |
-| `crates/station/src/ipc.rs` | the socket server (rules below); hello `{api: 1}` answered with the station's API version, the station id and a per-start instance id; one connection per call or subscription; read deadlines on calls, never on an open subscription |
+| `crates/station/src/ipc.rs` | the socket server (rules below), generic over any `Transport`; hello `{api: 1}` always answered with the station's API version, the station id and a per-start instance id, also on a version mismatch, and then the connection is closed; one connection per call or subscription; frames capped at 1 MiB both ways; both ends check the uid; a deadline on every frame of a call, never on an open subscription; an exclusive lock on `<socket>.lock` while it serves |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] --tower URL`: foreground daemon, creates its key on first run, graceful shutdown |
 | `crates/chief-cli/src/main.rs` | `chief` (clap): `status`, `id`, `peer add\|ls\|rm`, `chat`, `send`, `log` |
 
 **Local socket.** The data dir defaults to `$XDG_DATA_HOME/thecompany/station`. The socket path is a
 function of the data dir: `$XDG_RUNTIME_DIR/thecompany/station.sock` for the default data dir when
 that variable is set, otherwise `<data-dir>/station.sock`; `chief --station PATH` overrides. The
-station takes the data-dir lock first and only then removes a leftover socket, binds and sets 0600.
+station takes the data-dir lock first; the socket server then locks `<socket>.lock`, so that a socket
+another station is serving (two data dirs can name the same socket path) is never taken away, and
+only then removes a leftover socket, binds and sets 0600.
 The directory is created 0700, and an existing one must be owned by the same user with no group or
 other access. A path too long for a socket address is refused with a message naming `--data-dir`.
 The peer uid comes from `tokio::net::UnixStream::peer_cred()`.

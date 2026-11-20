@@ -516,8 +516,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `is_relay()`, `is_ip()`, `is_selected()`. On one host a connection starts on the relay and selects
   the direct path 33–47 ms after `connect()` starts.
 - **Local socket and tooling.** `tokio::net::UnixStream::peer_cred()` gives the peer uid (the std
-  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket path is limited to
-  108 bytes on Linux, 104 on Apple. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
+  equivalent is unstable); `rustix` supplies `geteuid` without `unsafe`. A socket address holds
+  108 bytes on Linux and 104 on Apple, including the terminating NUL, so a socket path can have 107
+  or 103 bytes. `std::fs::File::try_lock` is stable since 1.89. UniFFI has no
   stream type and does not propagate cancellation, hence the pull-style `Subscription::next()`.
 - **Bootstrap (M2).** The record is SRV (decision 13, settled in #38); it was measured against a
   DNS server on 127.0.0.1. `n0_dns_resolver::DnsResolver::lookup_srv(name)` returns
