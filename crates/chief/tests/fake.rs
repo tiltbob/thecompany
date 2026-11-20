@@ -561,6 +561,43 @@ async fn wait_for_subscribers_wakes_on_subscribe_and_on_drop() {
 // Inspection.
 
 #[tokio::test]
+async fn a_hook_that_removes_or_replaces_itself_does_not_run_again() {
+    let (fake, c) = with_peers().await;
+    // Removing itself: one call only.
+    let runs = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&runs);
+    fake.on_call(move |fake, _| {
+        *count.lock().unwrap() += 1;
+        fake.clear_on_call();
+    });
+    c.status().await.unwrap();
+    c.status().await.unwrap();
+    assert_eq!(*runs.lock().unwrap(), 1);
+
+    // Replacing itself: the new hook runs from the next call on, the old one never again.
+    let first = Arc::new(Mutex::new(0));
+    let second = Arc::new(Mutex::new(0));
+    let (in_first, in_second) = (Arc::clone(&first), Arc::clone(&second));
+    fake.on_call(move |fake, _| {
+        *in_first.lock().unwrap() += 1;
+        let in_second = Arc::clone(&in_second);
+        fake.on_call(move |_, _| *in_second.lock().unwrap() += 1);
+    });
+    c.status().await.unwrap();
+    c.status().await.unwrap();
+    c.status().await.unwrap();
+    assert_eq!((*first.lock().unwrap(), *second.lock().unwrap()), (1, 2));
+
+    // A hook that leaves the slot alone keeps running.
+    let kept = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&kept);
+    fake.on_call(move |_, _| *count.lock().unwrap() += 1);
+    c.status().await.unwrap();
+    c.status().await.unwrap();
+    assert_eq!(*kept.lock().unwrap(), 2);
+}
+
+#[tokio::test]
 async fn requests_are_recorded_and_the_hook_runs_first() {
     let (fake, c) = with_peers().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
