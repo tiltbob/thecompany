@@ -17,8 +17,8 @@
 //! - [`Request`], [`Response`], [`Event`], [`ApiError`], [`TowerState`] and [`MessageStatus`] are
 //!   internally tagged: `{"type":"<variant in snake_case>", ...fields}`, for example
 //!   `{"type":"peer_add","name":"bob","station_id":"..."}` or `{"type":"status"}`.
-//! - The label enums [`Link`], [`Direction`] and [`FailReason`] are bare snake_case strings, for
-//!   example `"relayed"`.
+//! - The label enums [`Link`], [`Direction`], [`FailReason`] and [`TowerSource`] are bare
+//!   snake_case strings, for example `"relayed"`.
 //! - Field names are the Rust names. Unknown fields are ignored on input, at every level.
 //! - An `Option` field that is `None` is left out on output. A missing field or `null` reads as
 //!   `None`.
@@ -163,10 +163,13 @@ use std::fmt;
 /// any enum, a renamed, removed or retyped field, and a new required field all change
 /// `API_VERSION`.
 ///
-/// Version 1 is not final until the first station that implements it is released with M1. Until
-/// then its rules are being completed, and clarifications of them do not change the number; from
-/// that release on, the rule above applies as written.
-pub const API_VERSION: u32 = 1;
+/// The API rules remain provisional until the first station implementing them is released with
+/// M1. Clarifications before that release do not change the version. Wire-form changes still
+/// follow the versioning rule above.
+///
+/// Version 2 adds [`TowerState::Standby`]. The optional tower source and bootstrap domain can
+/// be absent from older JSON.
+pub const API_VERSION: u32 = 2;
 
 /// The largest body of a chat message, in bytes of UTF-8 (16 KiB). [`Request::Send`] with a larger
 /// body fails with [`ApiError::Invalid`]. Equal to the chat protocol's cap.
@@ -307,7 +310,7 @@ pub enum Event {
         /// The removed peer's name.
         name: String,
     },
-    /// The station's status changed (in M1, the state of a tower).
+    /// The station's status changed.
     Status {
         /// The whole status as it is now.
         status: Status,
@@ -323,24 +326,45 @@ pub struct Status {
     /// Opaque, and new on every start of the station; compare for equality only (rule 1). A
     /// transport that reports an instance id when it connects reports this same value.
     pub instance_id: String,
-    /// Every configured tower, in configuration order. M1 has exactly one.
+    /// Every tower in the station's set, in the set's order.
     pub towers: Vec<TowerStatus>,
+    /// The DNS domain supplied for SRV bootstrap, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_domain: Option<String>,
 }
 
-/// One configured tower and the station's connection to it.
+/// One tower in the station's set and what the station knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TowerStatus {
-    /// The tower's URL as configured.
+    /// The tower's URL in the station's set.
     pub url: String,
-    /// The station's connection to the tower.
+    /// The station's observation of this tower, or [`TowerState::Standby`] when unknown.
     pub state: TowerState,
+    /// How the station learned about this tower, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TowerSource>,
 }
 
-/// The state of the station's connection to one tower.
+/// How the station learned about a tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TowerSource {
+    /// From the station's explicit configuration.
+    Configured,
+    /// From a previously stored tower set.
+    Remembered,
+    /// From a DNS SRV lookup.
+    Srv,
+    /// From another station's advertised tower set, adopted at the chief's explicit request.
+    Peer,
+}
+
+/// What the station knows about one tower. Live connection observations cover only the home
+/// tower.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TowerState {
-    /// Not connected, and no failure seen yet.
+    /// The observed home connection has yet to connect and has no reported failure.
     Connecting,
     /// Connected: the station can be reached through this tower.
     Connected,
@@ -355,6 +379,9 @@ pub enum TowerState {
         /// Cleaned display text of at most [`TOWER_TEXT_MAX_BYTES`] bytes (rule 9).
         reason: String,
     },
+    /// The tower's connection state is unknown. This can happen for a tower other
+    /// than the home tower or when no home tower state is available.
+    Standby,
 }
 
 /// A peer in the station's peer book: a name for one or more stations.
@@ -753,5 +780,11 @@ mod tests {
         let input = format!("{separators}éx");
         let spaces = " ".repeat(TOWER_TEXT_MAX_BYTES - 2);
         assert_eq!(clean_tower_display(&input), format!("{spaces}é"));
+
+        let head = "a".repeat(TOWER_TEXT_MAX_BYTES - 1);
+        assert_eq!(
+            clean_tower_display(&format!("{head}\u{2028}")),
+            format!("{head} ")
+        );
     }
 }

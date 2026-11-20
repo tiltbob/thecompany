@@ -33,7 +33,7 @@ use std::fs::{self, File, Permissions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
@@ -46,10 +46,12 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 const PERMISSION_BITS: u32 = 0o7777;
 /// Group and other permission bits.
 const GROUP_OTHER_BITS: u32 = 0o077;
+const DIRECTORY_DESCRIPTOR_LABEL: &str = "<directory descriptor>";
 
 /// Why a private directory or a key file was refused or could not be used.
 ///
-/// Every message names the path and what to do about it. No variant holds key bytes.
+/// Errors identify the path involved. For [`load_or_create_key_in`], they identify a bare
+/// filename or the directory descriptor. No variant holds key bytes.
 #[derive(Debug)]
 pub enum PrivatePathError {
     /// The file or directory belongs to another user.
@@ -192,7 +194,7 @@ impl std::error::Error for PrivatePathError {
     }
 }
 
-/// Whether [`load_or_create_key`] created the key or found it.
+/// Whether [`load_or_create_key`] or [`load_or_create_key_in`] created the key or found it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOrigin {
     /// This call generated the key and published it: the first run.
@@ -201,7 +203,8 @@ pub enum KeyOrigin {
     Loaded,
 }
 
-/// A key returned by [`load_or_create_key`]. Its `Debug` output never shows the key.
+/// A key returned by [`load_or_create_key`] or [`load_or_create_key_in`]. Its `Debug` output never
+/// shows the key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredKey<const N: usize> {
     /// The key bytes.
@@ -264,7 +267,7 @@ pub fn check_private_dir(dir: &Path) -> Result<(), PrivatePathError> {
 pub fn create_key_file(path: &Path, key: &[u8]) -> Result<(), PrivatePathError> {
     let (dir_path, name) = split(path)?;
     let dir = open_private_dir(dir_path, Create::IfMissing)?;
-    create_in(&dir, dir_path, path, name, key, write_all)
+    create_in(&dir, Some(dir_path), path, name, key, write_all)
 }
 
 /// Reads an `N`-byte key file. The directory that holds it must pass [`check_private_dir`] (it is
@@ -294,22 +297,74 @@ pub fn load_or_create_key<const N: usize>(
 ) -> Result<StoredKey<N>, PrivatePathError> {
     let (dir_path, name) = split(path)?;
     let dir = open_private_dir(dir_path, Create::IfMissing)?;
+    load_or_create_in(&dir, Some(dir_path), path, name, generate)
+}
+
+/// Loads or creates a key inside an already opened directory. Use this when another operation,
+/// such as locking the station's data directory, is tied to that same directory descriptor.
+///
+/// `dir` must be a directory owned by the effective user with no group or other permission bits.
+/// Open it for reading so it can be synced. If the key is missing, the directory is synced before
+/// calling `generate`, and again after publication so the new entry survives a crash. A later I/O
+/// error can still leave a complete key behind, as in [`create_key_file`].
+///
+/// `name` must be one bare filename without separators or NUL bytes. All file operations use `dir`,
+/// even if the path used to open it has since changed. Errors identify only a bare filename or the
+/// directory descriptor.
+///
+/// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`].
+pub fn load_or_create_key_in<const N: usize>(
+    dir: &File,
+    name: &OsStr,
+    generate: impl FnOnce() -> [u8; N],
+) -> Result<StoredKey<N>, PrivatePathError> {
+    let path = Path::new(name);
+    let dir_label = Path::new(DIRECTORY_DESCRIPTOR_LABEL);
+    // Compare the raw name too, since `components` normalizes trailing separators and dots.
+    if !matches!(path.components().next(), Some(Component::Normal(part)) if part == name)
+        || name.as_encoded_bytes().contains(&0)
+    {
+        return Err(io_error(
+            dir_label,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "key name must be one filename without separators or NUL bytes",
+            ),
+        ));
+    }
+
+    check_dir(dir, dir_label)?;
+    load_or_create_in(dir, None, path, name, generate)
+}
+
+fn load_or_create_in<const N: usize>(
+    dir: &File,
+    dir_path: Option<&Path>,
+    path: &Path,
+    name: &OsStr,
+    generate: impl FnOnce() -> [u8; N],
+) -> Result<StoredKey<N>, PrivatePathError> {
     let loaded = |key| StoredKey {
         key,
         origin: KeyOrigin::Loaded,
     };
-    match read_in(&dir, path, name) {
+    match read_in(dir, path, name) {
         Ok(key) => return Ok(loaded(key)),
         Err(PrivatePathError::NotFound { .. }) => {}
         Err(e) => return Err(e),
     }
+    // A caller-supplied descriptor can allow relative opens yet fail to sync, for example O_PATH.
+    if dir_path.is_none() {
+        dir.sync_all()
+            .map_err(|error| io_error(Path::new(DIRECTORY_DESCRIPTOR_LABEL), error))?;
+    }
     let key = generate();
-    match create_in(&dir, dir_path, path, name, &key, write_all) {
+    match create_in(dir, dir_path, path, name, &key, write_all) {
         Ok(()) => Ok(StoredKey {
             key,
             origin: KeyOrigin::Created,
         }),
-        Err(PrivatePathError::AlreadyExists { .. }) => read_in(&dir, path, name).map(loaded),
+        Err(PrivatePathError::AlreadyExists { .. }) => read_in(dir, path, name).map(loaded),
         Err(e) => Err(e),
     }
 }
@@ -481,12 +536,18 @@ fn check_dir(handle: &File, path: &Path) -> Result<(), PrivatePathError> {
 /// `write` puts the key into the file; it is a parameter so tests can make it fail.
 fn create_in(
     dir: &File,
-    dir_path: &Path,
+    dir_path: Option<&Path>,
     path: &Path,
     name: &OsStr,
     key: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
 ) -> Result<(), PrivatePathError> {
+    // Include the directory path in diagnostics when the caller supplied one.
+    let dir_label = dir_path.unwrap_or(Path::new(DIRECTORY_DESCRIPTOR_LABEL));
+    let stage_label = |staged: &OsStr| match dir_path {
+        Some(dir_path) => dir_path.join(staged),
+        None => PathBuf::from(staged),
+    };
     // An entry under a staging name proves nothing about who made it (any file name is a valid key
     // name), so a taken name is skipped, never removed. Only the name this call created is
     // unlinked below.
@@ -503,12 +564,12 @@ fn create_in(
                 break;
             }
             Err(e) if e == Errno::EXIST => {}
-            Err(e) => return Err(io_error(&dir_path.join(&candidate), e.into())),
+            Err(e) => return Err(io_error(&stage_label(&candidate), e.into())),
         }
     }
     let Some((tmp, fd)) = staged else {
         return Err(io_error(
-            dir_path,
+            dir_label,
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -520,7 +581,7 @@ fn create_in(
             ),
         ));
     };
-    let tmp_path = dir_path.join(&tmp);
+    let tmp_path = stage_label(&tmp);
     let mut file = File::from(fd);
 
     let published = write_temp(&mut file, &tmp_path, key, write).and_then(|()| {
@@ -538,7 +599,7 @@ fn create_in(
         .map_err(|e| io_error(&tmp_path, e.into()));
     published?;
     removed?;
-    dir.sync_all().map_err(|e| io_error(dir_path, e))
+    dir.sync_all().map_err(|e| io_error(dir_label, e))
 }
 
 /// Sets the mode of the fresh temporary file, checks it, writes the key and syncs the file.
@@ -719,8 +780,11 @@ fn check_owner_and_mode(want: Want, uid: u32, st_mode: u32, euid: u32) -> Result
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const KEY: &[u8; 32] = b"MARKER-0123456789-abcdefghij-KEY";
@@ -969,6 +1033,17 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("staging"), "{err}");
+
+        let dir = File::open(&base).unwrap();
+        let err = load_or_create_key_in(&dir, OsStr::new("node.key"), || *KEY).unwrap_err();
+        assert!(matches!(
+            &err,
+            PrivatePathError::Io { path, source }
+                if path == Path::new("<directory descriptor>")
+                    && source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!err.to_string().contains(base.to_string_lossy().as_ref()));
+        assert!(!base.join("node.key").exists());
         for t in &taken {
             assert_eq!(fs::read(t).unwrap(), b"taken");
         }
@@ -1074,7 +1149,7 @@ mod tests {
         let path = link.join(name);
 
         let dir = open_private_dir(&link, Create::IfMissing).unwrap();
-        let err = create_in(&dir, &link, &path, name, KEY, |file, key| {
+        let err = create_in(&dir, Some(&link), &path, name, KEY, |file, key| {
             file.write_all(&key[..5])?;
             // Point the path somewhere else while the create is in progress.
             fs::remove_file(&link)?;
@@ -1403,6 +1478,218 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(fs::read(&path).unwrap(), &KEY[..7]);
+    }
+
+    #[test]
+    fn directory_handle_keeps_key_operations_in_the_opened_directory() {
+        let (_t, base) = tmp();
+        let original = base.join("original");
+        let moved = base.join("moved");
+        let replacement = base.join("replacement");
+        let alias = base.join("data");
+        let existing_name = OsStr::new("existing.key");
+        let new_name = OsStr::from_bytes(b"new-\xff.key");
+        create_key_file(&original.join(existing_name), KEY).unwrap();
+        create_key_file(&replacement.join(existing_name), &[0; 32]).unwrap();
+        symlink(&original, &alias).unwrap();
+        let dir = File::open(&alias).unwrap();
+
+        // This fixture checks rename and retargeting of the original path. The absence of
+        // descriptor-to-path reconstruction is an implementation property checked in review.
+        fs::rename(&original, &moved).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+
+        let existing = load_or_create_key_in::<32>(&dir, existing_name, || {
+            panic!("the opened directory already has a key")
+        })
+        .unwrap();
+        assert_eq!(existing.origin, KeyOrigin::Loaded);
+        assert!(
+            existing.key == *KEY,
+            "loaded the key from the opened directory"
+        );
+
+        let created = load_or_create_key_in(&dir, new_name, || *KEY).unwrap();
+        assert_eq!(created.origin, KeyOrigin::Created);
+        assert!(read32(&moved.join(new_name)).unwrap() == created.key);
+        assert_eq!(mode_of(&moved.join(new_name)), 0o600);
+        assert_eq!(entries(&moved), [existing_name, new_name]);
+        assert_eq!(entries(&replacement), [existing_name]);
+
+        let loaded = load_or_create_key_in::<32>(&dir, new_name, || {
+            panic!("the generated key already exists")
+        })
+        .unwrap();
+        assert_eq!(loaded.origin, KeyOrigin::Loaded);
+        assert!(loaded.key == created.key);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn unsyncable_directory_handle_refuses_creation_before_generation() {
+        let (_t, base) = tmp();
+        let dir = File::from(
+            rustix::fs::open(
+                &base,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let name = OsStr::new("node.key");
+        let error = load_or_create_key_in::<32>(&dir, name, || {
+            panic!("a descriptor that cannot sync must fail before generation")
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PrivatePathError::Io { path, source }
+                if path == Path::new("<directory descriptor>")
+                    && source.raw_os_error() == Some(Errno::BADF.raw_os_error())
+        ));
+        assert!(
+            entries(&base).is_empty(),
+            "no key or staging file was created"
+        );
+
+        create_key_file(&base.join(name), KEY).unwrap();
+        let existing = load_or_create_key_in::<32>(&dir, name, || {
+            panic!("loading the existing key needs no generator or sync")
+        })
+        .unwrap();
+        assert_eq!(existing.origin, KeyOrigin::Loaded);
+        assert!(existing.key == *KEY);
+    }
+
+    #[test]
+    fn directory_handle_refuses_names_that_are_not_bare_filenames() {
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "/node.key",
+            "../node.key",
+            "sub/node.key",
+            "./node.key",
+            "node.key/.",
+            "node.key/",
+            "node.key\0ignored",
+        ] {
+            let error = load_or_create_key_in::<32>(&dir, OsStr::new(name), || {
+                panic!("a bad filename must fail before generation")
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PrivatePathError::Io { path, source }
+                    if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL)
+                        && source.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
+        assert!(entries(&base).is_empty());
+    }
+
+    #[test]
+    fn directory_handle_rechecks_type_owner_and_mode() {
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        let regular = File::create(base.join("ordinary-file")).unwrap();
+        let name = OsStr::new("node.key");
+        let refused = |dir: &File| {
+            load_or_create_key_in::<32>(dir, name, || {
+                panic!("an unsafe directory must fail before generation")
+            })
+            .unwrap_err()
+        };
+
+        assert!(matches!(
+            refused(&regular),
+            PrivatePathError::NotDirectory { path } if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL)
+        ));
+        chmod(&base, 0o750);
+        assert!(matches!(
+            refused(&dir),
+            PrivatePathError::DirMode { mode: 0o750, path }
+                if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL)
+        ));
+        chmod(&base, 0o700);
+        let wrong_owner = if effective_uid() == 0 {
+            std::os::unix::fs::chown(&base, Some(65534), None).unwrap();
+            let error = refused(&dir);
+            std::os::unix::fs::chown(&base, Some(0), None).unwrap();
+            error
+        } else {
+            refused(&File::open("/").unwrap())
+        };
+        assert!(matches!(
+            wrong_owner,
+            PrivatePathError::WrongOwner { path, .. } if path == Path::new(DIRECTORY_DESCRIPTOR_LABEL)
+        ));
+        assert_eq!(entries(&base), ["ordinary-file"]);
+    }
+
+    #[test]
+    fn directory_handle_refuses_unsafe_and_damaged_key_files() {
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        let name = OsStr::new("node.key");
+        let path = base.join(name);
+        create_key_file(&path, &KEY[..7]).unwrap();
+        symlink(&path, base.join("link.key")).unwrap();
+        let refused = |name| {
+            load_or_create_key_in::<32>(&dir, name, || {
+                panic!("an unsafe or damaged key must not be replaced")
+            })
+            .unwrap_err()
+        };
+
+        assert!(matches!(
+            refused(OsStr::new("link.key")),
+            PrivatePathError::Symlink { path } if path == Path::new("link.key")
+        ));
+        assert!(matches!(
+            refused(name),
+            PrivatePathError::WrongLength { path, found: 7, expected: 32 }
+                if path == Path::new(name)
+        ));
+        chmod(&path, 0o640);
+        assert!(matches!(
+            refused(name),
+            PrivatePathError::KeyFileMode { path, mode: 0o640 } if path == Path::new(name)
+        ));
+        assert!(fs::read(&path).unwrap() == KEY[..7]);
+        assert_eq!(entries(&base), ["link.key", "node.key"]);
+    }
+
+    #[test]
+    fn racing_directory_handle_calls_reuse_the_published_key() {
+        let (_t, base) = tmp();
+        let dir = File::open(&base).unwrap();
+        let (a_ready, a_wait) = mpsc::channel();
+        let (b_ready, b_wait) = mpsc::channel();
+        let (a, b) = std::thread::scope(|scope| {
+            let dir = &dir;
+            let start = |key, ready: mpsc::Sender<()>, other: mpsc::Receiver<()>| {
+                scope.spawn(move || {
+                    load_or_create_key_in(dir, OsStr::new("node.key"), || {
+                        // Both calls must observe the missing file before either can publish.
+                        ready.send(()).unwrap();
+                        other.recv_timeout(Duration::from_secs(5)).unwrap();
+                        key
+                    })
+                    .unwrap()
+                })
+            };
+            let a = start(*KEY, a_ready, b_wait);
+            let b = start([0; 32], b_ready, a_wait);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(a.key == b.key, "both calls return the published key");
+        assert_ne!(a.origin, b.origin, "one call publishes and the other loads");
+        assert_eq!(entries(&base), ["node.key"]);
     }
 
     #[test]
