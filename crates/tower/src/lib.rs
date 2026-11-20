@@ -25,7 +25,8 @@ mod tls;
 
 pub use certs::TlsFileProblem;
 pub use tls::{
-    DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, MAX_RELOAD_INTERVAL, TlsTower,
+    CertSource, DEFAULT_HTTPS_BIND, DEFAULT_QAD_BIND, DEFAULT_TLS_HTTP_BIND, MAX_RELOAD_INTERVAL,
+    TlsTower,
 };
 
 /// The default dev tower bind address.
@@ -220,6 +221,16 @@ pub enum TowerError {
     /// [`MAX_RELOAD_INTERVAL`]).
     #[error("the TLS tower's certificate reload interval is zero or too long to schedule")]
     InvalidReloadInterval,
+    /// An ACME certificate was asked for a host name that is an IP literal.
+    ///
+    /// Let's Encrypt issues certificates for DNS names only.
+    #[error("an ACME certificate needs a DNS host name, not an IP literal")]
+    AcmeNeedsDnsName,
+    /// The ACME contact is not a `mailto:` address with something after `mailto:`.
+    ///
+    /// The error does not repeat the contact.
+    #[error("the ACME contact must be a `mailto:` address")]
+    InvalidAcmeContact,
     /// An entry of [`TowerConfig::allow`] is not a valid endpoint id.
     ///
     /// Neither the message nor the source contains the entry's text.
@@ -371,7 +382,7 @@ impl Tower {
         if let Some((tls, (cert, reload))) = tls {
             relay.tls = Some(TlsConfig::new(tls.https_bind, cert));
             server_config.quic = tls.qad_bind.map(QuicConfig::new);
-            reloader = Some(reload);
+            reloader = reload;
         }
         server_config.relay = Some(relay);
 
@@ -413,7 +424,17 @@ impl Tower {
 
     /// Returns the bound UDP port of QUIC address discovery, or `None` when it is off.
     pub fn qad_port(&self) -> Option<u16> {
-        self.server.quic_addr().map(|addr| addr.port())
+        self.qad_addr().map(|addr| addr.port())
+    }
+
+    /// Returns the bound HTTPS address of a TLS tower, or `None` for a dev tower.
+    pub fn https_addr(&self) -> Option<SocketAddr> {
+        self.server.https_addr()
+    }
+
+    /// Returns the bound UDP address of QUIC address discovery, or `None` when it is off.
+    pub fn qad_addr(&self) -> Option<SocketAddr> {
+        self.server.quic_addr()
     }
 
     /// Returns what the tower has refused or limited since it started.

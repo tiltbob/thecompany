@@ -1,6 +1,7 @@
 //! The TLS tower: its configuration, its canonical URL, and its rustls server configuration.
 //!
-//! The certificate and key themselves are loaded, checked and reloaded in [`crate::certs`].
+//! A certificate from files is loaded, checked and reloaded in [`crate::certs`]. A certificate
+//! from ACME is obtained and renewed by iroh-relay's ACME client (tokio-rustls-acme).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use iroh_base::RelayUrl;
 use iroh_relay::defaults::{DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, DEFAULT_RELAY_QUIC_PORT};
-use iroh_relay::server::{CertConfig, DEFAULT_CERT_RELOAD_INTERVAL};
+use iroh_relay::server::{AcmeConfig, CertConfig, DEFAULT_CERT_RELOAD_INTERVAL};
 
 use crate::TowerError;
 use crate::certs::{CurrentPair, Reloader, load_pair};
@@ -39,8 +40,8 @@ const fn all_ipv4(port: u16) -> SocketAddr {
 /// Build it with [`TlsTower::new`] and pass it to [`TowerConfig::tls`](crate::TowerConfig::tls).
 /// The struct is `#[non_exhaustive]`; adjust it with the builder-style setters.
 ///
-/// Its `Debug` output shows the bind addresses and the reload interval, never the host name or
-/// the file paths, which often contain it.
+/// Its `Debug` output shows the bind addresses and the kind of certificate source, never the
+/// host name, the file paths, which often contain it, or the ACME contact address.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TlsTower {
@@ -59,33 +60,93 @@ pub struct TlsTower {
     /// Address discovery tells endpoints their public address, which direct paths across NATs
     /// need. It uses the relay's TLS configuration.
     pub qad_bind: Option<SocketAddr>,
-    /// The certificate chain, a PEM file that starts with the tower's own certificate.
+    /// Where the certificate comes from: PEM files, or ACME (Let's Encrypt).
+    pub source: CertSource,
+}
+
+/// Where a TLS tower's certificate and private key come from.
+///
+/// The variants are `#[non_exhaustive]`: build them through [`TlsTower::new`] and
+/// [`TlsTower::acme`]. The `Debug` output shows neither paths nor the contact address.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum CertSource {
+    /// A certificate chain and its private key in PEM files, read and reloaded by the tower.
+    #[non_exhaustive]
+    Files {
+        /// The certificate chain, a PEM file that starts with the tower's own certificate.
+        ///
+        /// The tower reads it at spawn and at every reload. It must hold at least one
+        /// certificate, every certificate in it must parse as X.509, and the first must belong
+        /// to the private key. Trust, expiry and names are not checked. The file may be at most
+        /// 64 KiB.
+        cert_path: PathBuf,
+        /// The private key of the certificate, a PEM file with exactly one unencrypted key
+        /// (PKCS#8, PKCS#1 or SEC1; RSA, ECDSA P-256 or P-384, or Ed25519).
+        ///
+        /// The tower reads it at spawn and at every reload, into one fixed buffer that is
+        /// zeroed afterwards, and hands it to rustls, which keeps it only inside its signing
+        /// key. The tower never logs it, never puts any byte of it into an error, and keeps no
+        /// other live copy. Freed memory may still hold copies made by two dependencies, which
+        /// the tower cannot zero: the PEM decoder's scratch buffers (rustls-pki-types), and, for
+        /// a SEC1 key, the PKCS#8 wrapping rustls's ring provider builds before ring loads it.
+        /// The file may be at most 64 KiB.
+        key_path: PathBuf,
+        /// How often the tower reads both files again.
+        ///
+        /// A pair that passes the same checks as at spawn replaces the one in use, so a renewed
+        /// certificate is served without a restart. A pair that fails them is ignored, with one
+        /// warning that names the file and the kind of problem, and the pair in use stays. The
+        /// default is iroh-relay's `DEFAULT_CERT_RELOAD_INTERVAL`, one day. [`Tower::spawn`]
+        /// refuses zero and anything longer than [`MAX_RELOAD_INTERVAL`] (365 days).
+        ///
+        /// [`Tower::spawn`]: crate::Tower::spawn
+        reload_interval: Duration,
+    },
+    /// A certificate from Let's Encrypt, obtained and renewed with the ACME tls-alpn-01
+    /// challenge by iroh-relay's ACME client.
     ///
-    /// The tower reads it at spawn and at every reload. It must hold at least one certificate,
-    /// every certificate in it must parse as X.509, and the first must belong to the private
-    /// key. Trust, expiry and names are not checked. The file may be at most 64 KiB.
-    pub cert_path: PathBuf,
-    /// The private key of the certificate, a PEM file with exactly one unencrypted key (PKCS#8,
-    /// PKCS#1 or SEC1; RSA, ECDSA P-256 or P-384, or Ed25519).
+    /// The certificate is for the tower's host name, which must then be a DNS name, not an IP
+    /// literal. Let's Encrypt validates it on TCP port 443 of that name, so the HTTPS listener
+    /// must be reachable there from the internet. The client contacts Let's Encrypt only once
+    /// the tower runs, never at configuration time.
     ///
-    /// The tower reads it at spawn and at every reload, into one fixed buffer that is zeroed
-    /// afterwards, and hands it to rustls, which keeps it only inside its signing key. The
-    /// tower never logs it, never puts any byte of it into an error, and keeps no other live
-    /// copy. Freed memory may still hold copies made by two dependencies, which the tower cannot
-    /// zero: the PEM decoder's scratch buffers (rustls-pki-types), and, for a SEC1 key, the
-    /// PKCS#8 wrapping rustls's ring provider builds before ring loads it. The file may be at
-    /// most 64 KiB.
-    pub key_path: PathBuf,
-    /// How often the tower reads both files again.
-    ///
-    /// A pair that passes the same checks as at spawn replaces the one in use, so a renewed
-    /// certificate is served without a restart. A pair that fails them is ignored, with one
-    /// warning that names the file and the kind of problem, and the pair in use stays. The
-    /// default is iroh-relay's `DEFAULT_CERT_RELOAD_INTERVAL`, one day. [`Tower::spawn`]
-    /// refuses zero and anything longer than [`MAX_RELOAD_INTERVAL`] (365 days).
-    ///
-    /// [`Tower::spawn`]: crate::Tower::spawn
-    pub reload_interval: Duration,
+    /// The ACME client creates the account key and the certificate's private key itself and
+    /// stores them, with the certificate, in `cache_dir` (files named `cached_account_<hash>`
+    /// and `cached_cert_<hash>`), written with the process's default file permissions. That is
+    /// the tower's own TLS key: the directory must be private to the tower (for example mode
+    /// 0700, owned by the tower's user). Without the cache every restart would order a new
+    /// certificate and soon hit Let's Encrypt's rate limits.
+    #[non_exhaustive]
+    Acme {
+        /// The account contact, a `mailto:` address. [`Tower::spawn`] refuses anything else.
+        ///
+        /// [`Tower::spawn`]: crate::Tower::spawn
+        contact: String,
+        /// The directory where the ACME client keeps its account key, the certificate and its
+        /// private key. It is created if it does not exist.
+        cache_dir: PathBuf,
+        /// `true` for Let's Encrypt's production directory, `false` (the default) for its
+        /// staging directory, whose certificates no client trusts.
+        production: bool,
+    },
+}
+
+impl fmt::Debug for CertSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Files {
+                reload_interval, ..
+            } => f
+                .debug_struct("Files")
+                .field("reload_interval", reload_interval)
+                .finish_non_exhaustive(),
+            Self::Acme { production, .. } => f
+                .debug_struct("Acme")
+                .field("production", production)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl TlsTower {
@@ -102,9 +163,34 @@ impl TlsTower {
             hostname: hostname.into(),
             https_bind: DEFAULT_HTTPS_BIND,
             qad_bind: Some(DEFAULT_QAD_BIND),
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
-            reload_interval: DEFAULT_CERT_RELOAD_INTERVAL,
+            source: CertSource::Files {
+                cert_path: cert_path.into(),
+                key_path: key_path.into(),
+                reload_interval: DEFAULT_CERT_RELOAD_INTERVAL,
+            },
+        }
+    }
+
+    /// A TLS tower reached as `hostname`, with a certificate from Let's Encrypt's staging
+    /// directory; see [`CertSource::Acme`] and [`TlsTower::production`].
+    ///
+    /// `contact` is the account's `mailto:` address and `cache_dir` the directory, private to
+    /// the tower, where the ACME client keeps its keys and the certificate. It listens on
+    /// [`DEFAULT_HTTPS_BIND`] and runs address discovery on [`DEFAULT_QAD_BIND`].
+    pub fn acme(
+        hostname: impl Into<String>,
+        contact: impl Into<String>,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            hostname: hostname.into(),
+            https_bind: DEFAULT_HTTPS_BIND,
+            qad_bind: Some(DEFAULT_QAD_BIND),
+            source: CertSource::Acme {
+                contact: contact.into(),
+                cache_dir: cache_dir.into(),
+                production: false,
+            },
         }
     }
 
@@ -121,8 +207,30 @@ impl TlsTower {
     }
 
     /// Sets how often the tower reads its certificate and key files again.
+    ///
+    /// It applies to a certificate from files; an ACME certificate is renewed by the ACME
+    /// client, and this setting leaves it unchanged.
     pub fn reload_interval(mut self, every: Duration) -> Self {
-        self.reload_interval = every;
+        if let CertSource::Files {
+            reload_interval, ..
+        } = &mut self.source
+        {
+            *reload_interval = every;
+        }
+        self
+    }
+
+    /// Chooses Let's Encrypt's production directory (`true`) or its staging directory
+    /// (`false`, the default) for an ACME certificate. It leaves a certificate from files
+    /// unchanged.
+    pub fn production(mut self, production: bool) -> Self {
+        if let CertSource::Acme {
+            production: current,
+            ..
+        } = &mut self.source
+        {
+            *current = production;
+        }
         self
     }
 }
@@ -132,7 +240,7 @@ impl fmt::Debug for TlsTower {
         f.debug_struct("TlsTower")
             .field("https_bind", &self.https_bind)
             .field("qad_bind", &self.qad_bind)
-            .field("reload_interval", &self.reload_interval)
+            .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
@@ -187,39 +295,154 @@ pub(crate) fn tower_url(hostname: &str, port: u16) -> Result<String, TowerError>
     Ok(text)
 }
 
-/// The relay's certificate configuration and the task that reloads it.
+/// The relay's certificate configuration and, for a certificate from files, the task that
+/// reloads it.
 ///
-/// rustls gets the ring provider explicitly; nothing is installed process-wide. The pair is
-/// loaded and checked here, before anything is bound.
-pub(crate) fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Reloader), TowerError> {
-    let every = tls.reload_interval;
-    let first_reload = (!every.is_zero() && every <= MAX_RELOAD_INTERVAL)
-        .then(|| tokio::time::Instant::now().checked_add(every))
-        .flatten()
-        .ok_or(TowerError::InvalidReloadInterval)?;
+/// rustls gets the ring provider explicitly; nothing is installed process-wide. Everything is
+/// checked here, before anything is bound: a pair from files is loaded and checked, and an ACME
+/// source needs a DNS name and a `mailto:` contact. Building the ACME configuration touches
+/// neither the network nor the cache directory; iroh-relay's ACME client starts only when the
+/// server runs.
+pub(crate) fn cert_config(tls: &TlsTower) -> Result<(CertConfig, Option<Reloader>), TowerError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let pair = load_pair(&provider, &tls.cert_path, &tls.key_path)
-        .map_err(|failure| failure.into_error())?;
-    let current = Arc::new(CurrentPair::new(pair));
-    let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
         .map_err(|error| TowerError::Start(Box::new(error)))?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::clone(&current) as Arc<dyn rustls::server::ResolvesServerCert>);
-    let reloader = Reloader::spawn(
-        &current,
-        provider,
-        tls.cert_path.clone(),
-        tls.key_path.clone(),
-        first_reload,
-        every,
-    );
-    Ok((CertConfig::Manual { server_config }, reloader))
+        .with_no_client_auth();
+    match &tls.source {
+        CertSource::Files {
+            cert_path,
+            key_path,
+            reload_interval,
+        } => {
+            let every = *reload_interval;
+            let first_reload = (!every.is_zero() && every <= MAX_RELOAD_INTERVAL)
+                .then(|| tokio::time::Instant::now().checked_add(every))
+                .flatten()
+                .ok_or(TowerError::InvalidReloadInterval)?;
+            let pair = load_pair(&provider, cert_path, key_path)
+                .map_err(|failure| failure.into_error())?;
+            let current = Arc::new(CurrentPair::new(pair));
+            let server_config = builder.with_cert_resolver(
+                Arc::clone(&current) as Arc<dyn rustls::server::ResolvesServerCert>
+            );
+            let reloader = Reloader::spawn(
+                &current,
+                provider,
+                cert_path.clone(),
+                key_path.clone(),
+                first_reload,
+                every,
+            );
+            Ok((CertConfig::Manual { server_config }, Some(reloader)))
+        }
+        CertSource::Acme {
+            contact,
+            cache_dir,
+            production,
+        } => {
+            let host = canonical_host(&tls.hostname).ok_or(TowerError::InvalidHostname)?;
+            if host.parse::<IpAddr>().is_ok() || host.starts_with('[') {
+                return Err(TowerError::AcmeNeedsDnsName);
+            }
+            if contact
+                .strip_prefix("mailto:")
+                .is_none_or(|address| address.is_empty())
+            {
+                return Err(TowerError::InvalidAcmeContact);
+            }
+            let acme_config = AcmeConfig::letsencrypt(*production)
+                .domains(vec![host])
+                .contact(vec![contact.clone()])
+                .cache_path(cache_dir.clone());
+            Ok((
+                CertConfig::LetsEncrypt {
+                    acme_config,
+                    server_config_builder: builder,
+                },
+                None,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tower_url;
+    use super::{CertSource, TlsTower, cert_config, tower_url};
+    use crate::TowerError;
+    use iroh_relay::server::CertConfig;
+
+    /// An ACME source builds iroh-relay's `CertConfig::LetsEncrypt` without touching the cache
+    /// directory (or the network: nothing here can reach it).
+    #[test]
+    fn an_acme_source_becomes_a_lets_encrypt_config_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("acme-cache");
+        let tls = TlsTower::acme("Tower1.Example.com.", "mailto:ops@example.com", &cache)
+            .production(true);
+        let (cert, reloader) = cert_config(&tls).unwrap();
+        assert!(matches!(cert, CertConfig::LetsEncrypt { .. }));
+        assert!(reloader.is_none());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn an_acme_source_refuses_an_ip_literal_and_a_contact_without_mailto() {
+        for host in ["127.0.0.1", "::1", "[2001:db8::1]"] {
+            let tls = TlsTower::acme(host, "mailto:ops@example.com", "/nonexistent");
+            assert!(matches!(
+                cert_config(&tls),
+                Err(TowerError::AcmeNeedsDnsName)
+            ));
+        }
+        for contact in ["", "ops@example.com", "mailto:", "https://example.com/"] {
+            let tls = TlsTower::acme("tower1.example.com", contact, "/nonexistent");
+            let Err(error) = cert_config(&tls) else {
+                panic!("accepted an ACME contact without mailto");
+            };
+            assert!(matches!(error, TowerError::InvalidAcmeContact));
+            // The message names `mailto:` itself; a longer contact must not appear in it.
+            if contact.len() > "mailto:".len() {
+                assert!(!format!("{error} {error:?}").contains(contact));
+            }
+        }
+    }
+
+    #[test]
+    fn the_production_and_reload_setters_apply_to_their_own_source_only() {
+        let acme = TlsTower::acme("tower1.example.com", "mailto:ops@example.com", "/c")
+            .production(true)
+            .reload_interval(std::time::Duration::from_secs(1));
+        assert!(matches!(
+            acme.source,
+            CertSource::Acme {
+                production: true,
+                ..
+            }
+        ));
+        let files = TlsTower::new("tower1.example.com", "/c.pem", "/k.pem")
+            .production(true)
+            .reload_interval(std::time::Duration::from_secs(1));
+        assert!(matches!(
+            files.source,
+            CertSource::Files { reload_interval, .. } if reload_interval.as_secs() == 1
+        ));
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_acme_contact_and_cache() {
+        let tls = TlsTower::acme(
+            "qzx-name.example",
+            "mailto:qzx-contact@example.com",
+            "/var/lib/qzx-cache",
+        );
+        for text in [format!("{tls:?}"), format!("{tls:#?}")] {
+            for marker in ["qzx-name", "qzx-contact", "qzx-cache"] {
+                assert!(!text.contains(marker), "{text}");
+            }
+            assert!(text.contains("Acme"), "{text}");
+        }
+    }
 
     #[test]
     fn leaves_out_port_443_and_keeps_any_other() {
