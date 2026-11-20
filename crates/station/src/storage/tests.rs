@@ -597,9 +597,16 @@ fn a_colliding_name_is_preserved_and_the_next_draw_commits() {
     let own = new_id();
     let book = single_peer("alice", new_id());
     let bytes = serde_json::to_vec(&DiskBook::from_book(&book)).expect("encode fixture book");
-    let collision = path.join(".peers.json.00112233445566778899aabbccddeeff.tmp");
+    let collision_suffix = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
+    let collision_name = ".peers.json.00112233445566778899aabbccddeeff.tmp";
+    assert_eq!(
+        staging_name(RecordFile::Peers, collision_suffix),
+        collision_name,
+        "staging name format"
+    );
+    let collision = path.join(collision_name);
     write_file(&collision, b"keep", 0o644);
-    let mut suffixes = [0x0011_2233_4455_6677_8899_aabb_ccdd_eeff, 2].into_iter();
+    let mut suffixes = [collision_suffix, 2].into_iter();
 
     assert_eq!(
         storage
@@ -612,7 +619,10 @@ fn a_colliding_name_is_preserved_and_the_next_draw_commits() {
             .expect("commit under a fresh staging name"),
         SaveOutcome::Durable
     );
-    assert!(suffixes.next().is_none());
+    assert!(
+        suffixes.next().is_none(),
+        "the first staging draw must collide and the second must commit"
+    );
     assert!(
         storage
             .load_peers(own)
@@ -789,7 +799,7 @@ async fn station_start_refuses_a_failed_directory_sync_before_creating_the_key()
         assert!(matches!(
             result,
             Err(StartError::Storage { detail }) if detail == "could not sync the station data directory"
-        ), "Station::start must run the startup directory sync");
+        ), "Station::start must refuse a failed startup directory sync");
         assert!(!FAIL_NEXT_STARTUP_SYNC.get());
         assert_eq!(STARTUP_SYNCS.get(), 0);
         assert!(!path.join(KEY_FILE).exists());
