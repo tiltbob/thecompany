@@ -1,10 +1,11 @@
 #![cfg(test)]
 
 use std::future::{Future, poll_fn, ready};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,8 +24,10 @@ use numbers_station::{
     IpTransport, MESSAGE_LOG_CAPACITY, StartError, Station, StationConfig, StationHandle,
 };
 use numbers_tower::{Tower, TowerConfig};
-use tokio::sync::mpsc;
-use tokio::task::yield_now;
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -673,50 +676,187 @@ async fn zero_timeouts_are_refused_and_leave_the_data_directory_free() {
     .await;
 }
 
+/// A loopback TCP forwarder in front of the tower, owned by one test for its whole duration.
+///
+/// Until [`Forwarder::cut`] it pipes each accepted connection both ways to the tower. From then
+/// on it ends every piped connection and closes each new connection as soon as it is accepted,
+/// counting those refused connections. Its listener stays bound until the test shuts it down,
+/// after the station has stopped, so no other test can be given its port while the station
+/// keeps dialling it.
+struct Forwarder {
+    url: String,
+    down: watch::Sender<bool>,
+    refused: Arc<Refused>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct Refused {
+    count: AtomicUsize,
+    grew: Notify,
+}
+
+impl Forwarder {
+    async fn start(tower: SocketAddr) -> Self {
+        let listener = checked(
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await,
+            "bind tower forwarder",
+        );
+        let address = checked(listener.local_addr(), "read tower forwarder address");
+        let (down, _) = watch::channel(false);
+        let refused = Arc::new(Refused::default());
+        let task = tokio::spawn(Self::forward(
+            listener,
+            tower,
+            down.subscribe(),
+            Arc::clone(&refused),
+        ));
+        Self {
+            url: format!("http://{address}/"),
+            down,
+            refused,
+            task,
+        }
+    }
+
+    async fn forward(
+        listener: tokio::net::TcpListener,
+        tower: SocketAddr,
+        down: watch::Receiver<bool>,
+        refused: Arc<Refused>,
+    ) {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                // Never spin on a failing accept; the listener stays bound either way.
+                yield_now().await;
+                continue;
+            };
+            if *down.borrow() {
+                refused.count.fetch_add(1, Ordering::SeqCst);
+                refused.grew.notify_one();
+                drop(client);
+                continue;
+            }
+            let mut down = down.clone();
+            tokio::spawn(async move {
+                let pipe = async {
+                    let mut upstream = TcpStream::connect(tower).await?;
+                    copy_bidirectional(&mut client, &mut upstream).await
+                };
+                // Biased, so that no byte is forwarded once the outage has begun.
+                tokio::select! {
+                    biased;
+                    _ = down.wait_for(|down| *down) => {}
+                    _ = pipe => {}
+                }
+            });
+        }
+    }
+
+    /// Starts the outage: ends the piped connections and refuses every later one.
+    fn cut(&self) {
+        self.down.send_replace(true);
+    }
+
+    fn refused(&self) -> usize {
+        self.refused.count.load(Ordering::SeqCst)
+    }
+
+    async fn refused_more_than(&self, count: usize) {
+        while self.refused() <= count {
+            self.refused.grew.notified().await;
+        }
+    }
+
+    async fn shutdown(self) {
+        self.task.abort();
+        assert!(
+            self.task.await.is_err_and(|error| error.is_cancelled()),
+            "tower forwarder stops"
+        );
+    }
+}
+
+async fn next_tower_state(events: &mut Subscription) -> TowerState {
+    loop {
+        if let Event::Status { mut status } = next_event(events).await {
+            return status.towers.swap_remove(0).state;
+        }
+    }
+}
+
+fn assert_not_connected(state: &TowerState) {
+    assert!(
+        *state != TowerState::Connected,
+        "a tower that is down was reported connected"
+    );
+}
+
 #[tokio::test]
 async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() {
     within(
         CASE_TIMEOUT,
         async {
-            let Network { scratch, tower } = Network::start().await;
+            // The tower keeps running: the outage is the forwarder's alone, and neither the
+            // forwarder's port nor the tower's is released while the station keeps dialling.
+            let network = Network::start().await;
+            let forwarder = Forwarder::start(network.tower.http_addr()).await;
             let (station, client) = start(config(
-                &scratch.path().join("station"),
-                tower.url(),
+                &network.scratch.path().join("station"),
+                &forwarder.url,
                 IpTransport::RelayOnly,
             ))
             .await;
             wait_online(&client).await;
             let mut events = subscribe(&client).await;
-            checked(tower.shutdown().await, "shut down loopback tower");
+            forwarder.cut();
             within(
                 ONLINE_TIMEOUT,
                 async {
-                    // Reports queued before the shutdown can still say Connected. After each failed
+                    // Reports queued before the outage can still say Connected. After each failed
                     // attempt iroh publishes the failure (Failing) for the backoff, then Connecting
                     // while it dials again; it publishes Connected only after a successful dial.
-                    // This assumes no other test is given the freed tower port in the meantime.
-                    let mut down = false;
+                    // From the first report that is not Connected on, Connected is a failure.
+                    let mut state = next_tower_state(&mut events).await;
+                    while state == TowerState::Connected {
+                        state = next_tower_state(&mut events).await;
+                    }
+                    while !matches!(state, TowerState::Failing { .. }) {
+                        state = next_tower_state(&mut events).await;
+                        assert_not_connected(&state);
+                    }
+                    // The station must keep retrying after its first Failing report: wait until
+                    // the forwarder has refused a connection that it accepted after that report.
+                    let refused = forwarder.refused();
                     loop {
-                        let Event::Status { status } = next_event(&mut events).await else {
-                            continue;
-                        };
-                        let state = &status.towers[0].state;
-                        if *state == TowerState::Connected {
-                            assert!(!down, "a tower that is down was reported connected");
-                            continue;
+                        tokio::select! {
+                            () = forwarder.refused_more_than(refused) => break,
+                            state = next_tower_state(&mut events) => assert_not_connected(&state),
                         }
-                        down = true;
+                    }
+                    // Reports already queued can predate that attempt; the next Failing report
+                    // after them is a retry that failed again.
+                    while let Some(event) = queued_event(&mut events).await {
+                        if let Event::Status { status } = event {
+                            assert_not_connected(&status.towers[0].state);
+                        }
+                    }
+                    loop {
+                        let state = next_tower_state(&mut events).await;
+                        assert_not_connected(&state);
                         if matches!(state, TowerState::Failing { .. }) {
-                            return;
+                            break;
                         }
                     }
                 },
-                "station reports the tower down, then failing",
+                "station keeps reporting a tower that is down as failing",
             )
             .await;
             let status = checked(client.status().await, "read station status");
-            assert!(status.towers[0].state != TowerState::Connected);
+            assert_not_connected(&status.towers[0].state);
             stop(station).await;
+            forwarder.shutdown().await;
+            network.shutdown().await;
         },
         "tower failure test timed out",
     )
