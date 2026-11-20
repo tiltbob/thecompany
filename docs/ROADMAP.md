@@ -153,15 +153,18 @@ unique receipts across all peers in memory, keyed by peer name and message ID. D
 acknowledgements leave that order alone. Older receipts and those from a prior station instance
 can be accepted again.
 
-The private data directory holds the stable lock file, `node.key`, and `peers.json`. The station
-loads the node key relative to the checked directory handle used for the lock. The peer book is a
-version-1 object with a list of peer records, each containing a name and ordered canonical station
-IDs. It is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
+The private data directory must be on a local filesystem so the station can rely on its exclusive
+lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the
+node key relative to the checked directory handle used for the lock. The peer book is a version-1
+object with a list of peer records, each containing a name and ordered canonical station IDs. It
+is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
 rename and directory sync. If the rename succeeds but directory sync fails, the station applies
 the visible book and reports that the change may not survive a crash. While that running station
 has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
 and syncs the directory before giving its usual answer. These retries emit no additional events.
-The saved file contains no network path state or message history.
+The saved file contains no network path state or message history. While the actor writes and syncs
+the peer book, command replies and event processing can pause. An incoming chat can receive
+`Unavailable` if its bounded mailbox fills during that time.
 
 **Deliberately not in M1:** TLS, SRV bootstrap, several towers, a tower set that changes at runtime,
 non-loopback plain HTTP, tower allowlist, running the station as a service (all M2); chiefs as
@@ -203,7 +206,8 @@ unlisted station denied.
 | `crates/chief/src/api.rs` | `TowerStatus.source: Option<TowerSource>` (`configured \| remembered \| srv \| peer`) and `Status.bootstrap_domain: Option<String>`. `Standby` represents a tower whose state is unobserved, including when the home tower state is unavailable. `API_VERSION` is 2. | #68, Codex |
 | `crates/chief/src/api.rs` | Per decision 16 (#73), the candidates a station holds with the reporting peer's name and the explicit request that takes one into the tower set. | #109, Codex |
 | `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. Per decision 16 (#73), the candidates and `chief tower add <url>` are #122, which waits for the API of #109 | #80, Claude |
-| `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` for the ACME cache, `CAP_NET_BIND_SERVICE`, sandboxing) and `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented). A unit test in each binary parses its unit's `ExecStart` with clap; CI runs `systemd-analyze verify` on both. Docs: "Running as a service" | #82, Claude |
+| `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` with `StateDirectoryMode=0700` for the ACME cache, `Restart=on-failure` with `RestartPreventExitStatus=2 78` (the binary exits with 78 for a configuration error and 2 for a command-line error, 1 for what can pass), `CAP_NET_BIND_SERVICE`, sandboxing) and an example drop-in for certificate files through `LoadCredential=`, restarted on renewal. A test in the binary reads the unit by section, parses its `ExecStart` with clap and checks the directives the binary needs; `scripts/check-units.sh` (CI) runs `systemd-analyze verify --recursive-errors=no` on the unit alone and with the drop-in, fails on any message, and needs systemd 250 or later (skipped locally without it, a failure in CI). Docs: "Running the tower as a service" (`packaging/systemd/README.md`). | #82, Claude |
+| `packaging/systemd/` | `station.service` (user unit, `Restart=on-failure`, `loginctl enable-linger` documented), with the same test in the binary and the same check as the tower's unit; it waits for the station daemon (#53, #79) | #127, Claude |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
 | `scripts/walkthrough-tls.sh` | the walkthrough with the real binaries over TLS on loopback, run by CI | #84, Codex |
 | `docs/notes/m2-demo.md` or a docs section | the runbook for the real-network demo | #85, Claude |

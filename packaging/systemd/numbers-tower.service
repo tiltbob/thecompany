@@ -1,0 +1,46 @@
+# The production tower as a system service. See packaging/systemd/README.md.
+#
+# As shipped, the unit works with an ACME certificate whose cache is under the state directory.
+# Certificate files need the drop-in in numbers-tower.service.d/tls-files.conf.example.
+# crates/tower/src/main.rs parses ExecStart below and checks the directives the binary needs.
+
+[Unit]
+Description=numbers tower (relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/tower serve --config /etc/numbers-tower/tower.toml
+
+# The tower exits with a failure when its relay stops by itself, and with success on SIGTERM
+# (systemctl stop). Restart it in the first case only.
+Restart=on-failure
+RestartSec=5s
+# A wrong command line (exit status 2) or configuration (78, EX_CONFIG) stays wrong: the
+# service ends as failed instead of being restarted. Fix it and start the service again.
+RestartPreventExitStatus=2 78
+
+# A user allocated at start and released at stop. It also implies a private /tmp,
+# ProtectSystem=strict, ProtectHome=read-only, NoNewPrivileges=yes, RestrictSUIDSGID=yes and
+# RemoveIPC=yes. The lines at the end repeat two of them and make ProtectHome stricter.
+DynamicUser=yes
+
+# /var/lib/numbers-tower, owned by the dynamic user and writable despite ProtectSystem=strict.
+# The documented config keeps the ACME cache, with the tower's keys, in it. Mode 0700 keeps it
+# private (systemd's default is 0755), and it is the mode the tower requires when cache_dir is
+# the state directory itself.
+StateDirectory=numbers-tower
+StateDirectoryMode=0700
+
+# Ports 80 and 443 without root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

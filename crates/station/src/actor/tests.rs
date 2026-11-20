@@ -8,6 +8,8 @@ use numbers::{Endpoint, EndpointConfig, generate_node_key, node_id};
 
 use super::*;
 
+mod delivery_deadline;
+
 async fn queued_event(events: &mut Subscription) -> Option<Event> {
     tokio::select! {
         biased;

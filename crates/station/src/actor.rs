@@ -502,9 +502,7 @@ async fn deliver(
         None
     })
     .await;
-    if let Ok(Some(status)) = outcome
-        && Instant::now() <= deadline
-    {
+    if let Ok(Some(status)) = outcome {
         return status;
     }
     // With no conclusive reply, report NoAnswer at the original deadline.
