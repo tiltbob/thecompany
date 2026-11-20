@@ -6,10 +6,11 @@
 
 mod common;
 
+use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
@@ -25,6 +26,8 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, SubscriberExt};
 
 /// How long an endpoint that does not trust the certificate must stay offline.
 const UNTRUSTED_FOR: Duration = Duration::from_secs(5);
@@ -268,16 +271,21 @@ fn free_udp_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
-/// Spawns a tower on fixed ports with the given files, expects it to fail, checks that none of
-/// the ports stayed bound, and returns the error.
+/// Spawns a tower reached as 127.0.0.1 on fixed ports with the given files, expects it to fail,
+/// checks that none of the ports stayed bound, and returns the error.
 async fn spawn_fails(cert: &Path, key: &Path) -> TowerError {
+    spawn_fails_as("127.0.0.1", cert, key).await
+}
+
+/// [`spawn_fails`] for a tower reached as `hostname`.
+async fn spawn_fails_as(hostname: &str, cert: &Path, key: &Path) -> TowerError {
     let (http, https, qad) = (free_tcp_port(), free_tcp_port(), free_udp_port());
-    let tls = TlsTower::new("127.0.0.1", cert, key)
+    let tls = TlsTower::new(hostname, cert, key)
         .https_bind((Ipv4Addr::LOCALHOST, https).into())
         .qad_bind(Some((Ipv4Addr::LOCALHOST, qad).into()));
     let config = TowerConfig::tls(tls).bind((Ipv4Addr::LOCALHOST, http).into());
     let Err(error) = Tower::spawn(config).await else {
-        panic!("spawn accepted unusable certificate files");
+        panic!("spawn accepted an unusable configuration");
     };
     for port in [http, https] {
         assert!(
@@ -436,6 +444,16 @@ async fn unusable_certificate_files_fail_spawn_before_binding() {
             "two-keys.pem",
             &format!("{}{}", cert.key_pem, other.key_pem),
         );
+        // An encrypted key is skipped by its label, whatever its body holds.
+        let encrypted_key = write(
+            "encrypted-key.pem",
+            &format!(
+                "-----BEGIN ENCRYPTED PRIVATE KEY-----\n{NOT_A_CERTIFICATE_DER}\n\
+                 -----END ENCRYPTED PRIVATE KEY-----\n"
+            ),
+        );
+        // One byte over the 64 KiB cap.
+        let too_large = write("too-large.pem", &"x".repeat(64 * 1024 + 1));
 
         for (path, problem) in [
             (
@@ -443,6 +461,7 @@ async fn unusable_certificate_files_fail_spawn_before_binding() {
                 TlsFileProblem::Unreadable(std::io::ErrorKind::NotFound),
             ),
             (&not_pem, TlsFileProblem::NoCertificate),
+            (&too_large, TlsFileProblem::TooLarge),
             (&invalid_der, TlsFileProblem::UnparsableCertificate),
             (&bad_second, TlsFileProblem::UnparsableCertificate),
             // Paths swapped by mistake: the key file holds no certificate.
@@ -459,6 +478,8 @@ async fn unusable_certificate_files_fail_spawn_before_binding() {
                 TlsFileProblem::Unreadable(std::io::ErrorKind::NotFound),
             ),
             (&not_pem, TlsFileProblem::NoPrivateKey),
+            (&too_large, TlsFileProblem::TooLarge),
+            (&encrypted_key, TlsFileProblem::NoPrivateKey),
             // Paths swapped by mistake: the certificate file holds no key.
             (&cert.cert, TlsFileProblem::NoPrivateKey),
             (&unsupported_key, TlsFileProblem::UnsupportedKey),
@@ -496,17 +517,20 @@ async fn malformed_pem_fails_spawn_without_showing_the_file() {
     .await;
 }
 
+/// Host names that are neither a DNS host name nor an IP literal.
+const INVALID_HOST_NAMES: [&str; 5] = [
+    "",
+    "tower/path",
+    "user@tower",
+    "tower_qzx.example",
+    "-qzx.example",
+];
+
 #[tokio::test]
 async fn an_invalid_host_name_fails_spawn_without_repeating_it() {
     let cert = cert();
     let tls = tls_tower(&cert.cert, &cert.key);
-    for name in [
-        "",
-        "tower/path",
-        "user@tower",
-        "tower_qzx.example",
-        "-qzx.example",
-    ] {
+    for name in INVALID_HOST_NAMES {
         let mut tls = tls.clone();
         name.clone_into(&mut tls.hostname);
         let Err(error) = Tower::spawn(config(tls)).await else {
@@ -517,6 +541,47 @@ async fn an_invalid_host_name_fails_spawn_without_repeating_it() {
             assert_not_in(&texts(&error), name.as_bytes(), "the host name");
         }
     }
+}
+
+/// Spawns `tls` with its HTTPS port held by another listener, expects it to fail, and returns
+/// the error.
+async fn spawn_fails_with_https_taken(tls: TlsTower) -> TowerError {
+    let taken = TcpListener::bind(loopback()).unwrap();
+    let tls = tls.https_bind(taken.local_addr().unwrap());
+    let Err(error) = Tower::spawn(config(tls)).await else {
+        panic!("spawn bound an HTTPS port that is taken");
+    };
+    error
+}
+
+/// The host name is checked before anything is bound: an invalid name leaves every port free,
+/// and it is the error even when the HTTPS port is taken, where binding would fail first.
+#[tokio::test]
+async fn an_invalid_host_name_fails_spawn_before_binding() {
+    bounded(async {
+        let cert = cert();
+        for name in INVALID_HOST_NAMES {
+            let error = spawn_fails_as(name, &cert.cert, &cert.key).await;
+            assert!(matches!(error, TowerError::InvalidHostname), "{error}");
+
+            let mut tls = tls_tower(&cert.cert, &cert.key);
+            name.clone_into(&mut tls.hostname);
+            let error = spawn_fails_with_https_taken(tls).await;
+            assert!(matches!(error, TowerError::InvalidHostname), "{error}");
+        }
+    })
+    .await;
+}
+
+/// A TLS tower whose HTTPS port is taken fails to start.
+#[tokio::test]
+async fn a_taken_https_port_fails_spawn_with_a_start_error() {
+    bounded(async {
+        let cert = cert();
+        let error = spawn_fails_with_https_taken(tls_tower(&cert.cert, &cert.key)).await;
+        assert!(matches!(error, TowerError::Start(_)), "{error}");
+    })
+    .await;
 }
 
 /// Sends `GET path` over HTTPS to `addr` as 127.0.0.1, trusting only `roots`, and returns the
@@ -621,8 +686,120 @@ fn replace(path: &Path, text: &str) {
     std::fs::rename(&staged, path).unwrap();
 }
 
+/// One event from the tower's own targets: its level, its target and every field as text, the
+/// message included.
+#[derive(Debug)]
+struct Captured {
+    level: tracing::Level,
+    target: String,
+    fields: Vec<(String, String)>,
+}
+
+impl Captured {
+    /// The text of field `name`, if the event has it.
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A layer that records every event whose target starts with `numbers_tower`.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+impl Capture {
+    /// How many events it has recorded.
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// Whether an event recorded since the first `from` is the warning of a failed reload of
+    /// `file` with `problem`.
+    fn has_reload_warning(&self, from: usize, file: &str, problem: TlsFileProblem) -> bool {
+        self.0.lock().unwrap()[from..].iter().any(|event| {
+            event.level == tracing::Level::WARN
+                && event.target == "numbers_tower::tls"
+                && event.field("message")
+                    == Some(
+                        "TLS certificate reload failed; the tower keeps serving the pair in use",
+                    )
+                && event.field("file") == Some(file)
+                && event.field("problem") == Some(problem.to_string().as_str())
+        })
+    }
+
+    /// Fails if the level, target, a field name or a field value of any recorded event holds
+    /// `needle`.
+    fn assert_never_shows(&self, needle: &str, what: &str) {
+        for event in self.0.lock().unwrap().iter() {
+            let texts = [event.level.to_string(), event.target.clone()];
+            let fields = event.fields.iter().flat_map(|(name, value)| [name, value]);
+            for text in texts.iter().chain(fields) {
+                assert!(
+                    !text.contains(needle),
+                    "a log event shows {what}: {event:?}"
+                );
+            }
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+        let metadata = event.metadata();
+        if !metadata.target().starts_with("numbers_tower") {
+            return;
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(Captured {
+            level: *metadata.level(),
+            target: metadata.target().to_owned(),
+            fields: fields.0,
+        });
+    }
+}
+
+/// The fields of one event, each as text.
+#[derive(Default)]
+struct Fields(Vec<(String, String)>);
+
+impl Visit for Fields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.push((field.name().to_owned(), value.to_owned()));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+/// Waits, polling every reload interval, until a client that trusts only `cert` gets an answer
+/// from `addr`; fails after 10 s.
+async fn until_served(addr: SocketAddr, cert: &Cert, what: &str) {
+    let served = timeout(Duration::from_secs(10), async {
+        let mut tick = tokio::time::interval(RELOAD);
+        while https(addr, &[&cert.der], "/healthz").await.as_deref() != Ok("HTTP/1.1 200 OK") {
+            tick.tick().await;
+        }
+    })
+    .await;
+    assert!(served.is_ok(), "{what} was not served within 10 s");
+}
+
+/// Reloading serves a renewed pair, keeps it while the files on disk are broken, warns about
+/// each broken pair with the file and the kind of problem only, and goes on to serve the next
+/// good pair.
 #[tokio::test]
 async fn a_reload_serves_a_renewed_pair_and_keeps_the_last_good_one() {
+    // `#[tokio::test]` runs every task on this thread, the reload task's warnings included, so
+    // a default subscriber for this thread sees them. The guard need not be `Send`: neither
+    // `bounded` nor the test's runtime asks the future to be.
+    let capture = Capture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
     bounded(async {
         let first = cert();
         let tls = tls_tower(&first.cert, &first.key).reload_interval(RELOAD);
@@ -637,34 +814,50 @@ async fn a_reload_serves_a_renewed_pair_and_keeps_the_last_good_one() {
         let second = cert_in(&first.dir, "second");
         replace(&first.cert, &second.cert_pem);
         replace(&first.key, &second.key_pem);
-        let renewed = timeout(Duration::from_secs(10), async {
-            let mut tick = tokio::time::interval(RELOAD);
-            while https(addr, &[&second.der], "/healthz").await.is_err() {
-                tick.tick().await;
-            }
-        })
-        .await;
-        assert!(
-            renewed.is_ok(),
-            "the renewed certificate was not served within 10 s"
-        );
+        until_served(addr, &second, "the renewed pair").await;
         assert!(https(addr, &[&first.der], "/healthz").await.is_err());
 
         // Broken pairs: a certificate with another key; malformed PEM in both files; a new leaf
         // with its own key but a second certificate that does not parse. Each stays on disk for
-        // several intervals, and the renewed pair stays in use throughout.
+        // several intervals, and the renewed pair stays in use throughout. The certificate file
+        // is checked first, so a reload between the two renames reports the same file.
         let third = cert_in(&first.dir, "third");
         let [(_, malformed_header), (_, malformed_end)] = malformed_pem();
         let bad_chain = format!("{}{}", third.cert_pem, unparsable_certificate_section());
-        for (cert_pem, key_pem) in [
-            (third.cert_pem.as_str(), second.key_pem.as_str()),
-            (malformed_header.as_str(), malformed_end.as_str()),
-            (bad_chain.as_str(), third.key_pem.as_str()),
+        for (cert_pem, key_pem, file, problem) in [
+            (
+                third.cert_pem.as_str(),
+                second.key_pem.as_str(),
+                "private key file",
+                TlsFileProblem::KeyMismatch,
+            ),
+            (
+                malformed_header.as_str(),
+                malformed_end.as_str(),
+                "certificate file",
+                TlsFileProblem::MalformedPem,
+            ),
+            (
+                bad_chain.as_str(),
+                third.key_pem.as_str(),
+                "certificate file",
+                TlsFileProblem::UnparsableCertificate,
+            ),
         ] {
+            let from = capture.len();
             replace(&first.cert, cert_pem);
             replace(&first.key, key_pem);
             // Asserting that nothing changes: there is no event to wait for.
             tokio::time::sleep(RELOAD * 5).await;
+            // The warning is an event, but a slow host may not have reloaded yet.
+            let warned = timeout(Duration::from_secs(10), async {
+                let mut tick = tokio::time::interval(RELOAD);
+                while !capture.has_reload_warning(from, file, problem) {
+                    tick.tick().await;
+                }
+            })
+            .await;
+            assert!(warned.is_ok(), "no warning about the {file}: {problem}");
             assert_eq!(
                 https(addr, &[&second.der], "/healthz").await.as_deref(),
                 Ok("HTTP/1.1 200 OK")
@@ -672,49 +865,187 @@ async fn a_reload_serves_a_renewed_pair_and_keeps_the_last_good_one() {
             assert!(https(addr, &[&third.der], "/healthz").await.is_err());
         }
 
+        // A good pair again: reloading went on after the failures.
+        let fourth = cert_in(&first.dir, "fourth");
+        replace(&first.cert, &fourth.cert_pem);
+        replace(&first.key, &fourth.key_pem);
+        until_served(addr, &fourth, "the pair after the broken ones").await;
+
+        // No warning names where the files are, or quotes them.
+        let directory = first.dir.path().to_string_lossy().into_owned();
+        capture.assert_never_shows(&directory, "the directory");
+        for path in [&first.cert, &first.key] {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            capture.assert_never_shows(&name, "a file name");
+        }
+        capture.assert_never_shows(MARKER, "the content of a malformed file");
+
         assert!(tower.shutdown().await.is_ok());
     })
     .await;
 }
 
-/// A leaf for 127.0.0.1 signed by a CA, as `leaf, CA` PEM, with the leaf's key and the CA's
-/// certificate.
-fn chain_in(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
+/// The parameters of a CA certificate named `name`.
+fn ca_params(name: &str) -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "numbers test CA");
-    let ca = ca_params.self_signed(&ca_key).unwrap();
-    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        .push(rcgen::DnType::CommonName, name);
+    params
+}
+
+/// A leaf for 127.0.0.1 signed by an intermediate CA that a root CA signed, written as
+/// `leaf, intermediate` PEM, with the leaf's key; returns the files and the root's certificate.
+fn chain_in(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let root_params = ca_params("numbers test root CA");
+    let root = root_params.self_signed(&root_key).unwrap();
+    let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let intermediate_params = ca_params("numbers test intermediate CA");
+    let intermediate = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .unwrap();
+    let intermediate_issuer = rcgen::Issuer::from_params(&intermediate_params, &intermediate_key);
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
         .unwrap()
-        .signed_by(&leaf_key, &issuer)
+        .signed_by(&leaf_key, &intermediate_issuer)
         .unwrap();
     let (cert, key) = (dir.join("chain.pem"), dir.join("chain-key.pem"));
-    std::fs::write(&cert, format!("{}{}", leaf.pem(), ca.pem())).unwrap();
+    std::fs::write(&cert, format!("{}{}", leaf.pem(), intermediate.pem())).unwrap();
     std::fs::write(&key, leaf_key.serialize_pem()).unwrap();
-    (cert, key, ca.der().clone())
+    (cert, key, root.der().clone())
 }
 
-/// webpki parses an intermediate or CA certificate like a leaf, so a real chain of leaf and CA
-/// passes the check of every certificate, and the tower serves with it: a client that trusts the
-/// CA accepts the leaf. This does not show that the CA certificate itself is sent, since a
-/// client that trusts the CA needs only the leaf.
+/// The tower serves every certificate of its file, not only the first. The file holds a leaf
+/// and the intermediate CA that signed it; the client trusts only the root CA, which is not in
+/// the file, so it can build a path to the leaf only if the tower sends the intermediate. It
+/// also shows that an intermediate passes the check of every certificate.
 #[tokio::test]
-async fn a_two_certificate_chain_is_accepted_and_served() {
+async fn the_whole_chain_is_served_so_a_client_that_trusts_only_the_root_accepts_it() {
     bounded(async {
         let dir = tempfile::tempdir().unwrap();
-        let (cert, key, ca) = chain_in(dir.path());
+        let (cert, key, root) = chain_in(dir.path());
         let (tower, url) = spawn(config(tls_tower(&cert, &key))).await;
         let addr = https_addr(&url);
         assert_eq!(
-            https(addr, &[&ca], "/healthz").await.as_deref(),
+            https(addr, &[&root], "/healthz").await.as_deref(),
             Ok("HTTP/1.1 200 OK")
         );
         assert!(tower.shutdown().await.is_ok());
+    })
+    .await;
+}
+
+/// Standard base64 with padding, as a PEM body uses it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::new();
+    for chunk in bytes.chunks(3) {
+        let byte = |index: usize| u32::from(chunk.get(index).copied().unwrap_or(0));
+        let triple = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for position in 0..4 {
+            if position <= chunk.len() {
+                let sextet = (triple >> (18 - 6 * position)) & 0x3f;
+                text.push(char::from(ALPHABET[sextet as usize]));
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    text
+}
+
+/// `der` as a PEM section labelled `label`, 64 characters to a line.
+fn pem(label: &str, der: &[u8]) -> String {
+    let body = base64(der);
+    let mut text = format!("-----BEGIN {label}-----\n");
+    for line in body.as_bytes().chunks(64) {
+        text.push_str(std::str::from_utf8(line).unwrap());
+        text.push('\n');
+    }
+    text.push_str(&format!("-----END {label}-----\n"));
+    text
+}
+
+/// The first DER element of `input` (definite length, short or long form): its tag, its
+/// content and what follows it.
+fn der_element(input: &[u8]) -> (u8, &[u8], &[u8]) {
+    let (&tag, rest) = input.split_first().unwrap();
+    let (&first, rest) = rest.split_first().unwrap();
+    let (length, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let (octets, rest) = rest.split_at(usize::from(first & 0x7f));
+        let length = octets
+            .iter()
+            .fold(0, |length, &octet| (length << 8) | usize::from(octet));
+        (length, rest)
+    };
+    let (content, rest) = rest.split_at(length);
+    (tag, content, rest)
+}
+
+/// The SEC1 `ECPrivateKey` inside a PKCS#8 EC key: the content of the OCTET STRING that follows
+/// the version and the algorithm in `SEQUENCE { INTEGER, SEQUENCE, OCTET STRING, ... }`.
+fn sec1_from_pkcs8(pkcs8: &[u8]) -> Vec<u8> {
+    let (tag, body, _) = der_element(pkcs8);
+    assert_eq!(tag, 0x30, "PKCS#8 is a SEQUENCE");
+    let (tag, _version, rest) = der_element(body);
+    assert_eq!(tag, 0x02, "the version is an INTEGER");
+    let (tag, _algorithm, rest) = der_element(rest);
+    assert_eq!(tag, 0x30, "the algorithm is a SEQUENCE");
+    let (tag, sec1, _) = der_element(rest);
+    assert_eq!(tag, 0x04, "the key is an OCTET STRING");
+    sec1.to_vec()
+}
+
+/// The tower serves with each kind of key `TlsTower::key_path` promises beyond the ECDSA P-256
+/// PKCS#8 key the other tests use: ECDSA P-384 and Ed25519 in PKCS#8, ECDSA P-256 and P-384 in
+/// SEC1 (`EC PRIVATE KEY`). RSA keys, PKCS#1 or PKCS#8, have no test: nothing in the workspace
+/// can make an RSA key at run time, and the repository tracks no key files.
+#[tokio::test]
+async fn ecdsa_and_ed25519_keys_in_pkcs8_and_sec1_are_served() {
+    bounded(async {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (what, algorithm, sec1)) in [
+            ("ECDSA P-384, PKCS#8", &rcgen::PKCS_ECDSA_P384_SHA384, false),
+            ("Ed25519, PKCS#8", &rcgen::PKCS_ED25519, false),
+            ("ECDSA P-256, SEC1", &rcgen::PKCS_ECDSA_P256_SHA256, true),
+            ("ECDSA P-384, SEC1", &rcgen::PKCS_ECDSA_P384_SHA384, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = rcgen::KeyPair::generate_for(algorithm).unwrap();
+            let certificate = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            let key_pem = if sec1 {
+                pem("EC PRIVATE KEY", &sec1_from_pkcs8(&key.serialize_der()))
+            } else {
+                key.serialize_pem()
+            };
+            let (cert_path, key_path) = (
+                dir.path().join(format!("{index}.cert.pem")),
+                dir.path().join(format!("{index}.key.pem")),
+            );
+            std::fs::write(&cert_path, certificate.pem()).unwrap();
+            std::fs::write(&key_path, key_pem).unwrap();
+
+            let (tower, url) = spawn(config(tls_tower(&cert_path, &key_path))).await;
+            assert_eq!(
+                https(https_addr(&url), &[certificate.der()], "/healthz")
+                    .await
+                    .as_deref(),
+                Ok("HTTP/1.1 200 OK"),
+                "{what}"
+            );
+            assert!(tower.shutdown().await.is_ok());
+        }
     })
     .await;
 }
