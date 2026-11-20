@@ -52,6 +52,13 @@ async fn an_oversized_body_is_refused_before_anything_starts() {
         Err(ApiError::Invalid { field, reason })
             if field == "body" && reason == "must be at most 16 KiB"
     ));
+    // The limit is in bytes: this body is over it in bytes and under it in characters.
+    let body = "\u{e9}".repeat(BODY_MAX_BYTES / 2 + 1);
+    assert!(matches!(
+        actor.send("peer", &body),
+        Err(ApiError::Invalid { field, reason })
+            if field == "body" && reason == "must be at most 16 KiB"
+    ));
     assert_nothing_started(&actor, &mut events).await;
     link.shutdown().await.expect("shut down actor fixture link");
 }
@@ -110,6 +117,11 @@ async fn the_pending_send_cap_refuses_one_more_until_a_send_finishes() {
 
     // Finish one send as the run loop does: the removal fails it, then its worker is reaped.
     assert!(matches!(actor.remove_peer("other"), Ok(Response::Done)));
+    // The cap counts worker tasks, so a failed send whose worker is not reaped yet still counts.
+    assert!(matches!(
+        actor.send("peer", "still reclaiming"),
+        Err(ApiError::Internal { .. })
+    ));
     let reaped = timeout(REAP_TIMEOUT, actor.jobs.join_next())
         .await
         .expect("reap the finished send in time")
