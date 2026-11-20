@@ -40,13 +40,11 @@ async fn chat_from_a_removed_peer_is_refused_and_not_logged() {
         "bind actor endpoint",
     );
     let address = EndpointAddr::new(own_id).with_ip_addr(endpoint.iroh().bound_sockets()[0]);
-    let (link, mut inbox) = Link::start(
-        endpoint,
-        LinkConfig {
-            connect_timeout: BUDGET,
-            send_deadline: BUDGET,
-        },
-    );
+    let config = LinkConfig {
+        connect_timeout: BUDGET,
+        send_deadline: BUDGET,
+    };
+    let (link, mut inbox) = Link::start(endpoint, config);
     let status = Status {
         station_id: own_id.to_string(),
         instance_id: "fixture".to_owned(),
@@ -65,7 +63,7 @@ async fn chat_from_a_removed_peer_is_refused_and_not_logged() {
     let (sink, mut events) = subscription(SUBSCRIPTION_CAPACITY);
     actor.sinks.push(sink);
 
-    let peer = bind(&peer_key, own_id).await;
+    let peer = bind(&peer_key, [own_id]).await;
     let connection = dial_admitted(&peer, address, &link.handle()).await;
     let (mut send, mut recv) = checked(connection.open_bi().await, "open chat stream");
     write(&mut send, &StreamHeader::chat()).await;

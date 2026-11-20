@@ -508,11 +508,19 @@ async fn deliver(
     deadline: Instant,
 ) -> MessageStatus {
     let outcome = timeout_at(deadline, async {
-        for id in stations {
+        let mut stations = stations.into_iter().peekable();
+        while let Some(id) = stations.next() {
             if Instant::now() >= deadline {
                 break;
             }
-            match link.send(id, chat.clone()).await {
+            let reply = if stations.peek().is_none() {
+                link.send(id, chat.clone()).await
+            } else {
+                // While another candidate remains, a failed dial can advance to it. Keep
+                // waiting for an existing link's reply or its usual connection recovery.
+                link.send_without_failed_dial_retry(id, chat.clone()).await
+            };
+            match reply {
                 Ok(ChatReply::Ack) => return Some(MessageStatus::Delivered),
                 Ok(ChatReply::Nack(NackReason::Unavailable)) | Err(_) => continue,
                 Ok(ChatReply::Nack(_)) => return Some(failed(FailReason::Refused)),

@@ -240,10 +240,25 @@ one from the same initiator. There is at most one pending incoming hello per pee
 connection while that hello is pending is refused immediately with code `0`. A sender whose
 outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
 If the fallback also loses and no open link, incoming hello or shared dial remains, the send
-returns `Disconnected` even if the deadline has time left. A send that shares a failed dial
-receives that dial's error under the same conditions. When the direct-only restart tests were run
-on a multi-thread runtime, iroh could redial the peer's old address immediately after a stall
-close. M1 relies on the tower path for recovery in this case.
+returns `Disconnected` even if the deadline has time left.
+
+After an outgoing dial ends in `Timeout` or `Disconnected`, each waiting send with time left can
+start or join one fresh dial within its original deadline. This applies to the send that started
+the failed dial as well. An already open link can serve the send, and a pending incoming hello
+can make a new outgoing dial unnecessary. Authorization refusals and bad hellos keep their own
+errors. With another candidate station available, the sender can skip this failed-dial retry.
+It then returns the observed failure even if another caller has started a fresh outgoing dial.
+An admitted link or an incoming hello can still serve the send. The existing recovery after a
+stale connection or lost election is available either way.
+
+If the link redials before iroh processes the close, iroh sends the dial's packets only to
+the old address while that path is still selected. Processing the last connection's close clears
+the selected path, so a subsequent resolution can start an address lookup. `numbers` installs
+`TowerLookup`, which supplies relay URLs. In M1 a peer that restarts on a new port is reached
+again through a tower or by dialing in. The direct-only restart test uses a stale in-memory
+lookup for the first redial. It publishes the new address after that redial's
+first packet, so the first dial times out regardless of whether iroh has cleared the selected
+path yet. The shared dial timeout tests check recovery and the retry limit directly.
 [#120](https://github.com/tiltbob/thecompany/issues/120)
 
 If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
@@ -286,16 +301,24 @@ and skips that early check. If the connection is still current and has received 
 authenticated QUIC frames since before the request was written, the sender closes it.
 
 On that first attempt, a send waiting to open a stream also checks for authenticated QUIC
-frames. The wait for stream credit allows the greater of `connect_timeout` and the configured
-5 s transport keepalive plus 1 s for its acknowledgement. A quiet link can take a keepalive
-to transmit its queued STREAMS_BLOCKED frame. The observation stays with the current connection
-across short sends and resets when new authenticated frames arrive. A caller checks only within
-its original send deadline. If the observed connection is still current and has made
-no progress for the full interval, the sender closes it and can redial. QUIC replenishes
-credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
-An opt-in tower announcement takes one of those credits, so 13 unanswered chat sends can
-exhaust them.
+frames. The progress window is `max(connect_timeout, 6 s)`, allowing at least the configured
+5 s keepalive interval plus a 1 s margin. The observation stays with the current connection
+across short sends and resets when new authenticated frames arrive. A send that first observes
+a stall can close the connection only if its remaining budget exceeds the window. A later send
+can use the same observation to close and redial if the connection is still current and has made
+no progress for the full window. A caller checks only within its original send deadline.
+QUIC replenishes credits in batches. A crash with 14 unanswered
+sends can exhaust those credits on loopback. An opt-in tower announcement takes one of those
+credits, so 13 unanswered chat sends can exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
+
+A quiet link can take a keepalive to transmit its queued `STREAMS_BLOCKED` frame. Both sides
+reset their keepalive timers when they send a packet or receive an authenticated packet. The gap
+between frames at the waiting sender can be about 5 s or about 5 s plus a round trip, depending
+on which timer fires first. On a lossless path with a measured 1.53 s round trip, the gap reached
+6.48 s and the 6 s window caused a healthy credit-blocked link to close. Packet loss can lengthen
+the gap further.
+[#148](https://github.com/tiltbob/thecompany/issues/148)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that
 connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
@@ -660,10 +683,12 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
-  31 s. At the QUIC layer, keepalive is 5 s and idle timeout is 30 s; a dial to an
-  offline peer, or one whose filter ignores us, fails only by that timeout (30.0 s), and a peer
-  killed without closing is noticed after 30.0 s. Two processes on one node key: the relay keeps
-  only the newest, and the older one notices nothing (measured with two endpoints in one process).
+  31 s. iroh defaults to 5 s for both connection and path keepalives and ignores a path interval
+  above 5 s. `numbers` explicitly sets both intervals to 5 s. noq's default connection idle
+  timeout is 30 s. A dial to an offline peer, or one whose filter ignores us, fails only by that
+  timeout (30.0 s), and a peer killed without closing is noticed after 30.0 s. With two processes
+  on one node key, the relay keeps only the newest, and the older one notices nothing (measured
+  with two endpoints in one process).
   Sockets close only when every `Endpoint` clone is dropped; a rebind of the same port right after
   the last drop failed in about 6 of 45 runs and succeeded on a retry within 11 ms. With healthy
   peers, `router.shutdown()` including the close took 2–11 ms. iOS kills an app that holds a file

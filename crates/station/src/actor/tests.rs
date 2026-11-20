@@ -3,13 +3,14 @@ use std::future::ready;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-use numbers::link::LINK_ALPN;
+use numbers::link::{LINK_ALPN, LinkConfig};
 use numbers::{Endpoint, EndpointConfig, generate_node_key, node_id};
 
 use super::*;
 
 mod book_rules;
 mod delivery_deadline;
+mod delivery_failover;
 mod incoming_chat;
 mod removal;
 mod send_rules;
@@ -43,13 +44,11 @@ async fn actor_fixture(data_dir: &Path) -> (Actor, Link) {
     .await
     .unwrap_or_else(|_| panic!("bind actor fixture endpoint"));
     let budget = Duration::from_secs(2);
-    let (link, _incoming) = Link::start(
-        endpoint,
-        numbers::link::LinkConfig {
-            connect_timeout: budget,
-            send_deadline: budget,
-        },
-    );
+    let config = LinkConfig {
+        connect_timeout: budget,
+        send_deadline: budget,
+    };
+    let (link, _incoming) = Link::start(endpoint, config);
     let status = Status {
         station_id: own_id.to_string(),
         instance_id: "fixture".to_owned(),

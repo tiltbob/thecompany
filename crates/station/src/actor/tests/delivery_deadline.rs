@@ -25,9 +25,9 @@ pub(super) fn checked<T, E>(result: Result<T, E>, operation: &str) -> T {
     result.unwrap_or_else(|_| panic!("{operation}"))
 }
 
-pub(super) async fn bind(key: &[u8; 32], peer: NodeId) -> Endpoint {
+pub(super) async fn bind(key: &[u8; 32], peers: impl IntoIterator<Item = NodeId>) -> Endpoint {
     let authorizer = Arc::new(Authorizer::new(&[LINK_ALPN], &[CHAT_PROTOCOL]));
-    authorizer.replace_peers([(peer, "peer".into())]);
+    authorizer.replace_peers(peers.into_iter().map(|peer| (peer, "peer".into())));
     checked(
         Endpoint::bind(
             key,
@@ -58,8 +58,8 @@ async fn connect() -> (Link, Endpoint, Connection) {
     let peer_key = generate_node_key();
     let local_id = node_id(&local_key);
     let peer_id = node_id(&peer_key);
-    let endpoint = bind(&local_key, peer_id).await;
-    let peer = bind(&peer_key, local_id).await;
+    let endpoint = bind(&local_key, [peer_id]).await;
+    let peer = bind(&peer_key, [local_id]).await;
     let address = EndpointAddr::new(local_id).with_ip_addr(endpoint.iroh().bound_sockets()[0]);
     let (link, _inbox) = Link::start(
         endpoint,
@@ -118,7 +118,7 @@ async fn ready_reply_survives_deadline(reply: ChatReply, expected: MessageStatus
         link.handle(),
         vec![peer.iroh().id()],
         message,
-        deadline
+        deadline,
     ));
     let mut reply_stream = tokio::select! {
         biased;

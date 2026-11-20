@@ -148,13 +148,16 @@ appears offline, or has not added you": an unknown caller is ignored, which look
 
 A send to a peer with several stations tries connected stations first, preserving peer-book order
 within each group. It tries one station at a time using the same message ID and one deadline, and
-stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets the
-send try the next station within the same deadline. A station admits at most 1,000 concurrent sends
-and returns an internal error if it is full. While the station is running, it publishes the final
-outcome even after its message leaves the log. The receiving station keeps the 1,000 most recent
-unique receipts across all peers in memory, keyed by peer name and message ID. Duplicate
-acknowledgements leave that order alone. Older receipts and those from a prior station instance
-can be accepted again.
+stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets it
+try the next station within the same deadline. The final candidate can retry a failed outgoing
+dial once. Earlier candidates advance after a failed dial, while keeping the usual recovery for
+a stale connection or a lost election. The same deadline also lets a connected station's reply
+arrive late in the send budget. A station admits at most 1,000 concurrent sends and returns an
+internal error if it is full. While the station is running, it publishes the final outcome even
+after its message leaves the log. The receiving station keeps the 1,000 most recent unique
+receipts across all peers in memory, keyed by peer name and message ID. Duplicate acknowledgements
+leave that order alone. Receipt deduplication applies within one station. Older receipts and those
+from a prior station instance can be accepted again.
 
 The private data directory must be on a local filesystem so the station can rely on its exclusive
 lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the

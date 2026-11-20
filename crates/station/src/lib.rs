@@ -47,7 +47,8 @@ pub struct StationConfig {
     pub tower_url: String,
     /// Which IP sockets the endpoint binds. Use `RelayOnly` to disable direct paths.
     pub ip_transport: IpTransport,
-    /// Budget for connecting to one peer station.
+    /// Budget for one dial and its application hello. The last candidate can retry a failed
+    /// dial within the send budget. An earlier candidate advances to the next after a failed dial.
     pub connect_timeout: Duration,
     /// Total budget for one send across all candidate stations.
     pub send_deadline: Duration,
