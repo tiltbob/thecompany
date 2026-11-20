@@ -8,6 +8,7 @@ use numbers::{Endpoint, EndpointConfig, generate_node_key, node_id};
 
 use super::*;
 
+mod book_rules;
 mod delivery_deadline;
 mod incoming_chat;
 
