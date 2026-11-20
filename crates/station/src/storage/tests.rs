@@ -1,11 +1,18 @@
 use super::*;
 
 use std::fs::{self, Permissions};
+use std::future::ready;
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use chief::api::{ApiError, Event};
+use chief::client::{Client, Subscription};
 use numbers::node_id;
 use tempfile::TempDir;
+
+use crate::{IpTransport, StartError, Station, StationConfig};
 
 fn scratch() -> (TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("create scratch directory");
@@ -67,6 +74,32 @@ fn lock_excludes_another_start_and_the_same_inode_is_reused() {
     assert_eq!(fs::metadata(lock_path).expect("lock metadata").ino(), inode);
     let same_key = reopened.load_node_key().expect("read existing node key");
     assert!(key == same_key, "existing key was preserved");
+}
+
+#[test]
+fn startup_sync_runs_while_the_directory_is_locked_and_releases_the_lock_on_error() {
+    let (_temp, path) = scratch();
+    let result = Storage::lock_with_sync(&path, |dir| {
+        let checked = dir.metadata().expect("stat the directory being synced");
+        let expected = fs::metadata(&path).expect("stat the station directory");
+        assert_eq!(
+            (checked.dev(), checked.ino()),
+            (expected.dev(), expected.ino())
+        );
+        assert!(matches!(
+            Storage::lock(&path),
+            Err(StorageError::AlreadyRunning)
+        ));
+        Err(io::Error::other("injected directory sync failure"))
+    });
+    let Err(error @ StorageError::SyncDataDir) = result else {
+        panic!("startup must fail when the checked directory cannot be synced");
+    };
+    assert!(matches!(
+        StartError::from(error),
+        StartError::Storage { detail } if detail == "could not sync the station data directory"
+    ));
+    let _storage = Storage::lock(&path).expect("retry after the failed sync released the lock");
 }
 
 #[test]
@@ -199,12 +232,7 @@ fn rejects_malformed_duplicate_empty_and_self_entries() {
     let first = new_id();
     let second = new_id();
     let peer_path = path.join(PEER_FILE);
-    assert!(
-        storage
-            .load_peers(own)
-            .expect("absent peer book")
-            .is_empty()
-    );
+    assert!(storage.load_peers(own).expect("absent peer book").is_none());
 
     for invalid in [
         b"not json".as_slice(),
@@ -288,13 +316,13 @@ fn peer_book_round_trips_in_canonical_order_and_replaces_atomically() {
         SaveOutcome::Durable
     );
     assert_eq!(file_mode(&peer_path), 0o600);
-    assert!(storage.load_peers(own).expect("load peer book") == old);
+    assert!(storage.load_peers(own).expect("load peer book").as_ref() == Some(&old));
     let mut opened = File::open(&peer_path).expect("hold old peer book open");
     assert_eq!(
         storage.save_peers(&next, own).expect("replace peer book"),
         SaveOutcome::Durable
     );
-    assert!(storage.load_peers(own).expect("load replacement") == next);
+    assert!(storage.load_peers(own).expect("load replacement").as_ref() == Some(&next));
 
     let mut contents = Vec::new();
     opened
@@ -382,7 +410,13 @@ fn all_legacy_staging_names_can_be_occupied_without_blocking_a_save() {
             .expect("save with legacy stages present"),
         SaveOutcome::Durable
     );
-    assert!(storage.load_peers(own).expect("load committed peer book") == book);
+    assert!(
+        storage
+            .load_peers(own)
+            .expect("load committed peer book")
+            .as_ref()
+            == Some(&book)
+    );
     for index in 0..STAGING_ATTEMPTS {
         assert!(fs::read(legacy_path(index)).expect("read the legacy stage") == [index]);
     }
@@ -415,7 +449,13 @@ fn a_colliding_name_is_preserved_and_the_next_draw_commits() {
         SaveOutcome::Durable
     );
     assert!(suffixes.next().is_none());
-    assert!(storage.load_peers(own).expect("load replacement peer book") == book);
+    assert!(
+        storage
+            .load_peers(own)
+            .expect("load replacement peer book")
+            .as_ref()
+            == Some(&book)
+    );
     assert!(fs::read(&collision).expect("read the original entry") == b"keep");
     assert_eq!(file_mode(&collision), 0o644);
     assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 3);
@@ -452,7 +492,7 @@ fn sixteen_collisions_leave_the_book_and_all_stages_unchanged() {
         Err(StorageError::StagingNamesTaken(RecordFile::Peers))
     ));
     assert!(suffixes.next().is_none());
-    assert!(storage.load_peers(own).expect("load old book") == old);
+    assert!(storage.load_peers(own).expect("load old book").as_ref() == Some(&old));
     assert_eq!(
         fs::metadata(peer_path).expect("read unchanged inode").ino(),
         committed_inode
@@ -498,7 +538,7 @@ fn entropy_failure_after_a_collision_preserves_the_existing_files() {
         Err(StorageError::StageRecord(RecordFile::Peers))
     ));
     assert!(suffixes.next().is_none());
-    assert!(storage.load_peers(own).expect("load old book") == old);
+    assert!(storage.load_peers(own).expect("load old book").as_ref() == Some(&old));
     assert_eq!(
         fs::metadata(peer_path).expect("read unchanged inode").ino(),
         committed_inode
@@ -524,7 +564,8 @@ fn validation_failure_preserves_old_book_and_directory_sync_failure_commits() {
         storage
             .load_peers(own)
             .expect("load old book after rejection")
-            == old
+            .as_ref()
+            == Some(&old)
     );
 
     let next = single_peer("bob", new_id());
@@ -535,6 +576,181 @@ fn validation_failure_preserves_old_book_and_directory_sync_failure_commits() {
         })
         .expect("rename committed");
     assert_eq!(outcome, SaveOutcome::DurabilityUncertain);
-    assert!(storage.load_peers(own).expect("load committed replacement") == next);
+    assert!(
+        storage
+            .load_peers(own)
+            .expect("load committed replacement")
+            .as_ref()
+            == Some(&next)
+    );
     assert_eq!(fs::read_dir(path).expect("list fixtures").count(), 2);
+}
+
+fn offline_config(path: &Path) -> (StationConfig, TcpListener) {
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback port");
+    let address = reservation.local_addr().expect("read loopback port");
+    let mut config = StationConfig::new(path, format!("http://{address}/"));
+    config.ip_transport = IpTransport::RelayOnly;
+    (config, reservation)
+}
+
+fn peer_file_inode(path: &Path) -> u64 {
+    fs::metadata(path).expect("stat peer book").ino()
+}
+
+async fn assert_no_peer_event(events: &mut Subscription) {
+    loop {
+        let event = tokio::select! {
+            biased;
+            event = events.next() => event,
+            () = ready(()) => return,
+        };
+        assert!(
+            matches!(event, Some(Event::Status { .. })),
+            "no peer event was published"
+        );
+    }
+}
+
+const CASE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[tokio::test]
+async fn station_start_refuses_a_failed_directory_sync_before_creating_the_key() {
+    let (_temp, path) = scratch();
+    let (config, _reservation) = offline_config(&path);
+    tokio::time::timeout(CASE_TIMEOUT, async {
+        FAIL_NEXT_STARTUP_SYNC.set(true);
+        STARTUP_SYNCS.set(0);
+        let result = Station::start(config.clone()).await;
+        assert!(matches!(
+            result,
+            Err(StartError::Storage { detail }) if detail == "could not sync the station data directory"
+        ), "Station::start must run the startup directory sync");
+        assert!(!FAIL_NEXT_STARTUP_SYNC.get());
+        assert_eq!(STARTUP_SYNCS.get(), 0);
+        assert!(!path.join(KEY_FILE).exists());
+
+        let station = Station::start(config).await.expect("retry after failed sync");
+        assert_eq!(STARTUP_SYNCS.get(), 1);
+        assert!(path.join(KEY_FILE).is_file());
+        station.shutdown().await.expect("shut down after retry");
+    })
+    .await
+    .expect("startup sync test timed out");
+}
+
+#[tokio::test]
+async fn the_first_duplicate_add_after_restart_requires_a_durable_rewrite() {
+    let (_temp, path) = scratch();
+    let storage = Storage::lock(&path).expect("lock first station");
+    let own = node_id(&storage.load_node_key().expect("load first station key"));
+    let remote = new_id();
+    let book = single_peer("alice", remote);
+    storage.fail_next_peer_sync();
+    assert_eq!(
+        storage.save_peers(&book, own).expect("publish peer book"),
+        SaveOutcome::DurabilityUncertain
+    );
+    let book_path = path.join(PEER_FILE);
+    let published = File::open(&book_path).expect("hold published peer book open");
+    let published_inode = published
+        .metadata()
+        .expect("stat published peer book")
+        .ino();
+    let contents = fs::read(&book_path).expect("read published peer book");
+    drop(storage);
+
+    let (config, _reservation) = offline_config(&path);
+    tokio::time::timeout(CASE_TIMEOUT, async {
+        STARTUP_SYNCS.set(0);
+        let station = Station::start(config).await.expect("restart station");
+        assert_eq!(STARTUP_SYNCS.get(), 1);
+        assert_eq!(peer_file_inode(&book_path), published_inode);
+        let chief = Client::new(station.handle());
+        let mut events = chief.subscribe().await.expect("subscribe to peer events");
+        let remote_id = remote.to_string();
+        fs::set_permissions(&book_path, Permissions::from_mode(0o644))
+            .expect("make destination unsafe after loading the book");
+        assert!(matches!(
+            chief.peer_add("alice", &remote_id).await,
+            Err(ApiError::Internal { detail })
+                if detail == "could not use peers.json; it must be a regular file owned by this user with mode 0600"
+        ), "the restarted actor cannot acknowledge a failed rewrite");
+        assert_eq!(peer_file_inode(&book_path), published_inode);
+        fs::set_permissions(&book_path, Permissions::from_mode(0o600))
+            .expect("restore safe destination");
+
+        let peer = chief
+            .peer_add("alice", &remote_id)
+            .await
+            .unwrap_or_else(|_| panic!("duplicate add must succeed after the checked rewrite"));
+        assert_eq!(peer.name, "alice");
+        assert!(peer.stations.len() == 1 && peer.stations[0].station_id == remote_id);
+        let rewritten = File::open(&book_path).expect("hold rewritten peer book open");
+        let rewritten_inode = rewritten.metadata().expect("stat rewritten peer book").ino();
+        assert_ne!(rewritten_inode, published_inode, "the first success follows a rewrite");
+        assert!(fs::read(&book_path).expect("read confirmed peer book") == contents);
+        assert!(chief.peer_add("alice", &remote_id).await.is_ok());
+        assert_eq!(
+            peer_file_inode(&book_path), rewritten_inode,
+            "a confirmed book needs no second rewrite"
+        );
+        assert_no_peer_event(&mut events).await;
+        station
+            .shutdown()
+            .await
+            .expect("shut down restarted station");
+    })
+    .await
+    .expect("station restarted and handled the duplicate add");
+}
+
+#[tokio::test]
+async fn an_absent_remove_confirms_an_existing_empty_book_without_creating_a_missing_one() {
+    tokio::time::timeout(CASE_TIMEOUT, async {
+        for exists in [false, true] {
+            let (_temp, path) = scratch();
+            let book_path = path.join(PEER_FILE);
+            let published = exists.then(|| {
+                let storage = Storage::lock(&path).expect("lock for the empty book");
+                assert_eq!(
+                    storage
+                        .save_peers(&PeerBook::new(), new_id())
+                        .expect("save empty book"),
+                    SaveOutcome::Durable
+                );
+                File::open(&book_path).expect("hold existing empty book open")
+            });
+            let (config, _reservation) = offline_config(&path);
+            let station = Station::start(config).await.expect("start with no peers");
+            let chief = Client::new(station.handle());
+            let mut events = chief.subscribe().await.expect("subscribe to peer events");
+            assert!(matches!(
+                chief.peer_remove("absent").await,
+                Err(ApiError::PeerNotFound { name }) if name == "absent"
+            ));
+            if let Some(mut published) = published {
+                let original_inode = published
+                    .metadata()
+                    .expect("stat existing empty book")
+                    .ino();
+                assert_ne!(
+                    peer_file_inode(&book_path),
+                    original_inode,
+                    "confirm the empty book"
+                );
+                let mut contents = Vec::new();
+                published
+                    .read_to_end(&mut contents)
+                    .expect("read original empty book");
+                assert!(fs::read(&book_path).expect("read confirmed empty book") == contents);
+            } else {
+                assert!(!book_path.exists());
+            }
+            assert_no_peer_event(&mut events).await;
+            station.shutdown().await.expect("shut down with no peers");
+        }
+    })
+    .await
+    .expect("empty book confirmation test timed out");
 }

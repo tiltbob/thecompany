@@ -75,7 +75,10 @@ impl BookFixture {
             .storage
             .load_peers(self.actor.own_id)
             .expect("read saved book");
-        assert!(saved == self.book, "the book on disk is unchanged");
+        assert!(
+            saved.as_ref() == Some(&self.book),
+            "the book on disk is unchanged"
+        );
     }
 
     async fn shutdown(self) {

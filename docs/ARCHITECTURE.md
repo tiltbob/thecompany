@@ -552,8 +552,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
-  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
-  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
+  `EndpointConfig` defaults to WebPKI roots and system DNS. Custom DER roots can extend or replace
+  WebPKI, and an invalid root fails binding. An explicit UDP nameserver can replace system DNS.
+  Both DNS modes disable public fallback for relay connections and probes.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
