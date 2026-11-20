@@ -1,25 +1,16 @@
 //! `numbers`: the network library.
 //!
-//! It will hold node identity, the tower set, the iroh endpoint and its gate (the one
-//! authorization point), the link between two nodes, and the protocols that run over it (chat
-//! first). It takes iroh without default features; see the dependency notes in
-//! `docs/ARCHITECTURE.md`.
+//! Node identity, tower lookup, and authenticated endpoints. The library takes iroh
+//! without default features, as described in `docs/ARCHITECTURE.md`.
 
-/// A node's id: the public half of its node key.
-pub type NodeId = iroh::EndpointId;
+pub mod endpoint;
+pub mod gate;
+pub mod identity;
+pub mod towers;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn node_id_round_trips_through_its_string_form() {
-        let key = iroh::SecretKey::generate();
-        let id: NodeId = key.public();
-        let text = id.to_string();
-        let parsed: NodeId = text.parse().unwrap();
-        assert_eq!(parsed, id);
-        // A key rebuilt from its bytes has the same id.
-        assert_eq!(iroh::SecretKey::from_bytes(&key.to_bytes()).public(), id);
-    }
-}
+pub use endpoint::{
+    Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+};
+pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
+pub use identity::{NodeId, generate_node_key, node_id};
+pub use towers::{TowerSet, TowerSetError};
