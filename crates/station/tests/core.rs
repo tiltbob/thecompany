@@ -487,6 +487,47 @@ async fn station_starts_while_the_tower_is_unavailable() {
     .await;
 }
 
+#[tokio::test]
+async fn zero_timeouts_are_refused_without_locking_the_data_directory() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let scratch = checked(tempfile::tempdir(), "create station test directory");
+            // This socket reserves a loopback port and never serves an HTTP response.
+            let offline = checked(
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)),
+                "reserve unavailable tower port",
+            );
+            let address = checked(offline.local_addr(), "read local tower address");
+            let url = format!("http://{address}/");
+            let valid = config(
+                &scratch.path().join("station"),
+                &url,
+                IpTransport::RelayOnly,
+            );
+            let mut zero_send = valid.clone();
+            zero_send.send_deadline = Duration::ZERO;
+            let mut zero_connect = valid.clone();
+            zero_connect.connect_timeout = Duration::ZERO;
+            for invalid in [zero_send, zero_connect] {
+                assert!(matches!(
+                    Station::start(invalid).await,
+                    Err(StartError::InvalidTimeouts)
+                ));
+                let (station, _client) = within(
+                    CONNECT_TIMEOUT,
+                    start(valid.clone()),
+                    "a valid start follows the refused one",
+                )
+                .await;
+                stop(station).await;
+            }
+        },
+        "zero timeout test timed out",
+    )
+    .await;
+}
+
 struct WirePeer {
     id: NodeId,
     link: Link,
