@@ -245,6 +245,8 @@ async fn the_home_observer_clears_denial_without_a_status_request() {
 async fn the_home_observer_stops_on_close_and_on_final_runtime_drop() {
     for explicit_close in [true, false] {
         let endpoint = relay_only(TowerSet::default()).await;
+        // Let the observer reach its watcher before testing runtime drop.
+        tokio::task::yield_now().await;
         let raw = endpoint.iroh().clone();
         let observer = endpoint.runtime._tower_observer.abort_handle();
         let control = endpoint.tower_control();
@@ -423,6 +425,48 @@ async fn a_tower_update_keeps_the_lock_while_its_notification_is_pending() {
     );
     nudge.as_mut().await.unwrap();
     set.as_mut().await.unwrap();
+    assert!(runtime.relays == second.relay_map());
+    endpoint.iroh().close().await;
+}
+
+#[tokio::test]
+async fn a_set_keeps_the_lock_while_its_map_edits_are_suspended() {
+    let (_first, first) = reserve_towers(MAX_TOWERS);
+    let (_second, second) = reserve_towers(2);
+    let endpoint = relay_only(TowerSet::default()).await;
+    let runtime = &endpoint.runtime;
+
+    let mut set_first = pin!(endpoint.set_towers(&first));
+    tokio::task::yield_now().await;
+    // Leave budget to acquire the lock and start applying the set. A notification send
+    // exhausts the budget before the remaining relay-map edits can run.
+    for _ in 0..126 {
+        consume_budget().await;
+    }
+    assert!(
+        poll_fn(|cx| Poll::Ready(set_first.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        !runtime.relays.is_empty(),
+        "the first set has edited the map"
+    );
+    assert!(
+        runtime.relays != first.relay_map(),
+        "the first set still has edits to make"
+    );
+
+    tokio::task::yield_now().await;
+    let mut set_second = pin!(endpoint.set_towers(&second));
+    assert!(
+        poll_fn(|cx| Poll::Ready(set_second.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "the second set waits for the first set's suspended map edit",
+    );
+    set_first.as_mut().await.unwrap();
+    set_second.as_mut().await.unwrap();
     assert!(runtime.relays == second.relay_map());
     endpoint.iroh().close().await;
 }

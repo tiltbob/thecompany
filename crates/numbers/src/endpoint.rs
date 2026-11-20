@@ -470,7 +470,8 @@ impl TowerControl {
     /// Reconciles the relay map with the configured set and requests a full net report if the
     /// set is nonempty. Call this when the home tower is missing or disconnected. A full report
     /// can change the home even when its connection works. While a report is running, a
-    /// periodic tick can replace a pending full-report request with an incremental one.
+    /// periodic tick or a minor network change can replace a pending full-report request with
+    /// an incremental one.
     ///
     /// If interrupted, a later [Self::set_towers] or nudge reconciles the map and delivers
     /// any interrupted map-edit notification. A cancelled request for an unchanged map

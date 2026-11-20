@@ -623,13 +623,15 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
   took it out of the map but left the home connection and the raw status as they were. The same
   can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
-  and `home_relay_status()` reports the actual home. The endpoint observes the home between
-  status calls and clears its remembered failure on an observed connection or home change.
+  and `home_relay_status()` reports the actual home. The `numbers::Endpoint` runs a task that
+  follows `home_relay_status()` between `tower_states()` calls and clears its remembered failure
+  on an observed connection or home change.
   Iroh's latest-value watcher can coalesce brief transitions. A map change requests a full net
   report even when `insert_relay` keeps the same configuration, so a nudge needs no removal.
-  If a report is already running, a periodic tick can replace that pending request with an
-  incremental report. A tower that denies an endpoint can still become its home when another tower is
-  in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
+  If a report is already running, a periodic tick or a minor network change can replace that
+  pending request with an incremental report. A tower that denies an endpoint can still become
+  its home when another tower is in the map (17 of 30) and keeps it; `remove_relay` of the denying
+  tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
   noticed a stopped tower (see Tower), it reported not connected 0–51 ms after `shutdown()` was
   called; the reconnect backoff (10 ms–16 s) has jitter, and gaps between attempts reached about
