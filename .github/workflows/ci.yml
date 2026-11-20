@@ -45,3 +45,7 @@ jobs:
         run: bash scripts/check-deps.sh
       - name: Lint guards
         run: bash scripts/check-lints.sh
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
