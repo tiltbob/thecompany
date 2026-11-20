@@ -52,6 +52,12 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 # The control group tree under /sys/fs/cgroup is read-only for the service.
 ProtectControlGroups=yes
+# No setting of the system clock or the hardware clock. adjtimex(2) and clock_adjtime(2) are
+# refused even for reading; the tower reads the clock with clock_gettime(2).
+ProtectClock=yes
+# The service gets its own copy of the host name and cannot change the host name or the domain
+# name. The tower takes its host name from tower.toml.
+ProtectHostname=yes
 
 [Install]
 WantedBy=multi-user.target
