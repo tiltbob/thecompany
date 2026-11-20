@@ -612,7 +612,7 @@ async fn candidate_pages_through_the_socket_make_one_read_each() {
                 &["--limit", "0", "--after-peer", "bob"][..],
                 Some("bob"),
                 0,
-                String::new(),
+                "no candidates\n".to_owned(),
             ),
         ] {
             let mut args = vec!["tower", "candidates"];

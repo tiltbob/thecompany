@@ -313,15 +313,15 @@ The station caps each cleaned tower error or denial reason at 1,024 UTF-8 bytes 
 ```
 tower serve --config /etc/numbers-tower/tower.toml    # TLS tower with allowlist and rate limit
 
-station run --domain example.com                      # SRV on the first run; the domain is stored
+station run --domain synthetic.invalid               # SRV on the first run; the domain is stored
 station run                                           # the remembered set; SRV only as above
-station run --tower https://tower1.example.com --tower https://tower2.example.com
+station run --tower https://tower1.synthetic.invalid --tower https://tower2.synthetic.invalid
                                                       # pins for this run; no SRV, not remembered
 station run --tower https://127.0.0.1:8443 --tower-ca cert.pem   # trust the certificate in cert.pem
 chief status                                         # installed towers and peer links
 chief tower candidates --limit 10                    # one candidate page
 chief tower candidates --after-peer bob --limit 10   # continue after bob
-chief tower add https://tower3.synthetic.invalid     # add the URL to the set
+chief tower add https://tower3.synthetic.invalid     # adopt a URL shown on a candidate page
 chief tower remove https://tower3.synthetic.invalid  # remove the URL from the set
 ```
 
@@ -402,6 +402,8 @@ run time.
   - towers protocol: a peer's extra tower shows as a candidate and is never connected to, added to
     the relay map or passed on, also after the station's own towers stop; a bad list is dropped
     whole; only peers in the peer book are heard (#81)
+  - tower CLI over a fake station socket covers candidate pages, probes, the empty terminal page,
+    and explicit add and remove outcomes (#122)
   - each binary parses the `ExecStart` of its systemd unit (#82)
 - CI also runs `systemd-analyze verify` on both units (#82), and generates the Swift bindings once
   #83 is unblocked.

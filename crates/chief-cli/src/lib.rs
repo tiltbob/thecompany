@@ -168,8 +168,9 @@
 //! - `peer rm`: `removed <name>`. `send`: `delivered to <peer>`. An empty `log`: `no messages`.
 //!
 //! - `tower candidates`: `candidate <peer> <url>` per entry. If more groups remain, one
-//!   `next-after-peer <peer>` line follows. The empty boundary prints as `""`. Peer names,
-//!   URLs and the continuation each occupy one field.
+//!   `next-after-peer <peer>` line follows. A page with no entries or continuation prints
+//!   `no candidates`. The empty boundary prints as `""`. Peer names, URLs and the continuation
+//!   each occupy one field.
 //! - `tower add`: `added <url>` or `<url> is already in the set`.
 //! - `tower remove`: `removed <url>` or `<url> is not in the set`.
 //!
@@ -367,7 +368,8 @@ pub enum TowerCommand {
     /// Read one live page of candidate towers
     ///
     /// Prints `candidate <peer> <url>` per URL. If another group remains, the last line is
-    /// `next-after-peer <peer>`. Pass that peer name to `--after-peer` for the next page. New
+    /// `next-after-peer <peer>`. A page with no entries or continuation prints `no candidates`.
+    /// Pass the continuation to `--after-peer` for the next page. New
     /// announcements or a station restart can change later pages. A zero limit probes for another
     /// group without listing any. To continue after a probe, raise the limit and keep your
     /// original boundary, omitting `--after-peer` if it was omitted for the probe. An empty
@@ -837,6 +839,9 @@ async fn tower_candidates<T: BindInstance>(
     out: &mut dyn Write,
 ) -> Outcome {
     let page = client.tower_candidates(after_peer, limit).await?;
+    if page.groups.is_empty() && page.next_after_peer.is_none() {
+        say(out, "no candidates")?;
+    }
     for group in page.groups {
         let peer = line_token(&group.peer);
         for candidate in group.candidates {

@@ -814,6 +814,7 @@ fn tower_help_describes_the_live_boundary_and_explicit_mutations() {
         "one live page",
         "candidate <peer> <url>",
         "next-after-peer <peer>",
+        "no candidates",
         "--after-peer <PEER>",
         "--limit <N>",
         "[default: 32]",
@@ -824,6 +825,18 @@ fn tower_help_describes_the_live_boundary_and_explicit_mutations() {
     }
     let remove = cli(&["tower", "remove", "--help"]).unwrap_err().to_string();
     assert!(remove.contains("SRV discovery can bring a removed URL back"));
+}
+
+#[tokio::test]
+async fn empty_candidate_listing_prints_no_candidates() {
+    bounded(async {
+        let client = Client::new(FakeStation::new("STATION-A", "INSTANCE-1"));
+        assert_eq!(
+            exec(&client, &["tower", "candidates"]).await,
+            (Exit::Done, "no candidates\n".to_owned(), String::new()),
+        );
+    })
+    .await;
 }
 
 #[derive(Clone)]
