@@ -949,7 +949,10 @@ mod tests {
         let Err(error) = Tower::spawn(TowerConfig::dev(bind)).await else {
             panic!("the port is taken");
         };
-        assert!(matches!(error, TowerError::Bind { .. }), "{error:?}");
+        assert!(
+            matches!(error, TowerError::Bind { .. }),
+            "a taken port is not reported as a bind error"
+        );
         assert_eq!(status_of(error), EXIT_FAILURE);
 
         let dir = tempfile::tempdir().unwrap();
@@ -963,7 +966,7 @@ mod tests {
         };
         assert!(
             matches!(error, TowerError::CertificateFile { .. }),
-            "{error:?}"
+            "a missing certificate file is not reported as a certificate file error"
         );
         assert_eq!(status_of(error), EXIT_FAILURE);
     }
