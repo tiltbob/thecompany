@@ -83,6 +83,15 @@ SystemCallArchitectures=native
 # way, and a newer libc may try such a call before it falls back to an older one.
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+# The service's /proc shows no process of another user.
+ProtectProc=invisible
+# The service's /proc holds only the process directories: /proc/sys, /proc/net, /proc/meminfo
+# and the other files about the kernel are hidden. The tower reads only /proc/self there
+# (maps, cgroup and mountinfo, seen when it was traced).
+ProcSubset=pid
+# What the service creates is private to its user. The tower makes its ACME cache directory
+# 0700 itself; this makes the key files that the ACME client writes into it 0600 instead of 0644.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
