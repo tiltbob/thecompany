@@ -795,7 +795,7 @@ fn status_help_describes_its_lines() {
         "denied (the tower refused this station, and trying again does not help until the \
          tower's operator changes that; the tower's reason follows; a tower of this project says \
          \"not on this tower's list\": give its operator the id that `chief id` prints)",
-        "configured (given when the station was started)",
+        "configured (given at startup or added by the chief without a matching peer announcement)",
         "remembered (stored by an earlier run)",
         "srv (found through the domain's DNS record)",
         "peer (named by a peer and added by the chief)",
@@ -2879,12 +2879,12 @@ async fn transport_errors_exit_3() {
     bounded(async {
         let cases = [
             (
-                // This chief speaks API version 2; a newer station.
+                // A newer station.
                 ApiError::IncompatibleApi {
-                    station: 3,
-                    client: 2,
+                    station: 4,
+                    client: 3,
                 },
-                "the station speaks API version 3 and this chief speaks version 2; use the same \
+                "the station speaks API version 4 and this chief speaks version 3; use the same \
                  release of both\n",
             ),
             (

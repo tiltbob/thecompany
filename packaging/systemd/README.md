@@ -239,3 +239,71 @@ The start line then says `certificate="files"`.
 while it runs. The tower reloads its certificate files once a day, but under this drop-in it
 reads the same copies again, so a renewed certificate is used only after
 `sudo systemctl restart numbers-tower`. With certbot, a deploy hook can run that command.
+
+## Running the station as a service
+
+`station.service` is a systemd user unit. Run these commands on the workstation as the chief who
+owns the station. Build and install the binaries and unit from the repository checkout.
+
+```bash
+cargo build --release --locked -p numbers-station-daemon -p chief-cli
+install -Dm 0755 target/release/station "$HOME/.local/bin/station"
+install -Dm 0755 target/release/chief "$HOME/.local/bin/chief"
+install -Dm 0644 packaging/systemd/station.service \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/station.service"
+systemctl --user daemon-reload
+```
+
+The shipped unit runs `station run` and uses the station's saved tower configuration. For a new
+station, start it once with your bootstrap domain and then press Ctrl+C after it has discovered
+and connected to a tower. Inspect `chief status` privately from a second terminal. Replace
+`example.com` with the team's bootstrap domain.
+
+```bash
+"$HOME/.local/bin/station" run --domain example.com
+```
+
+For explicit tower pins, a private CA, or other startup flags, use
+`systemctl --user edit station.service`. Clear `ExecStart` before replacing it. For example,
+this override uses a private CA with domain discovery. Adjust the domain and CA path.
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/station run --domain example.com --tower-ca %h/.config/thecompany/ca.pem
+```
+
+For pins, use `--tower URL` in the replacement command and omit `--domain`. Pins apply to the
+current run, so a one-off foreground run with pins leaves the saved configuration as it was.
+`--tower-ca` also applies to the current run. After editing the startup command, restart a running
+service with `systemctl --user restart station.service`.
+
+Both launches use `$XDG_DATA_HOME/thecompany/station`, or `$HOME/.local/share/thecompany/station`
+when `XDG_DATA_HOME` is absent, empty, or relative. With the default data directory and an
+absolute `XDG_RUNTIME_DIR`, the socket is `$XDG_RUNTIME_DIR/thecompany/station.sock`. Otherwise it
+is `station.sock` inside the data directory. Keep the same XDG settings in the user manager and
+your terminal if you customize them. If you set `--data-dir` to a nondefault directory, pass
+`--station PATH` to `chief` to select its socket.
+
+The daemon locks the data directory before opening the node key. A foreground invocation using
+the service's data directory therefore fails while the service owns the lock, and the service
+cannot take the same data directory while a foreground instance is running. Stop the foreground
+instance before starting the unit. Keep the data directory on a local filesystem so the daemon
+can rely on its file lock. Use the same data directory to preserve the station identity.
+
+```bash
+systemctl --user enable --now station.service
+systemctl --user status station.service
+journalctl --user -u station.service -o cat
+```
+
+`enable` sets the station to start with the user manager. To start it at boot and keep it running
+after logout, set `loginctl enable-linger "$USER"`. Whether you can enable lingering for your
+account depends on the workstation's login policy.
+
+The service restarts after a failure, with a five-second delay. Command-line errors exit with
+status 2 and prevent automatic restart. Other startup failures, including a missing tower
+configuration or a data directory lock held by another instance, exit with status 1. Check the
+journal and correct the cause before starting the service again if it reaches systemd's start
+limit. `systemctl --user stop station.service` sends SIGTERM. The station removes the socket
+before shutting down the core and releasing its data-directory lock.

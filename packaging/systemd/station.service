@@ -1,0 +1,14 @@
+# Install as a user unit. See packaging/systemd/README.md for initial tower configuration.
+[Unit]
+Description=numbers station
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/station run
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,8 +1,8 @@
 //! Persistent state of one station, behind its data-directory lock.
 //!
 //! As with `numbers_base::keyfile`, ancestors of the data directory must be writable only by
-//! the station user or root. The node key and peer book are opened relative to the checked
-//! directory's descriptor. The actor is the only peer-book writer. Stop it before editing the book.
+//! the station user or root. The node key and state records are opened relative to the checked
+//! directory's descriptor. The station holds the lock when writing state records.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -19,12 +19,16 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
+use crate::towers::{RememberedTowers, TowerRecordError};
+
 const LOCK_FILE: &str = "lock";
 const KEY_FILE: &str = "node.key";
 const PEER_FILE: &str = "peers.json";
+const TOWER_FILE: &str = "towers.json";
 const PEER_FILE_VERSION: u32 = 1;
 // This also leaves room for the link records in `Response::Peers` under the 1 MiB IPC cap.
 const PEER_FILE_MAX_BYTES: usize = 256 * 1024;
+const TOWER_FILE_MAX_BYTES: usize = 16 * 1024;
 const STAGING_ATTEMPTS: u8 = 16;
 const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const OPEN_PRIVATE: OFlags = OFlags::NOFOLLOW
@@ -35,17 +39,46 @@ const OPEN_PRIVATE: OFlags = OFlags::NOFOLLOW
 /// Names are sorted for snapshots. Each peer's stations stay in insertion order.
 pub(crate) type PeerBook = BTreeMap<String, Vec<NodeId>>;
 
-/// The result of a peer-book replacement once the new file is visible.
+/// The result of an atomic replacement once the new file is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
     Durable,
-    /// The rename committed, but syncing the directory failed. Apply the new book in memory.
+    /// The rename committed, but syncing the directory failed.
     DurabilityUncertain,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RecordFile {
+    Peers,
+    Towers,
+}
+
+impl RecordFile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Peers => PEER_FILE,
+            Self::Towers => TOWER_FILE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Peers => "peer book",
+            Self::Towers => "tower record",
+        }
+    }
+
+    fn max_bytes(self) -> usize {
+        match self {
+            Self::Peers => PEER_FILE_MAX_BYTES,
+            Self::Towers => TOWER_FILE_MAX_BYTES,
+        }
+    }
 }
 
 /// Displayable diagnostics deliberately omit user paths, IDs, and file contents.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StorageError {
+pub(super) enum StorageError {
     #[error("could not use the station data directory; it must be private and owned by this user")]
     DataDir,
     #[error(
@@ -59,23 +92,26 @@ pub(crate) enum StorageError {
     #[error("could not load or create node.key; check its owner, permissions and validity")]
     NodeKey,
     #[error(
-        "could not use peers.json; it must be a regular file owned by this user with mode 0600"
+        "could not use {}; it must be a regular file owned by this user with mode 0600",
+        .0.name()
     )]
-    PeerFile,
-    #[error("could not read peers.json")]
-    ReadPeers,
+    PrivateRecord(RecordFile),
+    #[error("could not read {}", .0.name())]
+    ReadRecord(RecordFile),
     #[error("invalid peers.json: {0}")]
     InvalidPeers(&'static str),
-    #[error("peer book exceeds the 256 KiB limit")]
-    PeerBookTooLarge,
-    #[error("could not create a private staging file for peers.json")]
-    StagePeers,
-    #[error("all staging names for peers.json are taken")]
-    StagingNamesTaken,
-    #[error("could not write or sync the staged peer book")]
-    WritePeers,
-    #[error("could not replace peers.json")]
-    ReplacePeers,
+    #[error("invalid towers.json: {0}")]
+    InvalidTowers(TowerRecordError),
+    #[error("{} exceeds the {} KiB limit", .0.label(), .0.max_bytes() / 1024)]
+    RecordTooLarge(RecordFile),
+    #[error("could not create a private staging file for {}", .0.name())]
+    StageRecord(RecordFile),
+    #[error("all staging names for {} are taken", .0.name())]
+    StagingNamesTaken(RecordFile),
+    #[error("could not write or sync the staged {}", .0.label())]
+    WriteRecord(RecordFile),
+    #[error("could not replace {}", .0.name())]
+    ReplaceRecord(RecordFile),
 }
 
 /// The station's checked data directory and the lock held until the actor stops.
@@ -84,6 +120,8 @@ pub(crate) struct Storage {
     _lock: File,
     #[cfg(test)]
     fail_peer_sync: Cell<bool>,
+    #[cfg(test)]
+    fail_tower_sync: Cell<bool>,
 }
 
 impl Storage {
@@ -116,6 +154,8 @@ impl Storage {
                 _lock: lock,
                 #[cfg(test)]
                 fail_peer_sync: Cell::default(),
+                #[cfg(test)]
+                fail_tower_sync: Cell::default(),
             }),
             Err(TryLockError::WouldBlock) => Err(StorageError::AlreadyRunning),
             Err(TryLockError::Error(_)) => Err(StorageError::TakeLock),
@@ -129,26 +169,9 @@ impl Storage {
     }
 
     pub(crate) fn load_peers(&self, own_id: NodeId) -> Result<PeerBook, StorageError> {
-        if !check_private_entry(&self.dir, PEER_FILE).map_err(|_| StorageError::PeerFile)? {
+        let Some(bytes) = self.read_record(RecordFile::Peers)? else {
             return Ok(PeerBook::new());
-        }
-        let file = rustix::fs::openat(
-            &self.dir,
-            PEER_FILE,
-            OFlags::RDONLY | OPEN_PRIVATE,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(|_| StorageError::ReadPeers)?;
-        check_private_file(&file).map_err(|_| StorageError::PeerFile)?;
-
-        let mut bytes = Vec::new();
-        file.take(PEER_FILE_MAX_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| StorageError::ReadPeers)?;
-        if bytes.len() > PEER_FILE_MAX_BYTES {
-            return Err(StorageError::PeerBookTooLarge);
-        }
+        };
         let disk: DiskBook = serde_json::from_slice(&bytes)
             .map_err(|_| StorageError::InvalidPeers("expected a versioned peer book"))?;
         disk.into_book(own_id)
@@ -161,12 +184,9 @@ impl Storage {
         own_id: NodeId,
     ) -> Result<SaveOutcome, StorageError> {
         validate_book(book, own_id)?;
-        let bytes =
-            serde_json::to_vec(&DiskBook::from_book(book)).map_err(|_| StorageError::WritePeers)?;
-        if bytes.len() > PEER_FILE_MAX_BYTES {
-            return Err(StorageError::PeerBookTooLarge);
-        }
-        self.replace_peers(&bytes, |dir| {
+        let bytes = serde_json::to_vec(&DiskBook::from_book(book))
+            .map_err(|_| StorageError::WriteRecord(RecordFile::Peers))?;
+        self.replace_record(RecordFile::Peers, &bytes, |dir| {
             #[cfg(test)]
             if self.fail_peer_sync.replace(false) {
                 return Err(io::ErrorKind::Other.into());
@@ -180,18 +200,78 @@ impl Storage {
         self.fail_peer_sync.set(true);
     }
 
-    fn replace_peers(
+    pub(super) fn load_towers(&self) -> Result<Option<RememberedTowers>, StorageError> {
+        self.read_record(RecordFile::Towers)?
+            .map(|bytes| RememberedTowers::decode(&bytes))
+            .transpose()
+            .map_err(StorageError::InvalidTowers)
+    }
+
+    /// Any error leaves the previous tower record unchanged.
+    pub(super) fn save_towers(
         &self,
+        record: &RememberedTowers,
+    ) -> Result<SaveOutcome, StorageError> {
+        let bytes = record
+            .encode()
+            .map_err(|_| StorageError::WriteRecord(RecordFile::Towers))?;
+        self.replace_record(RecordFile::Towers, &bytes, |dir| {
+            #[cfg(test)]
+            if self.fail_tower_sync.replace(false) {
+                return Err(io::ErrorKind::Other.into());
+            }
+            dir.sync_all()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_tower_sync(&self) {
+        self.fail_tower_sync.set(true);
+    }
+
+    fn read_record(&self, record: RecordFile) -> Result<Option<Vec<u8>>, StorageError> {
+        if !check_private_entry(&self.dir, record.name())
+            .map_err(|_| StorageError::PrivateRecord(record))?
+        {
+            return Ok(None);
+        }
+        let file = rustix::fs::openat(
+            &self.dir,
+            record.name(),
+            OFlags::RDONLY | OPEN_PRIVATE,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| StorageError::ReadRecord(record))?;
+        check_private_file(&file).map_err(|_| StorageError::PrivateRecord(record))?;
+
+        let mut bytes = Vec::new();
+        file.take(record.max_bytes() as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| StorageError::ReadRecord(record))?;
+        if bytes.len() > record.max_bytes() {
+            return Err(StorageError::RecordTooLarge(record));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn replace_record(
+        &self,
+        record: RecordFile,
         bytes: &[u8],
         sync_dir: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<SaveOutcome, StorageError> {
-        let mut stage = StagedBook::create(&self.dir)?;
+        if bytes.len() > record.max_bytes() {
+            return Err(StorageError::RecordTooLarge(record));
+        }
+        let mut stage = StagedRecord::create(&self.dir, record)?;
         stage
             .file
             .write_all(bytes)
             .and_then(|()| stage.file.sync_all())
-            .map_err(|_| StorageError::WritePeers)?;
-        check_private_entry(&self.dir, PEER_FILE).map_err(|_| StorageError::PeerFile)?;
+            .map_err(|_| StorageError::WriteRecord(record))?;
+        check_private_entry(&self.dir, record.name())
+            .map_err(|_| StorageError::PrivateRecord(record))?;
         stage.commit()?;
         Ok(match sync_dir(&self.dir) {
             Ok(()) => SaveOutcome::Durable,
@@ -259,17 +339,18 @@ fn set_private_mode(file: &File) -> io::Result<()> {
     check_private_file(file)
 }
 
-struct StagedBook<'a> {
+struct StagedRecord<'a> {
     dir: &'a File,
+    record: RecordFile,
     name: String,
     file: File,
     committed: bool,
 }
 
-impl<'a> StagedBook<'a> {
-    fn create(dir: &'a File) -> Result<Self, StorageError> {
+impl<'a> StagedRecord<'a> {
+    fn create(dir: &'a File, record: RecordFile) -> Result<Self, StorageError> {
         for index in 0..STAGING_ATTEMPTS {
-            let name = staging_name(index);
+            let name = staging_name(record, index);
             match rustix::fs::openat(
                 dir,
                 name.as_str(),
@@ -279,29 +360,30 @@ impl<'a> StagedBook<'a> {
                 Ok(fd) => {
                     let stage = Self {
                         dir,
+                        record,
                         name,
                         file: File::from(fd),
                         committed: false,
                     };
-                    set_private_mode(&stage.file).map_err(|_| StorageError::StagePeers)?;
+                    set_private_mode(&stage.file).map_err(|_| StorageError::StageRecord(record))?;
                     return Ok(stage);
                 }
                 Err(Errno::EXIST) => {}
-                Err(_) => return Err(StorageError::StagePeers),
+                Err(_) => return Err(StorageError::StageRecord(record)),
             }
         }
-        Err(StorageError::StagingNamesTaken)
+        Err(StorageError::StagingNamesTaken(record))
     }
 
     fn commit(mut self) -> Result<(), StorageError> {
-        rustix::fs::renameat(self.dir, self.name.as_str(), self.dir, PEER_FILE)
-            .map_err(|_| StorageError::ReplacePeers)?;
+        rustix::fs::renameat(self.dir, self.name.as_str(), self.dir, self.record.name())
+            .map_err(|_| StorageError::ReplaceRecord(self.record))?;
         self.committed = true;
         Ok(())
     }
 }
 
-impl Drop for StagedBook<'_> {
+impl Drop for StagedRecord<'_> {
     fn drop(&mut self) {
         if !self.committed {
             let _ = rustix::fs::unlinkat(self.dir, self.name.as_str(), AtFlags::empty());
@@ -309,8 +391,8 @@ impl Drop for StagedBook<'_> {
     }
 }
 
-fn staging_name(index: u8) -> String {
-    format!(".peers.json.{}.{index}.tmp", std::process::id())
+fn staging_name(record: RecordFile, index: u8) -> String {
+    format!(".{}.{}.{index}.tmp", record.name(), std::process::id())
 }
 
 #[derive(Serialize, Deserialize)]

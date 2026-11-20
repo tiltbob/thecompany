@@ -160,18 +160,20 @@ again. So a station watches its home tower (below).
   peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
   and never passes one on; a chief may take one into the set with an explicit command (decided in
   #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
-- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
-  tower that is not connected, for some seconds, and never while the home tower is connected. Then
-  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
-  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+- **A station watches its home tower.** After some seconds with no home or a disconnected home,
+  it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
+  configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
+  connected home alone. A tower that denies the station is marked and shown with the reason. It
   is taken out of the relay map only if another tower of the set is not marked denied; if it is
   the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
   only when the set changes or at a long interval. The station limits its own attempts; it does not
   control iroh's own retries (decided in #74, built in #78).
-  Station API version 2 represents an unobserved tower as `Standby`, including when there is no
-  home tower observation. An explicit refusal remains `Denied`. Status can also carry the source
-  of each tower and the SRV bootstrap domain.
+  Station API version 2 introduced `Standby` for an unobserved tower, including when there is
+  no home tower observation, and optional tower sources and SRV bootstrap domain in Status. An
+  explicit refusal remains `Denied`. Version 3 defines bounded pages of candidate URLs with
+  their supplying peers and explicit requests to add or remove a tower. Status and subscription
+  events cover the installed set.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
@@ -516,8 +518,9 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   `[::]` (per upstream's `test_bind_addr_no_clear`; the lab host had no IPv6), so tests use
   `.clear_ip_transports().bind_addr((LOCALHOST, 0))?` for exactly one socket on 127.0.0.1. `bind()`
   takes 3–5 ms, with or without a reachable tower.
-  `EndpointConfig` defaults to WebPKI roots and system DNS with public fallback disabled. Until the
-  TLS and DNS settings are wired, binding with custom roots or an explicit nameserver returns an error.
+  `EndpointConfig` defaults to WebPKI roots and system DNS. Custom DER roots can extend or replace
+  WebPKI, and an invalid root fails binding. An explicit UDP nameserver can replace system DNS.
+  Both DNS modes disable public fallback for relay connections and probes.
 - **Relay map.** The bare-URL constructors assume QAD on UDP 7842. An endpoint with IP sockets
   plans QAD probes per IP family for which the host has a usable address (IPv4: non-loopback; IPv6:
   global or unique-local), and against a plain-HTTP tower each waits out a 3 s timeout: on the
@@ -609,7 +612,10 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  took it out of the map but left the home connection and the status as they were. A tower that
+  took it out of the map but left the home connection and the raw status as they were. The same
+  can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
+  and `home_relay_status()` reports the actual home. A map change schedules a full net report
+  even when `insert_relay` keeps the same configuration, so a nudge needs no removal. A tower that
   denies an endpoint can still become its home when another tower is
   in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
