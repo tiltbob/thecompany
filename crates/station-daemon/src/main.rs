@@ -3,11 +3,7 @@
 use std::process::ExitCode;
 
 fn banner() -> String {
-    format!(
-        "station {}: not implemented yet (data dir would be $XDG_DATA_HOME/{})",
-        env!("CARGO_PKG_VERSION"),
-        numbers_station::DATA_DIR_SUBPATH
-    )
+    format!("station {}: not implemented yet", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() -> ExitCode {
@@ -18,9 +14,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn banner_names_the_binary() {
-        let b = super::banner();
-        assert!(b.starts_with("station "));
-        assert!(b.contains("thecompany/station"));
+    fn banner_names_the_binary_and_version() {
+        assert_eq!(
+            super::banner(),
+            format!("station {}: not implemented yet", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
