@@ -130,10 +130,11 @@
 //!     field `name`); the form of the station id ([`ApiError::Invalid`], field `station_id`; what
 //!     a valid id looks like is the station's to say); the station's own id
 //!     ([`ApiError::Invalid`], field `station_id`); a station that belongs to another peer
-//!     ([`ApiError::StationTaken`]). [`Request::PeerRemove`] fails the
-//!     peer's outgoing messages that are still `Sending` (rule 7, with their events), closes its
-//!     links and pushes [`Event::PeerRemoved`]. Any other change of a link pushes [`Event::Peer`]
-//!     with the whole peer; the links that `PeerRemove` closes push no [`Event::Peer`]:
+//!     ([`ApiError::StationTaken`]). Returned station IDs may use the station's canonical
+//!     representation. [`Request::PeerRemove`] fails the peer's outgoing messages that are still
+//!     `Sending` (rule 7, with their events), closes its links and pushes [`Event::PeerRemoved`].
+//!     Any other change of a link pushes [`Event::Peer`] with the whole peer; the links that
+//!     `PeerRemove` closes push no [`Event::Peer`]:
 //!     [`Event::PeerRemoved`] stands for the whole peer, its links included.
 //! 11. **End of a subscription.** A subscription ends when the station stops or the transport
 //!     loses its connection: [`crate::client::Subscription::next`] returns the events still queued,
@@ -525,7 +526,7 @@ pub enum ApiError {
     },
     /// [`Request::PeerAdd`] named a station that already belongs to another peer.
     StationTaken {
-        /// The station asked for.
+        /// The requested station, which may be returned in canonical form.
         station_id: String,
         /// The peer it belongs to.
         peer: String,

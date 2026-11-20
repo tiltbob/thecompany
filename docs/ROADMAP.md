@@ -143,6 +143,29 @@ appears offline, or has not added you": an unknown caller is ignored, which look
 `--tower` is required on every `station run` in M1; nothing about towers is persisted yet.
 `peer rm` closes the link to that peer.
 
+A send to a peer with several stations tries connected stations first, preserving peer-book order
+within each group. It tries one station at a time using the same message ID and one deadline, and
+stops on an acknowledgement or explicit refusal. An unavailable reply or transport error lets the
+send try the next station within the same deadline. A station admits at most 1,000 concurrent sends
+and returns an internal error if it is full. While the station is running, it publishes the final
+outcome even after its message leaves the log. The receiving station keeps the 1,000 most recent
+unique receipts across all peers in memory, keyed by peer name and message ID. Duplicate
+acknowledgements leave that order alone. Older receipts and those from a prior station instance
+can be accepted again.
+
+The private data directory must be on a local filesystem so the station can rely on its exclusive
+lock. The directory holds the stable lock file, `node.key`, and `peers.json`. The station loads the
+node key relative to the checked directory handle used for the lock. The peer book is a version-1
+object with a list of peer records, each containing a name and ordered canonical station IDs. It
+is capped at 256 KiB. Peer mutations stage and sync the replacement before an atomic
+rename and directory sync. If the rename succeeds but directory sync fails, the station applies
+the visible book and reports that the change may not survive a crash. While that running station
+has an uncertain book, a duplicate peer add or a remove of an absent peer rewrites the current book
+and syncs the directory before giving its usual answer. These retries emit no additional events.
+The saved file contains no network path state or message history. While the actor writes and syncs
+the peer book, command replies and event processing can pause. An incoming chat can receive
+`Unavailable` if its bounded mailbox fills during that time.
+
 **Deliberately not in M1:** TLS, SRV bootstrap, several towers, a tower set that changes at runtime,
 non-loopback plain HTTP, tower allowlist, running the station as a service (all M2); chiefs as
 identities, roster, invites (M3); airspace (M4); durable history and offline delivery (M9); GUI,
