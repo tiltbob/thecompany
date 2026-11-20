@@ -72,6 +72,17 @@ LockPersonality=yes
 # reading a real-time clock (ProtectClock= above allows that), and the raw I/O port calls are
 # refused. The tower needs no other device.
 PrivateDevices=yes
+# No memory can be writable and executable at once, and no mapping can be made executable later.
+# The tower generates no code at run time.
+MemoryDenyWriteExecute=yes
+# Only system calls of the architecture systemd was built for. A call through another ABI's entry
+# point (i386 on x86-64) gets SIGSYS, so it cannot get around the filters of this unit.
+SystemCallArchitectures=native
+# Only the system calls of systemd's @system-service set. A call outside it fails with EPERM
+# instead of killing the service: systemd 250 to 254 treat calls newer than themselves the same
+# way, and a newer libc may try such a call before it falls back to an older one.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
