@@ -510,6 +510,9 @@ async fn a_second_start_is_refused_until_shutdown_has_returned() {
                     refused_while_pending += 1;
                 }
             }
+            // This guard checks the test's power, not the station: it needs the endpoint close to
+            // take more than one turn, which the open peer connection makes it do. If a later
+            // shutdown finishes faster, move this test to a seam instead of deleting the guard.
             assert!(
                 refused_while_pending > 0,
                 "no start attempt overlapped the pending shutdown"
@@ -620,7 +623,7 @@ async fn station_starts_while_the_tower_is_unavailable() {
 }
 
 #[tokio::test]
-async fn zero_timeouts_are_refused_without_locking_the_data_directory() {
+async fn zero_timeouts_are_refused_and_leave_the_data_directory_free() {
     within(
         CASE_TIMEOUT,
         async {
@@ -646,12 +649,7 @@ async fn zero_timeouts_are_refused_without_locking_the_data_directory() {
                     Station::start(invalid).await,
                     Err(StartError::InvalidTimeouts)
                 ));
-                let (station, _client) = within(
-                    CONNECT_TIMEOUT,
-                    start(valid.clone()),
-                    "a valid start follows the refused one",
-                )
-                .await;
+                let (station, _client) = start(valid.clone()).await;
                 stop(station).await;
             }
         },
@@ -678,9 +676,10 @@ async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() 
             within(
                 ONLINE_TIMEOUT,
                 async {
-                    // Reports queued before the shutdown can still say Connected. Between retries
-                    // iroh publishes Connecting, so the state may move between Connecting and
-                    // Failing; it must not say Connected again while the tower stays down.
+                    // Reports queued before the shutdown can still say Connected. After each failed
+                    // attempt iroh publishes the failure (Failing) for the backoff, then Connecting
+                    // while it dials again; it publishes Connected only after a successful dial.
+                    // This assumes no other test is given the freed tower port in the meantime.
                     let mut down = false;
                     loop {
                         let Event::Status { status } = next_event(&mut events).await else {

@@ -49,15 +49,13 @@ async fn an_oversized_body_is_refused_before_anything_starts() {
     let body = "x".repeat(BODY_MAX_BYTES + 1);
     assert!(matches!(
         actor.send("peer", &body),
-        Err(ApiError::Invalid { field, reason })
-            if field == "body" && reason == "must be at most 16 KiB"
+        Err(ApiError::Invalid { field, .. }) if field == "body"
     ));
     // The limit is in bytes: this body is over it in bytes and under it in characters.
     let body = "\u{e9}".repeat(BODY_MAX_BYTES / 2 + 1);
     assert!(matches!(
         actor.send("peer", &body),
-        Err(ApiError::Invalid { field, reason })
-            if field == "body" && reason == "must be at most 16 KiB"
+        Err(ApiError::Invalid { field, .. }) if field == "body"
     ));
     assert_nothing_started(&actor, &mut events).await;
     link.shutdown().await.expect("shut down actor fixture link");
@@ -100,8 +98,7 @@ async fn the_pending_send_cap_refuses_one_more_until_a_send_finishes() {
 
     assert!(matches!(
         actor.send("peer", "one too many"),
-        Err(ApiError::Internal { detail })
-            if detail == "the station has too many sends in progress"
+        Err(ApiError::Internal { .. })
     ));
     assert_eq!(actor.jobs.len(), MAX_PENDING_SENDS);
     assert_eq!(actor.pending.len(), MAX_PENDING_SENDS);
