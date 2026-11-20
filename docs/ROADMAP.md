@@ -14,10 +14,10 @@ Each milestone is one small, demoable PR series with an automated check and a ma
 | M2 | Real-world tower, station as a service: TLS (cert files; ACME optional), QAD, SRV bootstrap, several towers, a remembered tower set that peers pass on (DNS again only when no known tower answers), static allowlist + rate limit, systemd units, FFI smoke check | CI, in-process: TLS tower with a test certificate, QAD, fake SRV resolver; a station that knows its towers starts without touching DNS and returns to SRV only when none answers; an unlisted station id is denied. Demo: two stations on different networks, given only a domain, chat, relayed or direct | M1; decision 13; **needs:** a public host and a DNS zone (demo only) |
 | M3 | Membership: chief ids and admin keys, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, invites, station commissions, roster sync, signed address records passed between nodes, removal, the tower's own endpoint with a roster-fed allowlist; `chief network` | a second chief joins by invite through an allowlisting tower and chats without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while removal and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); a chief revokes one of their two devices and keeps working from the other; a removed chief is refused by every node after sync | M1 (allowlist feed: M2); decisions 1, 2; **needs:** Nitrokey HSM 2 tokens |
 | M4 | Airspace I: sealed blocks on towers and members, spaces and keys, names, leases and quotas, the two-tower rule with tower-to-tower pull; text objects; `chief airspace` | an object written on one station is read on another after the first went offline; the tower's disk holds only ciphertext; "stored" needs two towers; a rolled-back name is refused; unleased blocks lapse | M3; decisions 4, 5, 6 |
-| M5 | Safehouse, set up by hand by a chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, per-chief OS accounts, confinement checks | a chief runs `claude` and `codex` on a safehouse and logs in by hand; an agent process cannot read the safehouse's key or another chief's home | M3; decision 3 |
-| M6 | Login broker for Claude and Codex: structured flows, guards, status, expiry, logout | both harnesses signed in from a chief with no SSH; CI drives the flows with a fake harness CLI | M5; decisions 7, 8; **needs:** Claude and ChatGPT accounts |
+| M5 | Safehouse, set up by hand by a chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, per-chief OS accounts, confinement checks | a chief runs `claude` and `codex` on a safehouse with API keys set by hand; an agent process cannot read the safehouse's key or another chief's home | M3; decision 3 |
+| M6 | Harness API keys for Claude and Codex: set, status, replace and remove from a chief | both harnesses run on a safehouse on keys set from a chief with no SSH; a key never appears in a log, an error or an event; CI uses a fake harness CLI | M5; decision 8; **needs:** an Anthropic and an OpenAI API key (manual check only) |
 | M7 | Airspace II: git repos — remote helper, bundles and manifests, mirrors on safehouses, compaction | `git clone`, `fetch` and `push` between a station and a safehouse with only towers always on; a non-fast-forward push is refused; two racing pushes leave one tip and one conflict ref | M4 (safehouse side: M5); decision 10 |
-| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, ownership policy, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a chief; reattach from a second station; a non-owner cannot steer. CI: a fake ACP agent | M5 (M6 for real accounts); decisions 9, 11 |
+| M8 | Harness sessions: session host, journal, ACP kind, Claude + Codex presets, ownership policy, workspaces from airspace; `chief sessions`, `chief harness` | prompt, stream and approve from a chief; reattach from a second station; a non-owner cannot steer. CI: a fake ACP agent | M5 (M6 for keys set from a chief); decisions 9, 11 |
 | M9 | Chat v2: durable history and outbox, receipts, channels, delivery to all of a chief's stations, offline delivery through airspace, chat tools for agents | history survives a restart; a message sent while the recipient was offline arrives when it returns; an agent posts to a channel | M4 (agent tools: M8) |
 | M10 | Sockets: `chief forward -L` with a safehouse-side target policy | a station reaches a safehouse's localhost service; a disallowed target is refused | M5 |
 | M11 | Airspace III and files: large media (resume, streaming, range reads, audits), push/pull between nodes, browsing workspaces, file tools for agents | a multi-gigabyte upload survives an interruption; another node streams a range of it; a tower that dropped a block is caught and refilled | M4 (safehouse side: M5) |
@@ -194,14 +194,18 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 6. **Names without a trusted sequencer (M4, M7).** The fork rule; how many towers must accept a
    compare-and-swap; whether a write with no tower reachable fails or is published later; whether an
    always-on safehouse should order writes instead.
-7. **Codex browser login (M6).** Its callback sequence passes an ID token through the relay. Keep it
-   as a fallback behind device code, or drop it so that no token ever transits a station.
-8. **Raw API keys and cloud-provider credentials for Claude (M6).** Unsupported at first, or a
-   per-chief secret kept on the safehouse.
-9. **Harness transport, per harness (M8).** ACP adapters or native protocols. The Claude ACP adapter
-   is an Agent SDK app, and Anthropic's Agent SDK terms restrict offering claude.ai login in
-   third-party products; compare it with `claude -p` stream-json on the unmodified CLI and with
-   Claude's own background sessions. For Codex, `codex app-server`.
+7. **Codex browser login (M6).** Settled by the owner: dropped, with every other sign-in flow.
+   Harnesses authenticate with API keys only.
+8. **Harness API keys (M6).** API keys only is decided. Open: where a key is kept on the
+   safehouse and in what form; whether the harness process gets the key or a proxy on the safehouse
+   adds it to requests, so that an agent never holds it; one key per chief (planned) or a key a team
+   shares; whether cloud-provider credentials for Claude (Bedrock, Vertex, Foundry) are in scope
+   (planned: not at first); whether presets also switch off a harness's other sign-in methods where
+   it has a setting for that.
+9. **Harness transport, per harness (M8).** ACP adapters or native protocols. For Claude: the ACP
+   adapter (an Agent SDK app), `claude -p` stream-json on the unmodified CLI, or Claude's own
+   background sessions. For Codex, `codex app-server`. With API keys only, the Agent SDK terms on
+   claude.ai login no longer bear on the choice.
 10. **Git details (M7).** Whether a station also keeps a mirror; bundle or raw pack; when and who
     compacts; branch protection from the roster (for example agents confined to a session namespace);
     what the phone can do with repos; whether the Git LFS adapter is in scope.
@@ -225,15 +229,15 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 
 **Needs from the team:** a public host and DNS zone (M2 demo; nothing else waits on it); Nitrokey HSM 2
 tokens, one plus a spare or one per chief (M3 manual check — CI uses a software token); two or three
-tower hosts once airspace should be durable (M4 demo — CI uses in-process towers); Claude and
-ChatGPT accounts for the manual login checks (M6, M8 — CI uses fake harness CLIs); a Mac, an iPhone
-and an Apple Developer membership (M14, and an early device spike worth doing right after M2). iOS
-cannot be built in this environment.
+tower hosts once airspace should be durable (M4 demo — CI uses in-process towers); an Anthropic API
+key and an OpenAI API key for the manual checks (M5, M6, M8 — CI uses fake harness CLIs); a Mac,
+an iPhone and an Apple Developer membership (M14, and an early device spike worth doing right after
+M2). iOS cannot be built in this environment.
 
-**Vendor terms.** Each person signing in to the unmodified official CLI with their own account, in a
-self-hosted team tool, is inside both vendors' published terms. Hard rules: never inject refresh
-tokens, never copy credential files between nodes, never hide a login method the CLI offers. Revisit
-before distributing beyond the team or hosting it for others.
+**Vendor terms.** Harnesses authenticate with API keys only: each chief uses a key the vendor
+issued to them or to their organisation, under that vendor's API terms, with the unmodified
+official CLI. theCompany drives or relays no subscription sign-in (hard rule 3). Revisit before
+distributing beyond the team or hosting it for others.
 
 **Interpretations of the original request (correct if wrong):**
 

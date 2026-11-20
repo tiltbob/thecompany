@@ -16,8 +16,8 @@ err() {
 allowed_clippy_configs=()
 # Crates allowed not to inherit the workspace lints (paths of their Cargo.toml). None.
 allowed_lint_tables=()
-# Source files allowed to name the lints below: the two documented exceptions to hard rule 1,
-# both in frontends started by the chief (opening a sign-in URL, the git helper). None yet.
+# Source files allowed to name the lints below: the one documented exception to hard rule 1,
+# in a frontend started by the chief (the git helper). None yet.
 allowed_lint_mentions=()
 
 # in_list <item> <list...>
