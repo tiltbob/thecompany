@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::dns::DnsResolver;
@@ -11,8 +11,9 @@ use iroh::endpoint::{
     presets,
 };
 use iroh::protocol::{DynProtocolHandler, Router, RouterBuilder as IrohRouterBuilder};
-use iroh::{RelayMap, RelayMode, SecretKey, TransportAddr};
+use iroh::{RelayMap, RelayMode, SecretKey, TransportAddr, Watcher};
 use n0_future::{StreamExt, boxed::BoxStream, stream};
+use tokio::sync::Mutex;
 
 use crate::gate::Gate;
 use crate::{Authorizer, NodeId, TowerSet};
@@ -108,8 +109,99 @@ impl fmt::Debug for EndpointBindError {
 
 /// A bound iroh endpoint and the policy used by its incoming router.
 pub struct Endpoint {
-    inner: iroh::Endpoint,
+    runtime: Arc<EndpointRuntime>,
+}
+
+struct EndpointRuntime {
+    endpoint: iroh::Endpoint,
     gate: Gate,
+    relays: RelayMap,
+    tower_updates: Mutex<()>,
+}
+
+/// A station's handle for observing and updating its endpoint's towers.
+///
+/// The bound [Endpoint] and its gated router own the runtime. A station can
+/// retain this handle while the router is running. Keeping or dropping an
+/// idle handle has no effect on the endpoint's lifetime.
+#[derive(Clone)]
+pub struct TowerControl {
+    runtime: Weak<EndpointRuntime>,
+}
+
+impl fmt::Debug for TowerControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TowerControl").finish_non_exhaustive()
+    }
+}
+
+/// An error observing or updating the runtime tower set.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TowerControlError {
+    /// The bound endpoint is closed or its runtime was dropped.
+    #[error("the numbers endpoint is closed")]
+    Closed,
+}
+
+/// The endpoint's observation of one currently configured tower.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TowerState {
+    url: String,
+    /// Whether iroh has selected this tower as home.
+    pub is_home: bool,
+    /// The last observed connection status.
+    pub status: TowerStatus,
+}
+
+impl TowerState {
+    /// Returns the configured canonical URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl fmt::Debug for TowerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TowerState")
+            .field("is_home", &self.is_home)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The connection information available for a configured tower.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TowerStatus {
+    /// No connection outcome has been observed for this tower.
+    Unknown,
+    /// The endpoint is connected to this tower.
+    Connected,
+    /// The last connection attempt failed.
+    Failing,
+    /// The tower refused the endpoint.
+    Denied {
+        /// Untrusted display text from the tower, with control characters replaced by spaces.
+        reason: String,
+    },
+}
+
+impl TowerStatus {
+    fn denied(reason: &str) -> Self {
+        Self::Denied {
+            reason: reason.replace(char::is_control, " "),
+        }
+    }
+}
+
+impl fmt::Debug for TowerStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unknown => "Unknown",
+            Self::Connected => "Connected",
+            Self::Failing => "Failing",
+            Self::Denied { .. } => "Denied",
+        })
+    }
 }
 
 impl Endpoint {
@@ -140,7 +232,9 @@ impl Endpoint {
         let builder = iroh::Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(key))
             .relay_mode(RelayMode::Custom(relays.clone()))
-            .address_lookup(TowerLookup { relays })
+            .address_lookup(TowerLookup {
+                relays: relays.clone(),
+            })
             .hooks(gate.clone())
             .net_report_config(net_report)
             .portmapper_config(PortmapperConfig::Disabled)
@@ -154,8 +248,15 @@ impl Endpoint {
                 .map_err(EndpointBindError::Loopback)?,
             IpTransport::RelayOnly => builder.clear_ip_transports(),
         };
-        let inner = builder.bind().await.map_err(EndpointBindError::Bind)?;
-        Ok(Self { inner, gate })
+        let endpoint = builder.bind().await.map_err(EndpointBindError::Bind)?;
+        Ok(Self {
+            runtime: Arc::new(EndpointRuntime {
+                endpoint,
+                gate,
+                relays,
+                tower_updates: Mutex::new(()),
+            }),
+        })
     }
 
     /// Accesses iroh only for outgoing dials, status, and shutdown.
@@ -167,7 +268,33 @@ impl Endpoint {
     /// [`iroh::Endpoint::accept`], [`iroh::Endpoint::set_alpns`], or [`Router::builder`]
     /// with this handle. Doing so can bypass the pre-handshake filter.
     pub fn iroh(&self) -> &iroh::Endpoint {
-        &self.inner
+        &self.runtime.endpoint
+    }
+
+    /// Returns the station's tower control handle.
+    pub fn tower_control(&self) -> TowerControl {
+        TowerControl {
+            runtime: Arc::downgrade(&self.runtime),
+        }
+    }
+
+    /// Applies changes to the configured towers without rebinding the endpoint.
+    ///
+    /// See [TowerControl::set_towers] for cancellation behavior.
+    pub async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
+        self.runtime.set_towers(towers).await
+    }
+
+    /// Reads the states of configured towers, with connection outcomes for the home tower only.
+    pub fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
+        self.runtime.tower_states()
+    }
+
+    /// Removes and re-inserts the configured towers to request a new net report.
+    ///
+    /// See [TowerControl::nudge_towers] for cancellation behavior.
+    pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
+        self.runtime.nudge_towers().await
     }
 
     /// Starts configuring the inbound router, which applies the pre-handshake filter.
@@ -175,8 +302,8 @@ impl Endpoint {
     /// Register the protocol handlers on the returned builder before spawning it.
     pub fn router_builder(&self) -> EndpointRouterBuilder {
         EndpointRouterBuilder {
-            inner: Router::builder(self.inner.clone()),
-            gate: self.gate.clone(),
+            inner: Router::builder(self.runtime.endpoint.clone()),
+            runtime: Arc::clone(&self.runtime),
             #[cfg(test)]
             filter_decisions: None,
         }
@@ -184,7 +311,7 @@ impl Endpoint {
 
     /// Returns the endpoint's policy for authorizing streams.
     pub fn authorizer(&self) -> &Authorizer {
-        &self.gate.authorizer
+        &self.runtime.gate.authorizer
     }
 }
 
@@ -194,10 +321,103 @@ impl fmt::Debug for Endpoint {
     }
 }
 
+impl TowerControl {
+    /// Applies changes to the configured towers without rebinding the endpoint.
+    ///
+    /// An interrupted update can leave a partially applied set. The next update
+    /// compares its target with the actual relay map.
+    pub async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
+        self.runtime()?.set_towers(towers).await
+    }
+
+    /// Reads configured tower states. Only the home tower can have an observed outcome.
+    pub fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
+        self.runtime()?.tower_states()
+    }
+
+    /// Removes and re-inserts the configured towers to request a new net report.
+    ///
+    /// If interrupted, a relay may still be removed. Use [Self::set_towers]
+    /// to reapply the desired set.
+    pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
+        self.runtime()?.nudge_towers().await
+    }
+
+    fn runtime(&self) -> Result<Arc<EndpointRuntime>, TowerControlError> {
+        self.runtime.upgrade().ok_or(TowerControlError::Closed)
+    }
+}
+
+impl EndpointRuntime {
+    fn ensure_open(&self) -> Result<(), TowerControlError> {
+        if self.endpoint.is_closed() {
+            return Err(TowerControlError::Closed);
+        }
+        Ok(())
+    }
+
+    async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
+        let _update = self.tower_updates.lock().await;
+        self.ensure_open()?;
+        let desired = towers.relay_map();
+        // Compare actual relay configs, including QAD, so retries also repair a
+        // partially applied update. Remove replacements before inserting them.
+        for relay in self.relays.relays::<Vec<_>>() {
+            if desired.get(&relay.url).as_ref() != Some(&relay) {
+                self.endpoint.remove_relay(&relay.url).await;
+            }
+        }
+        for relay in desired.relays::<Vec<_>>() {
+            if self.relays.get(&relay.url).as_ref() != Some(&relay) {
+                self.endpoint.insert_relay(relay.url.clone(), relay).await;
+            }
+        }
+        self.ensure_open()
+    }
+
+    fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
+        self.ensure_open()?;
+        let home = self.endpoint.home_relay_status().get();
+        let states = self
+            .relays
+            .urls::<Vec<_>>()
+            .into_iter()
+            .map(|url| {
+                let observed = home.iter().find(|relay| relay.url() == &url);
+                let status = match observed {
+                    Some(relay) if relay.is_connected() => TowerStatus::Connected,
+                    Some(relay) => match relay.auth_denied_reason() {
+                        Some(reason) => TowerStatus::denied(reason),
+                        None if relay.last_error().is_some() => TowerStatus::Failing,
+                        None => TowerStatus::Unknown,
+                    },
+                    None => TowerStatus::Unknown,
+                };
+                TowerState {
+                    url: url.to_string(),
+                    is_home: observed.is_some(),
+                    status,
+                }
+            })
+            .collect();
+        Ok(states)
+    }
+
+    async fn nudge_towers(&self) -> Result<(), TowerControlError> {
+        let _update = self.tower_updates.lock().await;
+        self.ensure_open()?;
+        for relay in self.relays.relays::<Vec<_>>() {
+            self.endpoint.remove_relay(&relay.url).await;
+            self.endpoint.insert_relay(relay.url.clone(), relay).await;
+        }
+        self.ensure_open()
+    }
+}
+
 /// Registers protocol handlers for an endpoint's gated inbound router.
 pub struct EndpointRouterBuilder {
     inner: IrohRouterBuilder,
-    gate: Gate,
+    runtime: Arc<EndpointRuntime>,
     #[cfg(test)]
     filter_decisions:
         Option<tokio::sync::mpsc::UnboundedSender<iroh::protocol::IncomingFilterOutcome>>,
@@ -219,11 +439,13 @@ impl EndpointRouterBuilder {
     pub fn spawn(self) -> Router {
         let Self {
             inner,
-            gate,
+            runtime,
             #[cfg(test)]
             filter_decisions,
         } = self;
-        let filter = move |incoming: &Incoming| gate.filter(incoming);
+        // The router's filter keeps the runtime available to the station's
+        // weak tower control handle after the Endpoint wrapper is dropped.
+        let filter = move |incoming: &Incoming| runtime.gate.filter(incoming);
         #[cfg(test)]
         let filter = move |incoming: &Incoming| {
             let decision = filter(incoming);

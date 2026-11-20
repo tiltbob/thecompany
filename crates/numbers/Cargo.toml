@@ -8,7 +8,7 @@ publish.workspace = true
 [features]
 # `numbers::testing`: a fake DNS server on 127.0.0.1 for tests of this crate and of the station.
 # Off by default; nothing that ships enables it.
-test-support = ["dep:simple-dns", "dep:tokio"]
+test-support = ["dep:simple-dns", "tokio/net", "tokio/rt"]
 
 [dependencies]
 numbers-base.workspace = true
@@ -19,8 +19,7 @@ n0-future.workspace = true
 serde = { workspace = true, features = ["derive"] }
 simple-dns = { workspace = true, optional = true }
 thiserror.workspace = true
-# Only for `testing` (feature `test-support`): the fake DNS server's socket and task.
-tokio = { workspace = true, optional = true, features = ["net", "rt"] }
+tokio = { workspace = true, features = ["sync"] }
 url.workspace = true
 
 [dev-dependencies]

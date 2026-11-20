@@ -1,15 +1,18 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::RelayUrl;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, IncomingFilterOutcome, ProtocolHandler};
 use numbers_tower::{Tower, TowerConfig};
 use tokio::sync::mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel};
 use tokio::time::timeout;
 
-use super::{DnsConfig, Endpoint, EndpointBindError, EndpointConfig, IpTransport, TlsRoots};
-use crate::{Authorizer, TowerSet, generate_node_key};
+use super::{
+    DnsConfig, Endpoint, EndpointBindError, EndpointConfig, IpTransport, TlsRoots, TowerStatus,
+};
+use crate::{Authorizer, TowerEntry, TowerSet, generate_node_key};
 
 const ALPN: &[u8] = b"test/endpoint/0";
 
@@ -27,6 +30,44 @@ impl ProtocolHandler for ObserveAccept {
 fn dns_config_debug_hides_the_nameserver() {
     let dns = DnsConfig::Nameserver((Ipv4Addr::LOCALHOST, 53).into());
     assert_eq!(format!("{dns:?}"), "Nameserver(..)");
+}
+
+#[test]
+fn denied_status_replaces_controls_with_spaces() {
+    let TowerStatus::Denied { reason } = TowerStatus::denied("hello\nworld\tfrom\u{0085}tower")
+    else {
+        panic!("expected tower denial");
+    };
+    assert_eq!(reason, "hello world from tower");
+}
+
+#[tokio::test]
+async fn replacing_qad_updates_the_config_at_the_same_url() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let entry =
+        TowerEntry::from_url(&format!("https://{}", listener.local_addr().unwrap())).unwrap();
+    let url: RelayUrl = entry.url().parse().unwrap();
+    let initial = TowerSet::from_entries([entry.clone()]).unwrap();
+    let updated = TowerSet::from_entries([entry.with_qad_port(7342).unwrap()]).unwrap();
+    let endpoint = Endpoint::bind(
+        &generate_node_key(),
+        EndpointConfig {
+            towers: initial,
+            ip_transport: IpTransport::RelayOnly,
+            ..EndpointConfig::default()
+        },
+        Arc::new(Authorizer::new(&[ALPN], &[])),
+    )
+    .await
+    .unwrap();
+    let relays = &endpoint.runtime.relays;
+    assert_eq!(relays.get(&url).unwrap().quic.as_ref().unwrap().port, 7842);
+    endpoint.set_towers(&updated).await.unwrap();
+    assert_eq!(relays.len(), 1);
+    assert_eq!(relays.get(&url).unwrap().quic.as_ref().unwrap().port, 7342);
+    endpoint.nudge_towers().await.unwrap();
+    assert_eq!(relays.get(&url).unwrap().quic.as_ref().unwrap().port, 7342);
+    endpoint.iroh().close().await;
 }
 
 #[tokio::test]

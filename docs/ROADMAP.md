@@ -318,7 +318,10 @@ the tower's own endpoint (M3). Router port mapping stays off; whether stations u
 - `scripts/walkthrough.sh`, run by CI with the real binaries: one `tower`, two `station run` in temp
   dirs, `chief peer add` both ways, `chief send`, assert on `chief log` on the other side, stop both
   stations and assert the sockets are gone. The README carries the same steps for a person.
-- M2 adds the multi-tower test and the real-world demo on a public host.
+- M2's multi-tower test checks both endpoints' initial home, then stops that tower and explicitly
+  nudges the endpoints. A fresh relay-only connection must use the second tower within 30 seconds.
+  The runtime checks also cover replacing the tower set without rebinding and observing a denial.
+  The real-world demo uses a public host.
 - CI green on the PR.
 
 **M2.** The same rules hold: in-process, on 127.0.0.1, no query leaves the host, ids generated at
