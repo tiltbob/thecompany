@@ -19,6 +19,8 @@ mod ca;
 
 const TOWER_LOG_TARGET: &str = "numbers_station::towers";
 const LOG_TARGET: &str = "numbers_station_daemon::cli";
+// EX_CONFIG in sysexits.h. Like the tower, use it when a retry cannot fix the configuration.
+const EXIT_CONFIG: u8 = 78;
 const SOCKET_PATH_GUIDANCE: &str =
     "the Unix socket path is too long; choose a shorter --data-dir or XDG_RUNTIME_DIR";
 
@@ -77,7 +79,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("station: {error}");
-            ExitCode::FAILURE
+            error.exit_code()
         }
     }
 }
@@ -193,6 +195,39 @@ enum RunError {
     Socket(#[from] IpcError),
     #[error("a station worker failed during shutdown")]
     Shutdown,
+}
+
+impl RunError {
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::DataDirectory
+            | Self::SocketPath
+            | Self::TowerUrl
+            | Self::TowerSet
+            | Self::DnsServer
+            | Self::TowerCa(
+                ca::CaError::TooLarge | ca::CaError::Pem | ca::CaError::Empty | ca::CaError::Der,
+            )
+            | Self::Station(
+                StartError::EmptyPinnedTowers
+                | StartError::InvalidBootstrapDomain
+                | StartError::MissingTowerConfig
+                | StartError::InvalidTimeouts,
+            ) => ExitCode::from(EXIT_CONFIG),
+            Self::TowerCa(ca::CaError::Read)
+            | Self::Station(
+                StartError::AlreadyRunning
+                | StartError::RuntimeRequired
+                | StartError::Randomness
+                | StartError::Storage { .. }
+                | StartError::Bind,
+            )
+            | Self::Socket(_)
+            | Self::CryptoProvider
+            | Self::Signals
+            | Self::Shutdown => ExitCode::FAILURE,
+        }
+    }
 }
 
 // Select diagnostics by operation and error kind. The wrapped errors can contain user input.

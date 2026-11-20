@@ -94,7 +94,7 @@ fn systemd_station_unit_restarts_failures_and_keeps_private_permissions() {
         ("Type", "exec"),
         ("Restart", "on-failure"),
         ("RestartSec", "5s"),
-        ("RestartPreventExitStatus", "2"),
+        ("RestartPreventExitStatus", "2 78"),
         ("UMask", "0077"),
     ] {
         assert_eq!(unit_values(SYSTEMD_UNIT, "Service", key), [value], "{key}");
@@ -377,6 +377,53 @@ fn path_errors_point_to_data_dir() {
     assert!(message.contains("Unix socket path is too long"));
     assert!(message.contains("--data-dir"));
     assert_private_values_omitted(&message);
+}
+
+#[test]
+fn run_errors_classify_invalid_configuration_and_operational_failures() {
+    let path = PathBuf::from("/station-fixture/station.sock");
+    let cases = [
+        (RunError::DataDirectory, 78),
+        (RunError::SocketPath, 78),
+        (RunError::TowerUrl, 78),
+        (RunError::TowerSet, 78),
+        (RunError::DnsServer, 78),
+        (ca::CaError::TooLarge.into(), 78),
+        (ca::CaError::Pem.into(), 78),
+        (ca::CaError::Empty.into(), 78),
+        (ca::CaError::Der.into(), 78),
+        (StartError::EmptyPinnedTowers.into(), 78),
+        (StartError::InvalidBootstrapDomain.into(), 78),
+        (StartError::MissingTowerConfig.into(), 78),
+        (StartError::InvalidTimeouts.into(), 78),
+        (ca::CaError::Read.into(), 1),
+        (StartError::AlreadyRunning.into(), 1),
+        (StartError::RuntimeRequired.into(), 1),
+        (StartError::Randomness.into(), 1),
+        (
+            StartError::Storage {
+                detail: "invalid --tower URL".into(),
+            }
+            .into(),
+            1,
+        ),
+        (StartError::Bind.into(), 1),
+        (IpcError::InUse { path: path.clone() }.into(), 1),
+        (
+            IpcError::PathTooLong {
+                path,
+                reason: "socket path exceeds the bound".into(),
+            }
+            .into(),
+            1,
+        ),
+        (RunError::CryptoProvider, 1),
+        (RunError::Signals, 1),
+        (RunError::Shutdown, 1),
+    ];
+    for (error, status) in cases {
+        assert_eq!(error.exit_code(), ExitCode::from(status), "{error}");
+    }
 }
 
 #[test]

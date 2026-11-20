@@ -297,13 +297,18 @@ systemctl --user status station.service
 journalctl --user -u station.service -o cat
 ```
 
+Reading with `journalctl --user` can require persistent per-user journal storage or appropriate
+journal permissions, especially when the system journal is volatile.
+
 `enable` sets the station to start with the user manager. To start it at boot and keep it running
 after logout, set `loginctl enable-linger "$USER"`. Whether you can enable lingering for your
 account depends on the workstation's login policy.
 
-The service restarts after a failure, with a five-second delay. Command-line errors exit with
-status 2 and prevent automatic restart. Other startup failures, including a missing tower
-configuration or a data directory lock held by another instance, exit with status 1. Check the
-journal and correct the cause before starting the service again if it reaches systemd's start
-limit. `systemctl --user stop station.service` sends SIGTERM. The station removes the socket
-before shutting down the core and releasing its data-directory lock.
+Command-line syntax errors exit with status 2. Known configuration errors, such as a missing
+tower configuration, invalid tower settings, or invalid CA contents, exit with status 78
+(`EX_CONFIG`). Both statuses suppress automatic restart. Correct the cause and start the service
+again. Operational failures, including an unreadable CA file, storage and socket errors,
+and a data directory lock held by another instance, exit with status 1. The service restarts
+after such failures with a five-second delay. `systemctl --user stop station.service` sends
+SIGTERM. The station removes the socket before shutting down the core and releasing its
+data-directory lock.

@@ -211,7 +211,7 @@ unlisted station denied.
 | `crates/station/src/towers.rs` | Applies explicit tower additions and removals to the remembered and runtime working set as part of domain-backed startup support. | #77, #129, Codex |
 | `crates/chief-cli/src/lib.rs` | `chief status` prints `domain <domain>` first when the station has a bootstrap domain, then `tower <url> <state>[ (<source>)][: <detail>]` per tower: the detail is a failing tower's error or a denied tower's own reason (this project's tower says "not on this tower's list"), and the URL is always one field; `FakeStation::set_towers` and `set_bootstrap_domain` for the tests. Done. Per decision 16 (#73), candidate listing and `chief tower add <url>` / `chief tower remove <url>` are #122, which waits for the API of #109 | #80, Claude |
 | `packaging/systemd/` | `numbers-tower.service` (system unit: `DynamicUser`, `StateDirectory=numbers-tower` with `StateDirectoryMode=0700` for the ACME cache, `Restart=on-failure` with `RestartPreventExitStatus=2 78` (the binary exits with 78 for a configuration error and 2 for a command-line error, 1 for what can pass), `CAP_NET_BIND_SERVICE`, sandboxing) and an example drop-in for certificate files through `LoadCredential=`, restarted on renewal. A test in the binary reads the unit by section, parses its `ExecStart` with clap and checks the directives the binary needs; `scripts/check-units.sh` (CI) runs `systemd-analyze verify --recursive-errors=no` on the unit alone and with the drop-in, fails on any message, and needs systemd 250 or later (skipped locally without it, a failure in CI). Docs: "Running the tower as a service" (`packaging/systemd/README.md`). | #82, Claude |
-| `packaging/systemd/` | `station.service` runs `station run` as a user unit with remembered tower configuration, `Restart=on-failure`, and `RestartPreventExitStatus=2`. The daemon tests parse its `ExecStart`. `scripts/check-units.sh` verifies it in user scope. The service guide covers initial configuration, overrides and `loginctl enable-linger`. | #127, Codex |
+| `packaging/systemd/` | `station.service` runs `station run` as a user unit with remembered tower configuration, `Restart=on-failure`, and `RestartPreventExitStatus=2 78`. The daemon tests parse its `ExecStart`. `scripts/check-units.sh` verifies it in user scope. The service guide covers initial configuration, overrides and `loginctl enable-linger`. | #127, Codex |
 | `crates/chief-ffi` | UniFFI exports of the `chief::api` types, a small async facade (`start_station`, `request`) on an owned tokio runtime, Swift bindings generated in CI. Blocked on hard rule 10 (below) | #83, Claude |
 | `scripts/walkthrough-tls.sh` | the walkthrough with the real binaries over TLS on loopback, run by CI | #84, Codex |
 | `docs/notes/m2-demo.md` or a docs section | the runbook for the real-network demo | #85, Codex |
@@ -331,6 +331,12 @@ station run --tower https://127.0.0.1:8443 --tower-ca cert.pem   # trust the cer
 chief status                                          # towers: state, source, denial, candidates
 chief tower add https://tower3.example.com            # take a candidate into the set
 ```
+
+`station` exits 0 on success and 2 for command-line syntax errors. Known configuration errors
+exit 78 (`EX_CONFIG`), including missing path or tower configuration, an overlong socket path,
+invalid tower, DNS or timeout settings, and invalid CA contents. Operational errors exit 1,
+including an unreadable CA file, data-directory lock contention, storage and socket errors, and
+worker failures.
 
 **Deliberately not in M2:** ACME tested at runtime (it needs port 443 on a public host; #71),
 reload of the tower's config or allowlist on a signal (#69, #71), an allowlist fed from the roster

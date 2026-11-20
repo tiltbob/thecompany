@@ -7,7 +7,7 @@ Type=exec
 ExecStart=%h/.local/bin/station run
 Restart=on-failure
 RestartSec=5s
-RestartPreventExitStatus=2
+RestartPreventExitStatus=2 78
 UMask=0077
 
 [Install]
