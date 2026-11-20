@@ -131,10 +131,10 @@
 //!     a valid id looks like is the station's to say); the station's own id
 //!     ([`ApiError::Invalid`], field `station_id`); a station that belongs to another peer
 //!     ([`ApiError::StationTaken`]). Returned station IDs may use the station's canonical
-//!     representation. [`Request::PeerRemove`] fails the peer's outgoing messages that are still
-//!     `Sending` (rule 7, with their events), closes its links and pushes [`Event::PeerRemoved`].
-//!     Any other change of a link pushes [`Event::Peer`] with the whole peer; the links that
-//!     `PeerRemove` closes push no [`Event::Peer`]:
+//!     representation. [`Request::PeerRemove`] fails the peer's outgoing messages whose delivery
+//!     has not ended (rule 7, with their events), closes its links and pushes
+//!     [`Event::PeerRemoved`]. Any other change of a link pushes [`Event::Peer`] with the whole
+//!     peer; the links that `PeerRemove` closes push no [`Event::Peer`]:
 //!     [`Event::PeerRemoved`] stands for the whole peer, its links included.
 //! 11. **End of a subscription.** A subscription ends when the station stops or the transport
 //!     loses its connection: [`crate::client::Subscription::next`] returns the events still queued,
