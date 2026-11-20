@@ -14,7 +14,7 @@ It would replace NAT traversal and relays, enrolling and removing nodes, directi
 socket forwarding, and shells on safehouses (Tailscale SSH). In roadmap terms: the network half of
 M1, and M2, M3 and M10.
 
-It would not replace chat, locks, airspace, harness sessions, the login flow, the GUI or the phone
+It would not replace chat, locks, airspace, harness sessions, harness API keys, the GUI or the phone
 app. Those stay ours whichever network layer is underneath, and they are most of the roadmap.
 
 ## Against the requirements
