@@ -6,9 +6,11 @@ use chief::api::*;
 use chief::client::*;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::pin::pin;
+use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 // Samples.
@@ -263,6 +265,231 @@ async fn a_capacity_above_the_limit_does_not_panic() {
     assert_eq!(subscription.next().await, Some(removed("a")));
 }
 
+// 5b. The subscription pair: wake-ups and races.
+
+/// A waker that records whether it was woken.
+#[derive(Default)]
+struct WakeFlag(AtomicBool);
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl WakeFlag {
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Polls `future` once with a waker that sets `flag`.
+fn poll_with<F: Future>(future: Pin<&mut F>, flag: &Arc<WakeFlag>) -> Poll<F::Output> {
+    let waker = Waker::from(Arc::clone(flag));
+    future.poll(&mut Context::from_waker(&waker))
+}
+
+/// Polls `future` once with a waker that does nothing.
+fn poll_now<F: Future>(future: F) -> Poll<F::Output> {
+    pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+}
+
+#[test]
+fn a_parked_next_gets_resync_when_the_sink_is_dropped_after_a_lag() {
+    let (sink, mut subscription) = subscription(1);
+    let flag = Arc::new(WakeFlag::default());
+    {
+        let mut next = pin!(subscription.next());
+        assert!(poll_with(next.as_mut(), &flag).is_pending());
+        sink.push(removed("a")).unwrap();
+        sink.push(removed("b")).unwrap(); // overflows
+        drop(sink);
+        assert!(flag.take());
+        assert_eq!(
+            poll_with(next.as_mut(), &flag),
+            Poll::Ready(Some(Event::Resync))
+        );
+    }
+    for _ in 0..3 {
+        assert_eq!(poll_now(subscription.next()), Poll::Ready(None));
+    }
+}
+
+#[test]
+fn a_parked_next_is_woken_by_a_push() {
+    let (sink, mut subscription) = subscription(4);
+    let flag = Arc::new(WakeFlag::default());
+    let mut next = pin!(subscription.next());
+    assert!(poll_with(next.as_mut(), &flag).is_pending());
+    assert!(!flag.take());
+    sink.push(removed("a")).unwrap();
+    assert!(flag.take());
+    assert_eq!(
+        poll_with(next.as_mut(), &flag),
+        Poll::Ready(Some(removed("a")))
+    );
+}
+
+/// The old interleaving (the push sees a full queue, the subscriber empties the queue and parks,
+/// and only then the push records the lag) cannot be built any more: a push decides and records
+/// the overflow under the same lock in which it looks at the queue. Nor can an overflow be the only
+/// wake-up of a parked call: a call parks only on an empty queue, so the queue fills (one wake-up)
+/// before it can overflow. The nearest construction is an overflow while a `next()` is parked: the
+/// call is woken, and when polled it returns `Resync`, not the dropped events.
+#[test]
+fn a_parked_next_is_woken_by_an_overflow() {
+    let (sink, mut subscription) = subscription(1);
+    sink.push(removed("a")).unwrap();
+    assert_eq!(
+        poll_now(subscription.next()),
+        Poll::Ready(Some(removed("a")))
+    );
+
+    let flag = Arc::new(WakeFlag::default());
+    let mut next = pin!(subscription.next());
+    assert!(poll_with(next.as_mut(), &flag).is_pending());
+    sink.push(removed("b")).unwrap();
+    // Not polled in between: the next push overflows the queue while the call is still parked.
+    sink.push(removed("c")).unwrap();
+    assert!(flag.take());
+    assert_eq!(
+        poll_with(next.as_mut(), &flag),
+        Poll::Ready(Some(Event::Resync))
+    );
+}
+
+#[test]
+fn a_parked_next_is_woken_by_dropping_the_sink() {
+    let (sink, mut subscription) = subscription(4);
+    let flag = Arc::new(WakeFlag::default());
+    {
+        let mut next = pin!(subscription.next());
+        assert!(poll_with(next.as_mut(), &flag).is_pending());
+        drop(sink);
+        assert!(flag.take());
+        assert_eq!(poll_with(next.as_mut(), &flag), Poll::Ready(None));
+    }
+    assert_eq!(poll_now(subscription.next()), Poll::Ready(None));
+}
+
+#[test]
+fn pushes_after_a_lag_are_covered_by_the_resync() {
+    let (sink, mut subscription) = subscription(2);
+    for n in 1..=3 {
+        sink.push(removed(&format!("p{n}"))).unwrap(); // the third overflows
+    }
+    sink.push(removed("p4")).unwrap(); // dropped: the pending Resync covers it
+    assert_eq!(
+        poll_now(subscription.next()),
+        Poll::Ready(Some(Event::Resync))
+    );
+    assert!(poll_now(subscription.next()).is_pending());
+    sink.push(removed("p5")).unwrap();
+    assert_eq!(
+        poll_now(subscription.next()),
+        Poll::Ready(Some(removed("p5")))
+    );
+}
+
+#[test]
+fn closed_resolves_for_waiters_registered_before_and_after_the_drop() {
+    let (sink, subscription) = subscription(1);
+    let first = Arc::new(WakeFlag::default());
+    let second = Arc::new(WakeFlag::default());
+    let mut before = pin!(sink.closed());
+    let mut also_before = pin!(sink.closed());
+    assert!(poll_with(before.as_mut(), &first).is_pending());
+    assert!(poll_with(also_before.as_mut(), &second).is_pending());
+    drop(subscription);
+    assert!(first.take());
+    assert!(second.take());
+    assert_eq!(poll_with(before.as_mut(), &first), Poll::Ready(()));
+    assert_eq!(poll_with(also_before.as_mut(), &second), Poll::Ready(()));
+    assert_eq!(poll_now(sink.closed()), Poll::Ready(()));
+}
+
+/// What the consumer read in one round of the stress test.
+#[derive(Debug, PartialEq)]
+enum Read {
+    Number(u64),
+    Resync,
+}
+
+/// Checks the invariants of one round: numbers strictly increase; wherever numbers are skipped, and
+/// only there, a `Resync` was read in between (two in a row are allowed: everything pushed between
+/// them was dropped); and if the last number pushed is missing, a
+/// `Resync` was read after the last number delivered.
+fn check_round(reads: &[Read], pushed: u64, capacity: usize) {
+    let mut expected_next = 0;
+    let mut resync_since_number = false;
+    for read in reads {
+        match read {
+            Read::Resync => resync_since_number = true,
+            Read::Number(n) => {
+                assert!(
+                    *n >= expected_next,
+                    "{n} after {expected_next} (capacity {capacity})"
+                );
+                assert_eq!(
+                    *n > expected_next,
+                    resync_since_number,
+                    "number {n}, expected {expected_next}, Resync read: {resync_since_number} \
+                     (capacity {capacity})"
+                );
+                expected_next = n + 1;
+                resync_since_number = false;
+            }
+        }
+    }
+    assert_eq!(
+        expected_next < pushed,
+        resync_since_number,
+        "last number read {expected_next}, pushed {pushed}, Resync read before None: \
+         {resync_since_number} (capacity {capacity})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stress_one_producer_one_consumer() {
+    const PUSHES: u64 = 2_000;
+    const ROUNDS: usize = 60;
+    let all = async {
+        for capacity in [1, 2, 3, 16, 256] {
+            for round in 0..ROUNDS {
+                let (sink, mut subscription) = subscription(capacity);
+                let producer = tokio::spawn(async move {
+                    for n in 0..PUSHES {
+                        sink.push(Event::PeerRemoved {
+                            name: n.to_string(),
+                        })
+                        .unwrap();
+                    }
+                    // The sink is dropped here.
+                });
+                let mut reads = Vec::new();
+                let mut count = 0usize;
+                while let Some(event) = subscription.next().await {
+                    reads.push(match event {
+                        Event::Resync => Read::Resync,
+                        Event::PeerRemoved { name } => Read::Number(name.parse().unwrap()),
+                        other => panic!("unexpected event {other:?}"),
+                    });
+                    count += 1;
+                    if (count + round).is_multiple_of(7) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                producer.await.unwrap();
+                assert_eq!(subscription.next().await, None);
+                check_round(&reads, PUSHES, capacity);
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), all)
+        .await
+        .expect("the stress test did not finish within its bound");
+}
+
 // 6. Client over a scripted transport.
 
 #[tokio::test]
@@ -366,17 +593,56 @@ async fn a_wrong_response_variant_is_a_bad_reply() {
             limit: 50,
         }),
     ]);
-    let bad = |result: Result<(), ApiError>| match result {
-        Err(ApiError::BadReply { detail }) => assert!(detail.contains("unexpected response")),
-        other => panic!("expected BadReply, got {other:?}"),
+    let bad = |result: Result<(), ApiError>, detail: &str| {
+        assert_eq!(
+            result,
+            Err(ApiError::BadReply {
+                detail: detail.into()
+            })
+        );
     };
-    bad(client.status().await.map(drop));
-    bad(client.peers().await.map(drop));
-    bad(client.peer_add("bob", "STATION-B").await.map(drop));
-    bad(client.peer_remove("bob").await);
-    bad(client.send("bob", "on my way").await.map(drop));
-    bad(client.message(42).await.map(drop));
-    bad(client.log(None, None, 50).await.map(drop));
+    let got_done = |expected: &str| format!("expected a {expected} response, got a done response");
+    bad(client.status().await.map(drop), &got_done("status"));
+    bad(client.peers().await.map(drop), &got_done("peers"));
+    bad(
+        client.peer_add("bob", "STATION-B").await.map(drop),
+        &got_done("peer"),
+    );
+    bad(
+        client.peer_remove("bob").await,
+        "expected a done response, got a peer response",
+    );
+    bad(
+        client.send("bob", "on my way").await.map(drop),
+        &got_done("message"),
+    );
+    bad(client.message(42).await.map(drop), &got_done("message"));
+    bad(client.log(None, None, 50).await.map(drop), &got_done("log"));
+    fake.assert_script_done();
+}
+
+#[tokio::test]
+async fn a_bad_reply_does_not_carry_the_response_contents() {
+    const MARKER: &str = "MARKER-7f3a";
+    let mut status = a_status();
+    status.station_id = MARKER.into();
+    status.instance_id = MARKER.into();
+    status.towers[0].url = format!("http://{MARKER}/");
+    let mut message = sending();
+    message.body = MARKER.into();
+    message.id = MARKER.into();
+    let (client, fake) = client(vec![
+        step(Request::Peers, vec![], Ok(Response::Status { status })),
+        step(Request::Status, vec![], Ok(Response::Message { message })),
+    ]);
+    for error in [
+        client.peers().await.map(drop).unwrap_err(),
+        client.status().await.map(drop).unwrap_err(),
+    ] {
+        assert!(matches!(error, ApiError::BadReply { .. }), "{error:?}");
+        assert!(!format!("{error:?}").contains(MARKER), "{error:?}");
+        assert!(!error.to_string().contains(MARKER), "{error}");
+    }
     fake.assert_script_done();
 }
 
