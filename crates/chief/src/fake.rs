@@ -7,7 +7,8 @@
 //! [`FakeStation::set_now_ms`]. It is the reference that frontend tests trust, so its own tests
 //! check it against the rules.
 //!
-//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of every call,
+//! Test hooks beyond the rules: [`FakeStation::on_call`] runs code at the start of a call (for one
+//! call at a time: a call that starts while the hook runs for another is answered without it),
 //! [`FakeStation::fail_calls`] makes every call fail, and [`FakeStation::hold_subscribes`] keeps
 //! `subscribe` from returning until the test lets it.
 //!
@@ -22,7 +23,7 @@ use crate::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, LOG_PAGE_MAX_BYTES,
     LOG_PAGE_MAX_MESSAGES, Link, LogPage, MESSAGE_ID_MAX_BYTES, Message, MessageStatus, Peer,
     PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState, TowerStatus,
-    check_peer_name,
+    check_peer_name, clean, clean_tower_display,
 };
 use crate::client::{
     BindInstance, EventSink, SUBSCRIPTION_CAPACITY, Subscription, Transport, subscription,
@@ -36,7 +37,7 @@ use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
-/// The URL of the fake's one tower.
+/// The URL of the one tower a new fake has ([`FakeStation::new`]).
 pub const FAKE_TOWER_URL: &str = "http://127.0.0.1:3340/";
 
 /// How many messages the fake keeps by default, like the station: the newest 1,000.
@@ -57,7 +58,8 @@ type CallHook = Box<dyn FnMut(&FakeStation, &Request) + Send>;
 
 /// The hook of [`FakeStation::on_call`], and how often it was set or removed. A hook is taken out
 /// of the slot while it runs, and is put back afterwards only if the slot was not changed
-/// meanwhile: a hook that removes or replaces itself stays removed or replaced.
+/// meanwhile: a hook that removes or replaces itself stays removed or replaced. While it is out, the
+/// slot is empty, so a call that starts meanwhile (on another thread or task) runs no hook.
 #[derive(Default)]
 struct HookSlot {
     hook: Option<CallHook>,
@@ -162,7 +164,9 @@ impl FakeStation {
                 towers: vec![TowerStatus {
                     url: FAKE_TOWER_URL.to_owned(),
                     state: TowerState::Connecting,
+                    source: None,
                 }],
+                bootstrap_domain: None,
             },
             peers: BTreeMap::new(),
             log: VecDeque::new(),
@@ -207,25 +211,59 @@ impl FakeStation {
         self.state().outcome = outcome;
     }
 
-    /// Sets the state of the one tower and pushes [`Event::Status`].
+    /// Sets the state of every tower in the list to `tower` and pushes [`Event::Status`].
     ///
-    /// The text in the state (the `error` of [`TowerState::Failing`], the `reason` of
-    /// [`TowerState::Denied`]) came from outside, so every control character in it is replaced with
-    /// a space (rule 9) before it is stored and before the event is pushed.
+    /// The `error` of [`TowerState::Failing`] and the `reason` of [`TowerState::Denied`] are
+    /// cleaned and bounded with [`clean_tower_display`] before being stored or sent in an event.
     pub fn set_tower_state(&self, tower: TowerState) {
-        let tower = match tower {
-            TowerState::Failing { error } => TowerState::Failing {
-                error: scrub(&error),
-            },
-            TowerState::Denied { reason } => TowerState::Denied {
-                reason: scrub(&reason),
-            },
-            other @ (TowerState::Connecting | TowerState::Connected) => other,
-        };
+        let tower = clean_tower_state(tower);
         let mut state = self.state();
         for t in &mut state.status.towers {
             t.state = tower.clone();
         }
+        let status = state.status.clone();
+        state.emit(&Event::Status { status });
+    }
+
+    /// Replaces the whole list of towers, in the given order, and pushes [`Event::Status`]. An
+    /// empty list is allowed: the status then has no towers.
+    ///
+    /// The text in it came from outside. Before it is stored and before the event is pushed, every
+    /// character of rule 9 in each `url` is replaced with a space ([`clean`]), and each `error` of
+    /// [`TowerState::Failing`] and each `reason` of [`TowerState::Denied`] is cleaned and bounded
+    /// with [`clean_tower_display`], as [`FakeStation::set_tower_state`] does. The sources are
+    /// stored as given.
+    ///
+    /// The bootstrap domain is left as it is. The fake treats the first tower of the list as the
+    /// home tower: a [`FakeStation::restart`] puts it back in [`TowerState::Connecting`] and every
+    /// other tower in [`TowerState::Standby`], and keeps the list itself (its order, urls and
+    /// sources). Keeping them is the fake's choice; what a real station reports after a restart
+    /// is not settled here, and a test that needs something else calls `set_towers` again.
+    pub fn set_towers(&self, towers: Vec<TowerStatus>) {
+        let towers = towers
+            .into_iter()
+            .map(|tower| TowerStatus {
+                url: clean(&tower.url).into_owned(),
+                state: clean_tower_state(tower.state),
+                source: tower.source,
+            })
+            .collect();
+        let mut state = self.state();
+        state.status.towers = towers;
+        let status = state.status.clone();
+        state.emit(&Event::Status { status });
+    }
+
+    /// Sets [`Status::bootstrap_domain`] (`None` clears it) and pushes [`Event::Status`].
+    ///
+    /// The domain is the chief's own input to its station, not text from a peer or a tower, so it
+    /// is stored as given, without [`crate::api::clean`]; a frontend still cleans what it prints.
+    ///
+    /// A [`FakeStation::restart`] keeps it: the fake's choice, as for the list of towers; a test
+    /// that needs something else calls `set_bootstrap_domain` again.
+    pub fn set_bootstrap_domain(&self, domain: Option<String>) {
+        let mut state = self.state();
+        state.status.bootstrap_domain = domain;
         let status = state.status.clone();
         state.emit(&Event::Status { status });
     }
@@ -260,14 +298,14 @@ impl FakeStation {
     }
 
     /// Logs a message from `peer` with a new id (rule 8) and pushes its event, as a station does
-    /// with a message that arrived from a peer's station. Every control character in `body` is
-    /// replaced with a space (rule 9).
+    /// with a message that arrived from a peer's station. Every character of rule 9 in `body` is
+    /// replaced with a space ([`crate::api::clean`]).
     ///
     /// It follows the limits a station applies to what arrives, and a refused message changes
     /// nothing: no receipt, no log entry, no event, no `seq` and no id used. The checks run in this
     /// order: [`ApiError::Stopping`] after [`FakeStation::stop`]; [`ApiError::PeerNotFound`] for a
     /// peer not in the book; [`ApiError::Invalid`] with field `body` for a body over
-    /// [`BODY_MAX_BYTES`] (counted before control characters are replaced). An empty body is
+    /// [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are replaced). An empty body is
     /// accepted: only [`Request::Send`] has a lower bound (rule 7), and a peer may send an empty
     /// body. Only a message that
     /// passes them takes a new id, `FAKE-MSG-<n>`, which has the form of [`Message::id`]. Fails
@@ -293,8 +331,8 @@ impl FakeStation {
     /// [`ApiError::PeerNotFound`] for a peer not in the book; [`ApiError::Invalid`] with field `id`
     /// for an id without the form of [`Message::id`] (1 to [`MESSAGE_ID_MAX_BYTES`] ASCII letters,
     /// digits, `_` or `-`), which a station refuses from a peer; [`ApiError::Invalid`] with field
-    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before control characters are replaced;
-    /// an empty body is accepted); and only then the duplicate check of rule 8.
+    /// `body` for a body over [`BODY_MAX_BYTES`] (counted before the characters of rule 9 are
+    /// replaced; an empty body is accepted); and only then the duplicate check of rule 8.
     pub fn receive_with_id(
         &self,
         peer: &str,
@@ -306,18 +344,23 @@ impl FakeStation {
 
     /// Gives a held outgoing message its final status (`Delivered` or `Failed`): rev 1 and its
     /// event (rule 7), also when the log has evicted the message meanwhile (the log then stays as
-    /// it is). Fails with [`ApiError::Invalid`] when `status` is not a final outgoing status (field
-    /// `status`), or when the `seq` is in the log but is not an outgoing message still `Sending`
-    /// (field `seq`); and with [`ApiError::MessageNotFound`] for any other `seq` that is not a
-    /// held message.
+    /// it is). The checks run in this order: [`ApiError::Stopping`] after [`FakeStation::stop`]
+    /// (rule 7 promises no outcome after a stop), and nothing changes; [`ApiError::Invalid`] when
+    /// `status` is not a final outgoing status (field `status`), or when the `seq` is in the log
+    /// but is not an outgoing message still `Sending` (field `seq`); and
+    /// [`ApiError::MessageNotFound`] for any other `seq` that is not a held message.
     pub fn resolve(&self, seq: u64, status: MessageStatus) -> Result<Message, ApiError> {
+        let mut state = self.state();
+        if state.stopped {
+            return Err(ApiError::Stopping);
+        }
         if !matches!(
             status,
             MessageStatus::Delivered | MessageStatus::Failed { .. }
         ) {
             return Err(invalid("status", "must be delivered or failed"));
         }
-        self.state().finish(seq, status)
+        state.finish(seq, status)
     }
 
     /// Stops the station: every subscription ends (rule 11), and every later call and subscribe
@@ -338,11 +381,18 @@ impl FakeStation {
 
     /// Restarts the station as a new instance (rule 1): every subscription ends (rule 11), the log
     /// is emptied and `seq` starts again at 1, the receipt window of rule 8 is forgotten, every
-    /// link is down, and calls are answered again after a [`FakeStation::stop`]. A subscribe that
-    /// is waiting at [`FakeStation::hold_subscribes`] wakes up and fails with
-    /// [`ApiError::Stopping`]: it belonged to the old instance and never attaches to the new one.
-    /// The peer book, the send outcome and the other test settings, the hold of subscribes
-    /// included, stay, as a station's peer book survives a restart.
+    /// link is down, the first tower of the list (the fake's home tower) is back in
+    /// [`TowerState::Connecting`] and every other one in [`TowerState::Standby`], as the API
+    /// reports a set whose home tower is not connected yet (no event is pushed: the subscriptions
+    /// have ended), and calls are answered again after a
+    /// [`FakeStation::stop`]. A subscribe that is waiting at [`FakeStation::hold_subscribes`] wakes
+    /// up and fails with [`ApiError::Stopping`]: it belonged to the old instance and never attaches
+    /// to the new one. The peer book, the send outcome and the other test settings, the hold of
+    /// subscribes included, stay, as a station's peer book survives a restart. So do, by the fake's
+    /// choice, the list of towers ([`FakeStation::set_towers`]: its order, urls and sources) and
+    /// the bootstrap domain ([`FakeStation::set_bootstrap_domain`]); only the towers' states
+    /// change. What a real station reports after a restart is not settled here: a test that
+    /// needs something else sets the towers or the domain again.
     pub fn restart(&self, instance_id: impl Into<String>) {
         {
             let mut state = self.state();
@@ -354,6 +404,13 @@ impl FakeStation {
             state.next_seq = 1;
             state.stopped = false;
             state.generation += 1;
+            for (i, tower) in state.status.towers.iter_mut().enumerate() {
+                tower.state = if i == 0 {
+                    TowerState::Connecting
+                } else {
+                    TowerState::Standby
+                };
+            }
             for stations in state.peers.values_mut() {
                 for station in stations {
                     station.link = Link::Down;
@@ -444,9 +501,13 @@ impl FakeStation {
         self.state().status.clone()
     }
 
-    /// Runs `hook` at the start of every later call, before the fake looks at the request, with
-    /// the fake unlocked: the hook may change the station (receive a message, for example), so a
-    /// test can make things happen exactly between a client's calls. Replaces an earlier hook.
+    /// Runs `hook` at the start of later calls, before the fake looks at the request, with the
+    /// fake unlocked: the hook may change the station (receive a message, for example), so a test
+    /// can make things happen exactly between a client's calls. Replaces an earlier hook.
+    ///
+    /// The hook runs for one call at a time: a call that starts while the hook is running for
+    /// another call (on another thread or task) is answered without running the hook. A test that
+    /// needs the hook before a particular call makes its calls one at a time.
     ///
     /// A call through a handle bound to an instance that is already gone (see "A bound handle" on
     /// [`FakeStation`]) is refused before the hook, which then does not run for it. `subscribe`
@@ -696,7 +757,7 @@ impl State {
             peer,
             id,
             Direction::Incoming,
-            scrub(body),
+            clean(body).into_owned(),
             MessageStatus::Received,
         )))
     }
@@ -859,6 +920,21 @@ impl State {
     }
 }
 
+/// `state` with the `error` of [`TowerState::Failing`] and the `reason` of [`TowerState::Denied`]
+/// cleaned and bounded with [`clean_tower_display`]: what [`FakeStation::set_tower_state`] and
+/// [`FakeStation::set_towers`] store.
+fn clean_tower_state(state: TowerState) -> TowerState {
+    match state {
+        TowerState::Failing { error } => TowerState::Failing {
+            error: clean_tower_display(&error),
+        },
+        TowerState::Denied { reason } => TowerState::Denied {
+            reason: clean_tower_display(&reason),
+        },
+        other @ (TowerState::Connecting | TowerState::Connected | TowerState::Standby) => other,
+    }
+}
+
 /// One page of `log` (oldest first) as rule 6 in [`crate::api`] defines it.
 fn page(log: &VecDeque<Message>, peer: Option<&str>, before: Option<u64>, limit: u32) -> LogPage {
     let mut newest_first = log
@@ -907,13 +983,6 @@ fn is_message_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Rule 9: every control character replaced with a space.
-fn scrub(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 /// Wakes its own task once and returns `Pending`, then is ready: one turn back to the runtime.

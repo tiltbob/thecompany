@@ -342,7 +342,10 @@ name = "chief-cli"
 version = "0.0.0"
 dependencies = [
  "chief",
- "numbers-base",
+ "clap",
+ "numbers-station",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2053,6 +2056,7 @@ dependencies = [
 name = "numbers"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "iroh",
  "iroh-relay",
  "n0-dns-resolver",
@@ -2076,7 +2080,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2107,11 +2113,17 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-relay",
+ "rcgen",
+ "rustix",
  "rustls",
+ "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

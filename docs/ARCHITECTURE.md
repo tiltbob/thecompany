@@ -160,15 +160,18 @@ again. So a station watches its home tower (below).
   peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
   and never passes one on; a chief may take one into the set with an explicit command (decided in
   #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
-- **A station watches its home tower.** It acts only after it has seen no home tower, or a home
-  tower that is not connected, for some seconds, and never while the home tower is connected. Then
-  it removes and re-inserts the tower, which makes iroh probe at once, and repeats that at a
-  growing, capped interval. A tower that denies the station is marked and shown with the reason. It
+- **A station watches its home tower.** After some seconds with no home or a disconnected home,
+  it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
+  configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
+  connected home alone. A tower that denies the station is marked and shown with the reason. It
   is taken out of the relay map only if another tower of the set is not marked denied; if it is
   the only tower, or every tower denies, the station changes nothing in the map, does not nudge and
   does not ask DNS because of the denial. Putting a denied tower back and asking DNS again happen
   only when the set changes or at a long interval. The station limits its own attempts; it does not
   control iroh's own retries (decided in #74, built in #78).
+  Station API version 2 represents an unobserved tower as `Standby`, including when there is no
+  home tower observation. An explicit refusal remains `Denied`. Status can also carry the source
+  of each tower and the SRV bootstrap domain.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
   airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
@@ -197,9 +200,10 @@ again. So a station watches its home tower (below).
 ### Link and protocols
 
 Two members share **one authenticated link** (ALPN `numbers/0`). It opens with a hello (version,
-network id, roster head); each feature is then a typed stream whose first frame is `{proto, v}` —
-`chat`, `roster`, `airspace`, `pty`, `sock`, `agent`, `apikey`, `file`, `lock`. One gate decides, default
-deny, whether this caller may open this protocol:
+network id, roster head, link generation, and a freshness challenge). Each feature then opens a
+typed stream whose first frame is `{proto, v}` — `chat`, `roster`, `airspace`, `pty`, `sock`,
+`agent`, `apikey`, `file`, `lock`. One gate decides, default deny, whether this caller may open
+this protocol:
 
 | Caller → callee | Allowed |
 |---|---|
@@ -214,6 +218,80 @@ deny, whether this caller may open this protocol:
 of roster proofs. Control messages are length-prefixed JSON frames (size-capped, read deadlines,
 unknown fields tolerated); bulk data is raw stream bytes. One link instead of one ALPN per feature
 keeps authorization in one place and hides from the tower which feature is in use.
+
+In M1, the `numbers/0` dialer opens a bidirectional stream and each end sends a hello with
+`v: 1`, `network: ""` and `head: ""`. Both reserved fields must be empty strings. The initial
+client hello omits `echo`, and receivers also accept `null` as absent. The `generation` stays
+the same for each running link instance, while the `challenge` is fresh for each hello. Both
+are nonzero arrays of 16 random bytes. The server includes the client's challenge as `echo`
+in its hello. The client verifies that echo, then returns the server's challenge in an
+`{"echo":[…]}` frame. The server checks the echo before admitting its connection.
+
+A new authenticated generation can replace a connection left open by a crash. A hello for a
+different generation is admitted only if the remembered generation has stayed the same since
+before the fresh challenge. When concurrent hellos present different generations, the first
+admission that changes the remembered generation takes precedence. A later handshake can start
+from the updated value. For the same generation, crossed dials keep the connection initiated by
+the lower node ID in lexicographic order of the 32 public key bytes. A fresh connection replaces
+one from the same initiator. There is at most one pending incoming hello per peer. A second incoming
+connection while that hello is pending is refused immediately with code `0`. A sender whose
+outgoing dial loses can wait for the pending hello to establish a link and redial once if it fails.
+If the fallback also loses and no open link, incoming hello or shared dial remains, the send
+returns `Disconnected` even if the deadline has time left. A send that shares a failed dial
+receives that dial's error under the same conditions. When the direct-only restart tests were run
+on a multi-thread runtime, iroh could redial the peer's old address immediately after a stall
+close. M1 relies on the tower path for recovery in this case.
+[#120](https://github.com/tiltbob/thecompany/issues/120)
+
+If the higher-ID peer closes a link initiated by the lower-ID peer and the close is lost, the
+lower-ID peer can still see the link as open. While the generation stays the same, the lower-ID
+peer can refuse both dials from the higher-ID peer with code `409`. The higher-ID peer can
+reconnect once the lower-ID peer detects the old connection's closure or retires it. M1 relies
+on QUIC and the send progress check for that detection. When looking for a connection after a
+lost election, it makes at most one fallback dial.
+
+Link application close codes are `400` for a bad hello or an acceptor's hello timeout, `403` for
+authorization refusal, `409` for replacement, and `0` for ordinary closure. At its own setup
+deadline, the dialer reports `Timeout` and closes any pending connection with `0`. During setup,
+a remote `400` or `403` ends the dial as `BadHello` or `NotAllowed`, respectively. A remote `409`
+uses the winner and fallback rules above. Other 32-bit application close codes are classified as
+`Disconnected`. During the hello exchange, a close without an application code, such as a
+transport-level close, or with a code above 32 bits ends the dial as `BadHello`, because every I/O
+failure of the hello exchange is mapped to it. Either end of an admitted link can open a
+bidirectional chat stream with the header `{"proto":"chat","v":1}`, followed by one message.
+Each JSON frame has a four-byte big-endian length and a payload limit of 64 KiB.
+
+A chat message carries `id`, `sent_at_ms` and `body`. The sender assigns an ID of 1–64 ASCII
+letters, digits, underscores or hyphens and reports its own time in Unix milliseconds. The
+receiver treats both as peer input. The body is padded standard base64 on the wire and decodes
+to at most 16 KiB of UTF-8. The receiver replies with `{"type":"ack"}` or a
+`{"type":"nack","reason":"…"}` containing one of `unknown_protocol`, `unsupported_version`,
+`invalid_id`, `body_too_large`, `invalid_body` or `unavailable`. The sender reports `BadReply`
+for an unknown NACK reason. The receiving actor acknowledges the message after deciding whether it
+is a new message or a retry.
+
+`connect_timeout` bounds each dial and hello together. `send_deadline` bounds the send, including
+any shared dials, retries and waits for a reply. On the first attempt over an already established
+connection, the sender checks for transport progress a full `connect_timeout` after queuing the
+request, if this interval is positive and shorter than the remaining send budget. A
+`connect_timeout` equal to or longer than `send_deadline` leaves the overall deadline in force
+and skips that early check. If the connection is still current and has received no
+authenticated QUIC frames since before the request was written, the sender closes it. A send
+waiting for stream credit skips the progress check. After a crash leaves a connection with no
+stream credit, sends can time out until QUIC's 30 s idle timeout or until the restarted peer
+connects first. QUIC replenishes credits in batches. The stall was reproduced with 14 unanswered
+sends on loopback. [#119](https://github.com/tiltbob/thecompany/issues/119)
+
+If a chat stream disconnects before its connection reports a close reason, the sender waits for that
+connection's close or peer revocation. The wait is bounded by `connect_timeout` and the time left
+before the original send deadline. If the wait expires with the connection still open, the send
+returns `Disconnected`. The overall deadline can expire first and return `Timeout`. The sender
+can retry once after an ordinary connection closure and once after observing a replacement.
+Each retry uses the same message ID and the original deadline. An `unavailable` reply to a retry
+leaves delivery uncertain because an earlier attempt can still be accepted. The receiver handles
+up to 16 concurrent incoming streams per link and applies `send_deadline` to each stream,
+including waiting for the actor's reply. It refuses unauthorized chat on an established link by
+resetting the stream with code `403`. A full or closed chat mailbox returns `unavailable`.
 
 ### Stations and the chief's frontends
 
@@ -234,10 +312,10 @@ The station is the node; frontends hold no network state.
 - **The admin key stays in the frontend.** The frontend builds the statement itself from the user's
   command and shows what will be signed; it never signs bytes or a description the station supplied.
   The key file never crosses the socket.
-- **A station takes input from peers, never orders.** It strips control characters from every
-  peer-supplied string before a frontend sees it, never opens a URL or file on a peer's say-so,
-  accepts files only as answers to its own pulls or as quarantined offers, and offers no reverse
-  forwards.
+- **A station takes input from peers, never orders.** It replaces control characters, line
+  separators and bidi controls (API rule 9) in every peer-supplied string before a frontend sees
+  it, never opens a URL or file on a peer's say-so, accepts files only as answers to its own pulls
+  or as quarantined offers, and offers no reverse forwards.
 - **iOS.** There are no daemons, so the app embeds the station core and is a foreground-only station
   that stops before the app is suspended. Messages for a phone wait in airspace.
 
@@ -251,8 +329,9 @@ encrypted blocks**.
   What travels and rests everywhere is the same ciphertext block, addressed by the BLAKE3 hash of its
   bytes, so any node, a tower included, can verify a block without being able to read it. Small
   things (text objects, git data) are packed into blocks of a few MiB; large files are cut into
-  blocks and can be resumed, streamed and read by range. The tower binary contains no sealing or key
-  code, and CI checks that.
+  blocks and can be resumed, streamed and read by range. The tower binary contains no sealing code
+  and no member, admin or airspace key, and CI checks that it links no member code. Its only keys
+  are its own TLS key and, when it takes its certificate from Let's Encrypt, its ACME account key.
 - **Durability (agreed).** Every tower keeps every block. A write counts as stored once two towers
   confirm it; a tower that was down catches up afterwards. The writer keeps its copy until then and
   airspace reports "not yet durable" (always, with a single tower). A member uploads once and the
@@ -395,7 +474,7 @@ moves from OS accounts inside one safehouse to one safehouse per chief or per jo
 Cargo.toml  rust-toolchain.toml  clippy.toml  CLAUDE.md  .github/workflows/ci.yml  scripts/
 docs/               ARCHITECTURE.md  ROADMAP.md         (this plan, kept current per milestone)
 crates/
-  base/             leaf crate: frame codec, key files; later the roster codec   package `numbers-base`
+  base/             leaf crate: frame codec, key files, pure tower URL validation; later the roster codec   package `numbers-base`
   numbers/          the network library: towers, endpoint + gate, link, protocols
   tower/            `tower` binary + embeddable lib (used by tests)              package `numbers-tower`
   station/          station core + local-socket server (library)                 package `numbers-station`
@@ -463,7 +542,11 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   endpoint id). `iroh::RelayConfig` (client) is a different type from
   `iroh_relay::server::RelayConfig`. In TLS mode the server also binds a plain-HTTP listener on
   `RelayConfig::http_bind_addr` that cannot be turned off and answers only `/generate_204`; ACME is
-  tls-alpn-01 on the HTTPS port only and needs `cache_path` (source reading); QAD needs TLS;
+  tls-alpn-01 on the HTTPS port only and needs `cache_path` (source reading); building
+  `AcmeConfig::letsencrypt(..)` and `CertConfig::LetsEncrypt` touches neither the network nor the
+  cache, and the ACME client starts inside `Server::spawn`, writing its account key and the
+  certificate with its key into the cache directory with default file permissions (source
+  reading, tokio-rustls-acme 0.10); QAD needs TLS;
   `Server::spawn` cannot add HTTP routes. The allowlist (`AccessControl`, `Access::Deny { reason }`)
   gates `/relay` only: a denied endpoint still used QAD and the `/ping` probe. Removing an id from
   the list does not disconnect it; `relay_service().clients().disconnect(id, None)` does (21–22 ms).
@@ -475,7 +558,31 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   After `Server::shutdown()` right after a client came online,
   the client still reported itself connected in 8 of 180 runs (whether it could still relay was not
   tested); it was not observed in 180 runs each when shutting down at least 1 s after the last
-  connect or stopping the tower's own runtime (observations, not guarantees).
+  connect or stopping the tower's own runtime (observations, not guarantees). The relay's
+  supervisor ends as soon as any of its tasks ends (`src/server.rs:960-978`), and nothing
+  listens after that: the address-discovery accept loop ends when noq's endpoint driver fails on
+  a UDP receive error other than `ECONNRESET` or `EMSGSIZE` (noq 1.5.0 `src/endpoint.rs:1036`,
+  then `accept` gives `None`, `:812`; iroh-relay `src/quic.rs:146`), and the ACME task ends with
+  its event stream. `Server::join` (`:901`) waits for the supervisor without stopping it, and
+  `Server::shutdown` (`:879`) awaits the same handle, so it must not be called after `join`
+  returned; `Tower::stopped` waits on `join`. Start errors, from the source: `BindTlsListener`
+  (`:807`) is, despite its name, the plain-HTTP listener of a TLS tower; `BindTcpListener`
+  (`src/server/http_server.rs:462`) is the relay's own listener and names its address in its
+  message; a taken address-discovery port is `QuicSpawn` with `QuicSpawnError::EndpointServer`
+  (`src/quic.rs:114`), whose type is in a private module, so the `io::Error` is read through
+  `Error::source`. The ACME client's events are logged under the target `iroh_relay::server` in
+  a span named `acme` (`src/server.rs:777-783`): `debug!("acme event: {ok:?}")` for a step
+  (tokio-rustls-acme 0.10.0 `EventOk`: `DeployedCachedCert`, `DeployedNewCert`,
+  `CertCacheStore`, `AccountCacheStore`, `src/state.rs:56`; no variant has a field) and
+  `error!("error: {err:?}")` for a failure (`EventError`, `src/state.rs:63-78`: `Order`, the four
+  cache errors `CertCacheLoad`, `CertCacheStore`, `AccountCacheLoad`, `AccountCacheStore`,
+  `CachedCertParse`, `NewCertParse`), whose text can carry the domain. Only a failed order sets a
+  wait before the next attempt, 2^n seconds with n growing to 16 (`src/state.rs:417-426`); a
+  cache error is reported once and sets no wait: a failed load is not tried again (`:398`,
+  `:409`) and a failed store is not repeated (`:259`, `:449`). Its cache writes use
+  `fs::create_dir_all` and `fs::write` with the process's default modes
+  (`src/caches/dir.rs:36-38`), so the tower creates the directory with mode 0700 itself.
+  tracing-subscriber 0.3.23's fmt layer writes to standard output (`src/fmt/fmt_layer.rs:749`).
 - **Router and gate.** `Router::builder(ep).incoming_filter(..).accept(ALPN, proto).spawn()`;
   `spawn` overrides builder ALPNs; dropping the `Router` aborts it, so call `router.shutdown().await`.
   When `accept()` returns the connection closes, so loop on `accept_bi`; streams are lazy, so write
@@ -502,7 +609,10 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   25 runs within 50 s). A connection relayed through the stopped tower kept that path and ended at
   the idle timeout in 20 of 20 runs; a new dial worked once both ends had moved. `remove_relay` of
   the home tower moved the endpoint to another in 220–244 ms; `remove_relay` of the only tower
-  took it out of the map but left the home connection and the status as they were. A tower that
+  took it out of the map but left the home connection and the raw status as they were. The same
+  can happen with an unresponsive replacement. `tower_states()` lists only configured towers,
+  and `home_relay_status()` reports the actual home. A map change schedules a full net report
+  even when `insert_relay` keeps the same configuration, so a nudge needs no removal. A tower that
   denies an endpoint can still become its home when another tower is
   in the map (17 of 30) and keeps it; `remove_relay` of the denying tower freed it in about 0.2 s.
   `Endpoint::online()` has no timeout: wrap it, and report `home_relay_status()`. When the endpoint
@@ -541,13 +651,21 @@ compiled in a harness, and equivalent loopback lab tests supplied the measured n
   Use `canonical_tower_url` for explicit, SRV, remembered and peer-supplied tower URLs. It lowercases
   DNS names, removes the trailing dot and default port, and keeps the root slash. Plain HTTP
   requires a literal loopback address.
-- **TLS and QAD (M2).** A tower reads its certificate and key from PEM files through
-  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` into
+- **TLS and QAD (M2).** A tower takes its certificate either from Let's Encrypt (ACME; see Tower
+  above) or from PEM files. From files, it reads the certificate and key itself (regular files
+  only; a directory, device or FIFO could block) and checks the pair before it serves it: the
+  chain holds a certificate, every one is an X.509 version 3 certificate that webpki parses (no
+  version 1 root), the key file holds exactly one key that ring can use, and the key belongs to
+  the certificate. It hands the pair to
+  rustls through its own certificate resolver, in
   `rustls::ServerConfig::builder_with_provider(..)` and `CertConfig::Manual`; the provider is passed
-  explicitly and no process-wide default was installed or needed. The resolver fails at once on a
-  missing, unreadable or non-PEM key file, but accepts a certificate file that holds no PEM
-  certificate (an empty chain; `Server::spawn` succeeds), so a tower checks that file itself (found
-  while building the tower, #70). A test endpoint trusts the
+  explicitly and no process-wide default was installed or needed. It reads both files again once a
+  day and replaces the pair only when the new one passes the same checks. iroh-relay's own
+  `reloading_resolver(&provider, cert, key, DEFAULT_CERT_RELOAD_INTERVAL)` is not used: it fails at
+  once on a missing, unreadable or non-PEM key file, but accepts a certificate file that holds no
+  PEM certificate (an empty chain; `Server::spawn` succeeds), never checks that the key belongs to
+  the certificate (source reading), and its errors can quote the file (found while building the
+  tower, #70). A test endpoint trusts the
   certificate with `iroh::tls::CaTlsConfig::custom_roots` (an empty list fails `bind()`) and came
   online in 223–325 ms. An endpoint that does not trust it never chooses a home tower: empty
   status, no error, `online()` pending. QAD ran when the relay map carried the tower's QAD port

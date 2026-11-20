@@ -4,9 +4,9 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::TransportAddr;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::{TransportAddr, Watcher};
 use numbers::{
     Authorizer, Endpoint, EndpointConfig, IpTransport, TowerControl, TowerControlError, TowerEntry,
     TowerSet, TowerState, TowerStatus, canonical_tower_url, generate_node_key,
@@ -196,11 +196,37 @@ async fn replacing_towers_moves_home_without_rebinding() {
     .await
     .expect("tower replacement timed out");
     assert_eq!(endpoint.iroh().bound_sockets(), sockets);
-    checked(
-        endpoint.set_towers(&TowerSet::default()).await,
-        "remove all towers",
-    );
-    assert!(checked(endpoint.tower_states(), "read empty tower set").is_empty());
+    // Removing a home from the map is not a disconnect. A replacement that cannot answer
+    // leaves it serving, even though the wrapper's snapshot only includes configured towers.
+    let offline = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let offline_set =
+        TowerSet::from_url(&format!("http://{}", offline.local_addr().unwrap())).unwrap();
+    let second_url = tower_url(&second);
+    let mut raw_home = endpoint.iroh().home_relay_status();
+    for set in [&offline_set, &TowerSet::default()] {
+        checked(endpoint.set_towers(set).await, "replace the connected home");
+        let snapshot = states(&control);
+        assert!(snapshot.iter().map(|state| state.url()).eq(set.urls()));
+        assert!(
+            snapshot
+                .iter()
+                .all(|state| !state.is_home && state.status == TowerStatus::Unknown)
+        );
+        let still_connected = |relays: &[iroh::endpoint::RelayStatus]| {
+            relays
+                .iter()
+                .any(|relay| relay.url().as_str() == second_url && relay.is_connected())
+        };
+        assert!(still_connected(&raw_home.get()));
+        let changed = timeout(Duration::from_secs(1), async {
+            while still_connected(&checked(raw_home.updated().await, "read raw home update")) {}
+        })
+        .await;
+        assert!(
+            changed.is_err(),
+            "iroh no longer keeps a removed home connected"
+        );
+    }
     endpoint.iroh().close().await;
     checked(first.shutdown().await, "stop first tower");
     checked(second.shutdown().await, "stop second tower");
@@ -239,6 +265,25 @@ async fn refusing_home_tower_is_denied() {
     let debug = format!("{state:?}");
     assert!(!debug.contains(state.url()));
     assert!(!debug.contains(reason));
+    // Catch the raw in-progress observation of retries, when iroh temporarily drops the error.
+    let mut home = endpoint.iroh().home_relay_status();
+    timeout(Duration::from_secs(10), async {
+        for _ in 0..3 {
+            loop {
+                let relays = checked(home.updated().await, "observe the next relay attempt");
+                if relays
+                    .iter()
+                    .any(|relay| !relay.is_connected() && relay.last_error().is_none())
+                {
+                    break;
+                }
+            }
+            let status = &states(&control)[0].status;
+            assert!(matches!(status, TowerStatus::Denied { reason: text } if text == reason));
+        }
+    })
+    .await
+    .expect("denying home did not retry three times");
     endpoint.iroh().close().await;
     checked(tower.shutdown().await, "stop denying tower");
 }
@@ -283,4 +328,33 @@ async fn station_control_survives_endpoint_handoff_and_releases_with_router() {
     );
     assert_eq!(control.nudge_towers().await, Err(TowerControlError::Closed));
     checked(tower.shutdown().await, "stop tower");
+}
+
+#[tokio::test]
+async fn a_closed_endpoint_rejects_tower_control_while_both_handles_stay_live() {
+    let empty = TowerSet::default();
+    let endpoint = bind(
+        empty.clone(),
+        IpTransport::RelayOnly,
+        Arc::new(Authorizer::new(&[], &[])),
+    )
+    .await;
+    let control = endpoint.tower_control();
+    endpoint.iroh().close().await;
+
+    assert_eq!(endpoint.tower_states(), Err(TowerControlError::Closed));
+    assert_eq!(
+        endpoint.set_towers(&empty).await,
+        Err(TowerControlError::Closed)
+    );
+    assert_eq!(
+        endpoint.nudge_towers().await,
+        Err(TowerControlError::Closed)
+    );
+    assert_eq!(control.tower_states(), Err(TowerControlError::Closed));
+    assert_eq!(
+        control.set_towers(&empty).await,
+        Err(TowerControlError::Closed)
+    );
+    assert_eq!(control.nudge_towers().await, Err(TowerControlError::Closed));
 }

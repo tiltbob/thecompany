@@ -15,15 +15,24 @@ clap.workspace = true
 iroh-base.workspace = true
 iroh-relay = { workspace = true, features = ["server"] }
 rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The effective user id, to check the ACME cache directory's owner.
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 # Integration tests act as stations through the tower.
 iroh.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+rcgen.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "test-util", "time"] }
 
 [lints]
 workspace = true

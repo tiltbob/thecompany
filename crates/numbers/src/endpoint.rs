@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as SnapshotMutex, MutexGuard, PoisonError, Weak};
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::dns::DnsResolver;
@@ -11,12 +11,12 @@ use iroh::endpoint::{
     presets,
 };
 use iroh::protocol::{DynProtocolHandler, Router, RouterBuilder as IrohRouterBuilder};
-use iroh::{RelayMap, RelayMode, SecretKey, TransportAddr, Watcher};
+use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher};
 use n0_future::{StreamExt, boxed::BoxStream, stream};
 use tokio::sync::Mutex;
 
 use crate::gate::Gate;
-use crate::{Authorizer, NodeId, TowerSet};
+use crate::{Authorizer, MAX_TOWERS, NodeId, TowerSet};
 
 /// Endpoint settings supplied by the station.
 #[derive(Clone, Debug, Default)]
@@ -116,7 +116,47 @@ struct EndpointRuntime {
     endpoint: iroh::Endpoint,
     gate: Gate,
     relays: RelayMap,
-    tower_updates: Mutex<()>,
+    tower_snapshot: SnapshotMutex<TowerSnapshot>,
+    /// Serializes map edits and keeps the URL whose notification may have been interrupted.
+    tower_updates: Mutex<Option<RelayUrl>>,
+}
+
+struct TowerSnapshot {
+    wanted: TowerSet,
+    // The endpoint binds one relay transport, which observes one home at a time.
+    home_failure: Option<(String, TowerStatus)>,
+}
+
+impl TowerSnapshot {
+    fn configure(&mut self, wanted: &TowerSet) {
+        if let Some((url, _)) = &self.home_failure
+            && !wanted.urls().any(|configured| configured == url)
+        {
+            self.home_failure = None;
+        }
+        self.wanted = wanted.clone();
+    }
+
+    fn observe(&mut self, home: Option<&str>, status: TowerStatus) -> TowerStatus {
+        if let Some(url) = home {
+            match status {
+                TowerStatus::Failing | TowerStatus::Denied { .. } => {
+                    self.home_failure = Some((url.to_owned(), status.clone()));
+                    return status;
+                }
+                TowerStatus::Unknown => {
+                    if let Some((previous, failure)) = &self.home_failure
+                        && previous == url
+                    {
+                        return failure.clone();
+                    }
+                }
+                TowerStatus::Connected => {}
+            }
+        }
+        self.home_failure = None;
+        status
+    }
 }
 
 /// A station's handle for observing and updating its endpoint's towers.
@@ -147,7 +187,7 @@ pub enum TowerControlError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct TowerState {
     url: String,
-    /// Whether iroh has selected this tower as home.
+    /// Whether iroh has selected this configured tower as home.
     pub is_home: bool,
     /// The last observed connection status.
     pub status: TowerStatus,
@@ -172,15 +212,17 @@ impl fmt::Debug for TowerState {
 /// The connection information available for a configured tower.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TowerStatus {
-    /// No connection outcome has been observed for this tower.
+    /// This tower is not the observed home, or no connection outcome has been observed yet.
     Unknown,
     /// The endpoint is connected to this tower.
     Connected,
-    /// The last connection attempt failed.
+    /// The last observed connection attempt failed. The station supplies any display text.
     Failing,
     /// The tower refused the endpoint.
     Denied {
-        /// Untrusted display text from the tower, with control characters replaced by spaces.
+        /// Untrusted tower text of unrestricted length, with `char::is_control` characters
+        /// replaced by spaces. The station applies its API's cleaning and display-size limit
+        /// before showing this to a frontend.
         reason: String,
     },
 }
@@ -254,7 +296,11 @@ impl Endpoint {
                 endpoint,
                 gate,
                 relays,
-                tower_updates: Mutex::new(()),
+                tower_snapshot: SnapshotMutex::new(TowerSnapshot {
+                    wanted: config.towers,
+                    home_failure: None,
+                }),
+                tower_updates: Mutex::new(None),
             }),
         })
     }
@@ -267,6 +313,7 @@ impl Endpoint {
     /// Serve all inbound protocols through [Self::router_builder]. Never call
     /// [`iroh::Endpoint::accept`], [`iroh::Endpoint::set_alpns`], or [`Router::builder`]
     /// with this handle. Doing so can bypass the pre-handshake filter.
+    /// Use [Self::set_towers] and [Self::nudge_towers] for relay-map changes.
     pub fn iroh(&self) -> &iroh::Endpoint {
         &self.runtime.endpoint
     }
@@ -280,17 +327,17 @@ impl Endpoint {
 
     /// Applies changes to the configured towers without rebinding the endpoint.
     ///
-    /// See [TowerControl::set_towers] for cancellation behavior.
+    /// See [TowerControl::set_towers] for cancellation and existing relay connections.
     pub async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
         self.runtime.set_towers(towers).await
     }
 
-    /// Reads the states of configured towers, with connection outcomes for the home tower only.
+    /// Reads the configured-tower snapshot. See [TowerControl::tower_states].
     pub fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
         self.runtime.tower_states()
     }
 
-    /// Removes and re-inserts the configured towers to request a new net report.
+    /// Requests a new net report when the home tower is missing or disconnected.
     ///
     /// See [TowerControl::nudge_towers] for cancellation behavior.
     pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
@@ -313,6 +360,10 @@ impl Endpoint {
     pub fn authorizer(&self) -> &Authorizer {
         &self.runtime.gate.authorizer
     }
+
+    pub(crate) fn authorizer_handle(&self) -> Arc<Authorizer> {
+        Arc::clone(&self.runtime.gate.authorizer)
+    }
 }
 
 impl fmt::Debug for Endpoint {
@@ -324,21 +375,34 @@ impl fmt::Debug for Endpoint {
 impl TowerControl {
     /// Applies changes to the configured towers without rebinding the endpoint.
     ///
-    /// An interrupted update can leave a partially applied set. The next update
-    /// compares its target with the actual relay map.
+    /// The requested set becomes the configured snapshot before relay-map edits begin. If the
+    /// update is interrupted, the live relay map may be partially updated. A later update
+    /// reconciles the map with its target and delivers any interrupted change notification.
+    /// Lookup can see both old and new URLs during an update, up to [`MAX_TOWERS`]. Reapplying
+    /// a fully applied set sends no notification.
+    ///
+    /// Removing a tower from the relay map does not disconnect an existing relay connection.
+    /// Iroh may keep the removed home if the new set is empty or no replacement responds.
     pub async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
         self.runtime()?.set_towers(towers).await
     }
 
-    /// Reads configured tower states. Only the home tower can have an observed outcome.
+    /// Reads the configured-tower snapshot, including during a relay-map update. A configured
+    /// home retains its last observed failure or denial while retrying. A connected observation
+    /// or a change of observed home clears the old failure.
+    ///
+    /// A home removed from the configured set is omitted even if it is still connected.
+    /// To observe the actual home, use [`iroh::Endpoint::home_relay_status`].
     pub fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
         self.runtime()?.tower_states()
     }
 
-    /// Removes and re-inserts the configured towers to request a new net report.
+    /// Reconciles the relay map with the configured set and requests a full net report if the
+    /// set is nonempty. Call this when the home tower is missing or disconnected. A full report
+    /// can change the home even when its connection works.
     ///
-    /// If interrupted, a relay may still be removed. Use [Self::set_towers]
-    /// to reapply the desired set.
+    /// If interrupted, a later [Self::set_towers] or nudge reconciles the map and delivers any
+    /// interrupted notification.
     pub async fn nudge_towers(&self) -> Result<(), TowerControlError> {
         self.runtime()?.nudge_towers().await
     }
@@ -357,60 +421,130 @@ impl EndpointRuntime {
     }
 
     async fn set_towers(&self, towers: &TowerSet) -> Result<(), TowerControlError> {
-        let _update = self.tower_updates.lock().await;
+        let mut pending = self.tower_updates.lock().await;
+        self.apply_tower_update(Some(towers), &mut pending).await
+    }
+
+    async fn nudge_towers(&self) -> Result<(), TowerControlError> {
+        let mut pending = self.tower_updates.lock().await;
+        self.apply_tower_update(None, &mut pending).await
+    }
+
+    fn tower_snapshot(&self) -> MutexGuard<'_, TowerSnapshot> {
+        self.tower_snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Called with `tower_updates` held through all map edits and notifications. `None` nudges
+    /// the current configuration.
+    async fn apply_tower_update(
+        &self,
+        towers: Option<&TowerSet>,
+        pending: &mut Option<RelayUrl>,
+    ) -> Result<(), TowerControlError> {
         self.ensure_open()?;
-        let desired = towers.relay_map();
-        // Compare actual relay configs, including QAD, so retries also repair a
-        // partially applied update. Remove replacements before inserting them.
-        for relay in self.relays.relays::<Vec<_>>() {
-            if desired.get(&relay.url).as_ref() != Some(&relay) {
-                self.endpoint.remove_relay(&relay.url).await;
+        let desired = {
+            let mut snapshot = self.tower_snapshot();
+            if let Some(towers) = towers {
+                snapshot.configure(towers);
             }
-        }
+            snapshot.wanted.relay_map()
+        };
+        let mut notify = towers.is_none();
+        let mut obsolete = self
+            .relays
+            .urls::<Vec<_>>()
+            .into_iter()
+            .filter(|url| !desired.contains(url));
         for relay in desired.relays::<Vec<_>>() {
-            if self.relays.get(&relay.url).as_ref() != Some(&relay) {
-                self.endpoint.insert_relay(relay.url.clone(), relay).await;
+            let current = self.relays.get(&relay.url);
+            if current.as_ref() == Some(&relay) {
+                continue;
             }
+            // Replace changed settings at the same URL in place. When adding at capacity,
+            // one URL must be obsolete since the desired set has room for the new URL.
+            if current.is_none()
+                && self.relays.len() == MAX_TOWERS
+                && let Some(url) = obsolete.next()
+            {
+                self.change_relay(url, None, pending).await;
+            }
+            self.change_relay(relay.url.clone(), Some(relay), pending)
+                .await;
+            notify = false;
+        }
+        for url in obsolete {
+            self.change_relay(url, None, pending).await;
+            notify = false;
+        }
+
+        // The report sees the whole map. One completed edit covers any interrupted notice.
+        // If the map already matched, replay a pending notice or send one for an explicit nudge.
+        if let Some(url) = pending.clone() {
+            let relay = self.relays.get(&url);
+            self.change_relay(url, relay, pending).await;
+        } else if notify && let Some(relay) = self.relays.relays::<Vec<_>>().into_iter().next() {
+            self.change_relay(relay.url.clone(), Some(relay), pending)
+                .await;
         }
         self.ensure_open()
+    }
+
+    async fn change_relay(
+        &self,
+        url: RelayUrl,
+        relay: Option<Arc<RelayConfig>>,
+        pending: &mut Option<RelayUrl>,
+    ) {
+        // Iroh mutates the map before awaiting delivery of RelayMapChange. Keep the URL even
+        // if the future is dropped after the mutation and before the notification is sent.
+        *pending = Some(url.clone());
+        if let Some(relay) = relay {
+            self.endpoint.insert_relay(url, relay).await;
+        } else {
+            self.endpoint.remove_relay(&url).await;
+        }
+        *pending = None;
     }
 
     fn tower_states(&self) -> Result<Vec<TowerState>, TowerControlError> {
         self.ensure_open()?;
+        let mut snapshot = self.tower_snapshot();
         let home = self.endpoint.home_relay_status().get();
-        let states = self
-            .relays
-            .urls::<Vec<_>>()
-            .into_iter()
+        let observed = home.iter().find(|relay| {
+            snapshot
+                .wanted
+                .urls()
+                .any(|url| url == relay.url().as_str())
+        });
+        let status = match observed {
+            Some(relay) if relay.is_connected() => TowerStatus::Connected,
+            Some(relay) => match relay.auth_denied_reason() {
+                Some(reason) => TowerStatus::denied(reason),
+                None if relay.last_error().is_some() => TowerStatus::Failing,
+                None => TowerStatus::Unknown,
+            },
+            None => TowerStatus::Unknown,
+        };
+        let home_url = observed.map(|relay| relay.url().as_str());
+        let status = snapshot.observe(home_url, status);
+        Ok(snapshot
+            .wanted
+            .urls()
             .map(|url| {
-                let observed = home.iter().find(|relay| relay.url() == &url);
-                let status = match observed {
-                    Some(relay) if relay.is_connected() => TowerStatus::Connected,
-                    Some(relay) => match relay.auth_denied_reason() {
-                        Some(reason) => TowerStatus::denied(reason),
-                        None if relay.last_error().is_some() => TowerStatus::Failing,
-                        None => TowerStatus::Unknown,
-                    },
-                    None => TowerStatus::Unknown,
-                };
+                let is_home = Some(url) == home_url;
                 TowerState {
-                    url: url.to_string(),
-                    is_home: observed.is_some(),
-                    status,
+                    url: url.to_owned(),
+                    is_home,
+                    status: if is_home {
+                        status.clone()
+                    } else {
+                        TowerStatus::Unknown
+                    },
                 }
             })
-            .collect();
-        Ok(states)
-    }
-
-    async fn nudge_towers(&self) -> Result<(), TowerControlError> {
-        let _update = self.tower_updates.lock().await;
-        self.ensure_open()?;
-        for relay in self.relays.relays::<Vec<_>>() {
-            self.endpoint.remove_relay(&relay.url).await;
-            self.endpoint.insert_relay(relay.url.clone(), relay).await;
-        }
-        self.ensure_open()
+            .collect())
     }
 }
 
