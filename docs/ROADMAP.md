@@ -12,8 +12,8 @@ Each milestone is one small, demoable PR series with an automated check and a ma
 | M0 | Scaffolding: workspace, toolchain pin, CI with the confinement lint, CLAUDE.md, docs, tracking issues | CI green with a real test per crate; issues exist | — |
 | **M1** | **Two chiefs chat**: dev tower, station daemon, `chief` CLI over the local socket, manual peer book | CI: chat through an in-process tower, the same relay-only, a stranger refused, a second station on one data dir refused, CLI ↔ station over the socket, and a scripted walkthrough with the real binaries | M0 |
 | M2 | Real-world tower, station as a service: TLS (cert files; ACME optional), QAD, SRV bootstrap, several towers, a remembered tower set (SRV again only when no known tower answers) that peers exchange and show, static allowlist + rate limit, systemd units, FFI smoke check | CI, in-process: TLS tower with a test certificate, QAD, fake SRV resolver; a station that knows its towers starts without an SRV lookup and returns to SRV only when none answers; an unlisted station id is denied. Demo: two stations on different networks, given only a domain, chat, relayed or direct | M1; decisions 13, 16, 17 (settled); **needs:** a public host and a DNS zone (demo only), and a ruling on hard rule 10 for the FFI smoke check |
-| M3 | Membership: chief ids and admin keys, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, invites, station commissions, roster sync, signed address records passed between nodes, removal, the tower's own endpoint with a roster-fed allowlist; `chief network` | a second chief joins by invite through an allowlisting tower and chats without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while removal and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); a chief revokes one of their two devices and keeps working from the other; a removed chief is refused by every node after sync | M1 (allowlist feed: M2); decisions 1, 2; **needs:** Nitrokey HSM 2 tokens |
-| M4 | Airspace I: sealed blocks on towers and members, spaces and keys, names, leases and quotas, the two-tower rule with tower-to-tower pull; text objects; `chief airspace` | an object written on one station is read on another after the first went offline; the tower's disk holds only ciphertext; "stored" needs two towers; a rolled-back name is refused; unleased blocks lapse | M3; decisions 4, 5, 6 |
+| M3 | Membership: chief ids and admin keys, an enrollment key on a Nitrokey HSM with the enrollment-requires-HSM rule, signed roster with the tower set, invites, station commissions, roster sync, signed address records passed between nodes, removal, the tower's own endpoint with a roster-fed allowlist; linked towers: a link between every two towers of the signed set, forwarding to the tower a node is connected to, roster replication between towers; `chief network` | a second chief joins by invite through an allowlisting tower and chats without `peer add`; with the HSM rule on, an enrollment without the token's signature is rejected by every node, while removal and daily use work without the token (CI: a software PKCS#11 token; a real Nitrokey by hand); a chief revokes one of their two devices and keeps working from the other; a removed chief is refused by every node after sync; two stations that each know one tower, and not the same one, chat through both towers, and a statement given to one tower reaches a member that asks the other | M1 (allowlist feed: M2); decisions 1, 2, 20; **needs:** Nitrokey HSM 2 tokens |
+| M4 | Airspace I: sealed blocks on towers and members, spaces and keys, names, leases and quotas, the two-tower rule with replication between towers (blocks, names, leases, quota counts); text objects; `chief airspace` | an object written on one station is read on another after the first went offline; the tower's disk holds only ciphertext; "stored" needs two towers, and is reached by a writer that knows only one; an object written through one tower is read through another by a member that knows only that one; a rolled-back name is refused; unleased blocks lapse | M3; decisions 4, 5, 6, 20 |
 | M5 | Safehouse, set up by hand by a chief: admission, `chief safehouses`, safehouse-hosted terminals (`chief shell`), `pty` harness presets, per-chief OS accounts, confinement checks | a chief runs `claude` and `codex` on a safehouse with API keys set by hand; an agent process cannot read the safehouse's key or another chief's home | M3; decision 3 |
 | M6 | Secrets, then harness API keys on them. (a) Secrets in three scopes — user (one chief), team, project — sealed in airspace spaces of their own; projects; `chief secret`, `chief project`; delivery to a safehouse for a terminal or session. (b) Harness API keys for Claude and Codex as secrets: the presets name the secret, a start resolves it project, then user, then team; `chief harness status` | (a) a secret set on one station is listed on the chief's other station, with no command returning its value; a team secret reaches every chief, a project secret only its members; a session gets exactly the names its harness asks for; after a chief is removed, every secret they could open is listed for rotation; the tower's disk holds only ciphertext. (b) both harnesses run on a safehouse on keys set from a chief with no SSH, once from the user scope and once from the team scope; a value never appears in a log, an error or an event; CI uses a fake harness CLI | M4, M5; decisions 8, 18, 19; **needs:** an Anthropic and an OpenAI API key (manual check only) |
 | M7 | Airspace II: git repos — remote helper, bundles and manifests, mirrors on safehouses, compaction | `git clone`, `fetch` and `push` between a station and a safehouse with only towers always on; a non-fast-forward push is refused; two racing pushes leave one tip and one conflict ref | M4 (safehouse side: M5); decision 10 |
@@ -332,7 +332,8 @@ reload of the tower's config or allowlist on a signal (#69, #71), an allowlist f
 and signed tower-set statements (M3), automatic use of a peer's candidates (#73), a TXT record
 (the alternative behind `Locator`, #38), DNS or SRV in the shell walkthrough (the library tests
 cover them; #84), distro packages (#82), iOS builds, push and the app (M14), `chief network` (M3),
-the tower's own endpoint (M3). Router port mapping stays off (decision 15, #42).
+the tower's own endpoint (M3), links between towers with forwarding and replication (M3 and M4,
+decision 20): in M2 every node uses the same tower set. Router port mapping stays off (decision 15, #42).
 
 **Waiting for the owner:**
 
@@ -478,7 +479,7 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
 13. **Bootstrap record (M2).** Decided by both agents (#38): SRV with one target per tower, as
     first specified, looked up behind the `Locator` trait of `numbers::bootstrap`, so that another
     record type stays one more implementation. A multi-A record on one name does not work with more
-    than one tower: iroh tells towers apart by URL and towers do not forward to each other, so two
+    than one tower: iroh tells towers apart by URL and the M2 tower does not forward to another, so two
     stations that land on different addresses of the same name cannot reach each other; and every
     tower would need a certificate for the shared name. The resolver is in the build already,
     through iroh. If SRV proves awkward on phones, a TXT record listing tower URLs keeps one name
@@ -524,6 +525,19 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     whether any chief may set a team secret (planned) or it takes more than one; whether
     secrets other than a harness's key reach a session only when its harness definition names
     them (planned) or all of a scope's secrets do.
+20. **Linked towers: forwarding and replication (M3, M4).** Required by the owner: towers
+    replicate between each other and forward to each other, so that members on different towers
+    can work together. Open is how. Forwarding: inside the embedded relay server, if it has a
+    place to hand on a packet for a node it does not hold (to be verified against the iroh-relay
+    source; a fork is not wanted); or a forwarding service of our own on the towers' own
+    endpoints, which members then use as a path; and, in either case, how towers learn which
+    tower holds a node. Replication: one protocol on the tower links for the roster, blocks,
+    names and leases, or one per kind; push, pull or both; how two towers settle a difference
+    without trusting each other's word (planned: everything replicated is either signed by a
+    member or addressed by its hash, so a tower verifies what it takes). Also: full mesh
+    (planned, the set is capped at eight) or less; whether a tower forwards for a node the
+    roster lists but its own allowlist has not caught up with; what a network of one team with
+    towers run by different people needs beyond this.
 
 **Needs from the team:** a public host and DNS zone (M2 demo; nothing else waits on it); a ruling
 on hard rule 10 for `crates/chief-ffi`, whose generated bindings use `unsafe` (M2 FFI smoke check,
@@ -548,6 +562,11 @@ distributing beyond the team or hosting it for others.
 - Tower "discovery" means finding a node's current address by its id. Who is in the network comes
   from the signed roster, never from a tower.
 - SRV bootstrap lands in M2 together with the TLS tower; M1's dev tower is given by URL.
+- "Towers replicate between each other and forward; peers on different towers must be able to
+  collaborate": inside one network. Two members whose tower sets share no tower, or who cannot
+  both reach the same tower, still chat, share airspace and drive safehouses, because their
+  towers pass traffic and stored data on to each other. It is not read as joining two networks
+  with separate rosters.
 - "Finding other nodes through the network" means: addresses a node already holds, then the signed
   address records it learns from nodes it is connected to (and from M3 the signed roster's tower
   set), then every tower of its own set. A tower set that a peer sends is shown as candidates and

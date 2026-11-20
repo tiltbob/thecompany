@@ -17,7 +17,7 @@ The cast:
 | **station** | A chief's node: a daemon on the chief's workstation. The `chief` CLI, the Linux GUI and the iOS app are frontends to a station. |
 | **safehouse** | A node that runs agents in arbitrary harnesses (Claude Code and Codex first). At first a chief sets one up by hand. |
 | **handler** | Later: the node that sets safehouses up, creating each in an isolated environment (an nspawn container, maybe a full QEMU VM). To be fleshed out. |
-| **tower** | An untrusted node: relays traffic, lets nodes find each other, and is the final store for encrypted blocks. A DNS SRV record leads a newcomer to its first tower. Never a member. |
+| **tower** | An untrusted node: relays traffic, lets nodes find each other, and is the final store for encrypted blocks. Towers are linked: they forward traffic to each other and replicate what they keep, so members on different towers work together. A DNS SRV record leads a newcomer to its first tower. Never a member. |
 | **agent** | A harness process on a safehouse. Agents run nowhere else. |
 | **airspace** | The persistence layer: text objects, git repos, occasional multi-gigabyte media. Every node takes part. |
 
@@ -29,7 +29,8 @@ project — and a harness's API key is one of them** (a chief's own key by defau
 project's where the team sets one), and harnesses
 authenticate with **API keys only** (no subscription sign-in is driven, relayed or supported); work is
 **tracked in GitHub issues**; in airspace, **every tower keeps every block and a write counts as
-stored once two towers confirm it**; a station and a safehouse on one machine is **never suggested
+stored once two towers confirm it**; **towers forward to each other and replicate between each
+other, so members that use different towers can work together**; a station and a safehouse on one machine is **never suggested
 and always warned against, but the two packages do not conflict**; the **SRV record only bootstraps
 access — a node already on the network finds other nodes through the network first and falls back
 to SRV last**; a network can **require a Nitrokey HSM to set up new nodes — and only for that, never
@@ -58,7 +59,7 @@ dependency set builds, and loopback tests exercise the M1 dev tower.
 
 | Node | Binary | Trust | Does | Never |
 |---|---|---|---|---|
-| tower | `tower` | untrusted with content; relied on, with checks, to keep blocks | relays ciphertext; rendezvous by node id; stores encrypted blocks | reads traffic or stored data, holds member or airspace keys, runs agents |
+| tower | `tower` | untrusted with content; relied on, with checks, to keep blocks | relays ciphertext, passing it to another tower when the receiver is connected there; rendezvous by node id; stores encrypted blocks and replicates them, and the roster, with the other towers | reads traffic or stored data, holds member or airspace keys, runs agents |
 | safehouse | `safehouse` | member, admitted by a chief | hosts agents and terminals, and holds the secrets its sessions run on (harness API keys among them); serves files, sockets, locks; keeps working copies of airspace | admin actions; starts anything on a station |
 | station | `station` | member, commissioned by its chief | its chief's presence on the network: chat, management, driving safehouses; keeps working copies of airspace | spawns agents; executes anything for a peer |
 | handler (later) | `handler` | member, admitted by a chief | creates and removes safehouses in isolated environments on a chief's request | runs agents itself; admin actions |
@@ -180,15 +181,39 @@ again. So a station watches its home tower (below).
   their supplying peers and explicit requests to add or remove a tower. Status and subscription
   events cover the installed set.
 - **What a tower can do.** It sees who talks to whom, from which IP, when and how much, and (with the
-  airspace) which node keeps or fetches which block. It can drop traffic and lose blocks. It, or whoever
+  airspace) which node keeps or fetches which block; with forwarding, a tower also sees this for
+  traffic it passes on for nodes of another tower. It can drop traffic and lose blocks. It, or whoever
   hijacks the SRV record, can forge the source id of a relayed packet far enough to learn a node's
   candidate addresses and make it send a few UDP probes. It cannot read, alter or impersonate member
   traffic or stored data, and can never become a member. DNSSEC or pinning would protect availability
   and metadata only.
-- **Same set everywhere.** With no better address, dialing tries every tower in the set at once.
-  Towers do not forward to each other, so a dialer reaches a peer only through a tower both of them
-  can reach; all nodes therefore use the same small set (two or three). SRV priority and weight are
-  ignored.
+- **Towers are linked.** Required by the owner; planned for M3 and M4, not built in M2. Members
+  that use different towers must be able to work together, so the towers of a network forward to
+  each other and replicate what they keep. How it is built is **decision 20**.
+  - *Links.* Every tower in the roster's signed tower set keeps an authenticated link to every
+    other one, from its own endpoint and node key (below). The set is small, so this is a full
+    mesh. A tower links only to towers the roster names, never to one a peer or another tower
+    suggests.
+  - *Forwarding.* A tower that gets relayed traffic for a node that is not connected to it passes
+    it to the tower that node is connected to. Towers tell each other which node ids they hold
+    connections for. What is forwarded is the same ciphertext a single tower relays: the
+    connection stays end-to-end encrypted between the two members (hard rule 2). A tower forwards
+    only for listed node ids, rate-limits it, and never forwards again what another tower
+    forwarded to it.
+  - *Replication.* Everything a tower keeps reaches every other tower: the roster (M3), then
+    blocks, names, leases and quota counts (M4). A member talks to one tower; "stored on two
+    towers" is reached by the towers among themselves.
+  - *For a node* this means one reachable tower is enough. Two members need no tower in common,
+    a member behind a network that reaches only one tower is not cut off, and a node never has
+    to connect to a tower because a peer named it (hard rule 8, #73). A direct path is still
+    taken whenever one exists.
+  - *The cost.* A forwarded connection crosses two towers, and each of them sees who talks to
+    whom. A tower's failure still breaks the relayed connections of the nodes homed on it, until
+    they move.
+- **Until towers are linked: the same set everywhere.** With no better address, dialing tries
+  every tower in the set at once. The M2 tower does not forward, so a dialer reaches a peer only
+  through a tower both of them can reach; all nodes therefore use the same small set (two or
+  three). SRV priority and weight are ignored.
   `TowerSet` caps the set at eight unique canonical URLs. Each `TowerEntry` carries its own QAD
   setting and defaults to UDP 7842 for HTTPS or QAD off for plain HTTP.
 - **Not an open relay.** A production tower relays only for listed node ids and rate-limits each
@@ -199,7 +224,8 @@ again. So a station watches its home tower (below).
   untrusted party, not a security boundary.
 - **Its own endpoint.** The relay server cannot host extra routes, so from M3 a tower also runs an
   iroh endpoint with its own node key. Members reach its services there, authenticated by node id:
-  the roster feed first, storage from M4. Towers also use it to pull blocks from each other.
+  the roster feed first, storage from M4. Towers also use it for their links to each other:
+  forwarding and roster replication from M3, block and name replication from M4.
 - **Direct paths across NATs need the production tower.** Address discovery (QAD, UDP 7842) requires
   TLS, and a relay-only node runs none. M1's plain-HTTP dev tower relays, and gives direct paths
   only on the same host.
@@ -373,7 +399,7 @@ encrypted blocks**.
   and no member, admin or airspace key, and CI checks that it links no member code. Its only keys
   are its own TLS key and, when it takes its certificate from Let's Encrypt, its ACME account key.
 - **Durability (agreed).** Every tower keeps every block. A write counts as stored once two towers
-  confirm it; a tower that was down catches up afterwards. The writer keeps its copy until then and
+  confirm it, whichever tower the writer uses; a tower that was down catches up afterwards. The writer keeps its copy until then and
   airspace reports "not yet durable" (always, with a single tower). A member uploads once and the
   other towers pull from that tower. A confirmation is only a claim: blocks are checked by hash on
   every read, and an always-on safehouse spot-checks towers with random range requests and has missing
