@@ -157,11 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_relay_ports_and_literal_whitespace() {
+    fn rejects_zero_relay_ports_and_literal_whitespace_or_controls() {
         for url in [
             "https://tower.example.invalid:0/",
             "http://127.0.0.1:0/",
             " https://tower.example.invalid",
+            "\u{1}https://tower.example.invalid",
             "https://tower.ex\tample.invalid",
             "https://tower.example.invalid/\n",
         ] {
@@ -170,6 +171,58 @@ mod tests {
                 Err(TowerSetError::InvalidUrl)
             ));
         }
+    }
+
+    #[test]
+    fn rejects_schemes_other_than_http_and_https() {
+        for url in [
+            "file:///relay",
+            "ws://192.0.2.1",
+            "wss://tower.example.invalid",
+        ] {
+            assert!(matches!(
+                canonical_tower_url(url),
+                Err(TowerSetError::UnsupportedScheme)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_credentials_paths_queries_and_fragments() {
+        for url in [
+            "https://tower.example.invalid/relay-prefix/",
+            "http://dev@127.0.0.1",
+            "https://:pw@tower.example.invalid",
+            "https://tower.example.invalid/?relay",
+            "https://tower.example.invalid/#relay",
+        ] {
+            assert!(matches!(
+                canonical_tower_url(url),
+                Err(TowerSetError::UnsupportedUrlParts)
+            ));
+        }
+    }
+
+    #[test]
+    fn allows_plain_http_only_on_loopback_ip_literals() {
+        for url in [
+            "http://192.0.2.10",
+            "http://[2001:db8::1]",
+            "http://localhost",
+        ] {
+            assert!(matches!(
+                canonical_tower_url(url),
+                Err(TowerSetError::NonLoopbackHttp)
+            ));
+        }
+        assert_eq!(
+            canonical_tower_url("http://127.0.0.1").unwrap(),
+            "http://127.0.0.1/"
+        );
+        assert_eq!(
+            canonical_tower_url("http://[::1]").unwrap(),
+            "http://[::1]/"
+        );
     }
 
     #[test]
