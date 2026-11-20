@@ -24,7 +24,7 @@ pub use endpoint::{
 pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
 pub use identity::{NodeId, generate_node_key, node_id};
 pub use link::{
-    IncomingChat, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate, SendError,
-    ShutdownError,
+    IncomingChat, IncomingTowers, LINK_ALPN, Link, LinkConfig, LinkHandle, LinkPath, PathUpdate,
+    SendError, ShutdownError, TowerExchange,
 };
 pub use towers::{MAX_TOWERS, Qad, TowerEntry, TowerSet, TowerSetError, canonical_tower_url};
