@@ -49,6 +49,15 @@ pub enum SendOutcome {
 
 type CallHook = Box<dyn FnMut(&FakeStation, &Request) + Send>;
 
+/// The hook of [`FakeStation::on_call`], and how often it was set or removed. A hook is taken out
+/// of the slot while it runs, and is put back afterwards only if the slot was not changed
+/// meanwhile: a hook that removes or replaces itself stays removed or replaced.
+#[derive(Default)]
+struct HookSlot {
+    hook: Option<CallHook>,
+    changes: u64,
+}
+
 /// An in-memory station that implements [`Transport`]. Cheap to clone; clones share one station.
 ///
 /// The outcome of a send is applied within the call, after the answer was made: the answer holds
@@ -61,7 +70,7 @@ pub struct FakeStation {
 
 struct Inner {
     state: Mutex<State>,
-    hook: Mutex<Option<CallHook>>,
+    hook: Mutex<HookSlot>,
     /// Woken when a subscription is added or a closed one is dropped.
     subscribers_changed: Notify,
     /// Woken when held subscribes may go on.
@@ -140,7 +149,7 @@ impl FakeStation {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
-                hook: Mutex::new(None),
+                hook: Mutex::new(HookSlot::default()),
                 subscribers_changed: Notify::new(),
                 subscribe_gate: Notify::new(),
             }),
@@ -403,13 +412,20 @@ impl FakeStation {
     /// Runs `hook` at the start of every later call, before the fake looks at the request, with
     /// the fake unlocked: the hook may change the station (receive a message, for example), so a
     /// test can make things happen exactly between a client's calls. Replaces an earlier hook.
+    ///
+    /// A hook may call [`FakeStation::clear_on_call`] or `on_call` itself: it then does not run
+    /// again, so a hook that removes itself runs for one call only.
     pub fn on_call(&self, hook: impl FnMut(&FakeStation, &Request) + Send + 'static) {
-        *self.hook() = Some(Box::new(hook));
+        let mut slot = self.hook();
+        slot.hook = Some(Box::new(hook));
+        slot.changes += 1;
     }
 
-    /// Removes the hook of [`FakeStation::on_call`].
+    /// Removes the hook of [`FakeStation::on_call`], also when called from inside the hook.
     pub fn clear_on_call(&self) {
-        *self.hook() = None;
+        let mut slot = self.hook();
+        slot.hook = None;
+        slot.changes += 1;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -419,7 +435,7 @@ impl FakeStation {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn hook(&self) -> MutexGuard<'_, Option<CallHook>> {
+    fn hook(&self) -> MutexGuard<'_, HookSlot> {
         self.inner
             .hook
             .lock()
@@ -427,14 +443,19 @@ impl FakeStation {
     }
 
     fn run_hook(&self, request: &Request) {
-        // Taken out while it runs, so the hook may call into the fake (and even replace itself).
-        let Some(mut hook) = self.hook().take() else {
-            return;
+        // Taken out while it runs, so the hook may call into the fake, and remove or replace
+        // itself: it is put back only if nobody changed the slot while it ran.
+        let (mut hook, changes) = {
+            let mut slot = self.hook();
+            let Some(hook) = slot.hook.take() else {
+                return;
+            };
+            (hook, slot.changes)
         };
         hook(self, request);
         let mut slot = self.hook();
-        if slot.is_none() {
-            *slot = Some(hook);
+        if slot.changes == changes {
+            slot.hook = Some(hook);
         }
     }
 
