@@ -1,10 +1,11 @@
 #![cfg(test)]
 
 use std::future::{Future, poll_fn, ready};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,10 @@ use numbers_station::{
     IpTransport, MESSAGE_LOG_CAPACITY, StartError, Station, StationConfig, StationHandle,
 };
 use numbers_tower::{Tower, TowerConfig};
-use tokio::sync::mpsc;
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -445,6 +449,86 @@ async fn restart_keeps_key_and_book_and_reconnects_on_next_send() {
     .await;
 }
 
+/// Polls `future` once without waiting.
+async fn poll_now<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+    poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
+}
+
+/// Whether the station has ended this subscription, after reading what was queued. Never waits.
+async fn subscription_ended(events: &mut Subscription) -> bool {
+    loop {
+        let mut next = pin!(events.next());
+        match poll_now(&mut next).await {
+            Poll::Ready(Some(_)) => {}
+            Poll::Ready(None) => return true,
+            Poll::Pending => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_second_start_is_refused_until_shutdown_has_returned() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let config = network.config("station", IpTransport::RelayOnly);
+            let (station, client) = start(config.clone()).await;
+            let target = station_id(&client).await;
+            let ((), peer) = tokio::join!(
+                wait_online(&client),
+                WirePeer::connect(&network.tower, &client, "peer")
+            );
+            // A live link gives the endpoint a peer connection to close besides the tower's. With
+            // only the tower connection, the shutdown ended before any attempt could overlap it.
+            peer.send(target, "open-link", "open the link", 0).await;
+            wait_api_link(&client, ApiLink::Relayed).await;
+            let mut events = subscribe(&client).await;
+
+            // This test runs on a current-thread runtime, so the actor runs only while this task
+            // waits. A refused start does not wait, so an attempt made between two polls that
+            // both found the shutdown pending overlapped it. Only attempts made after the actor
+            // left its loop count, since an earlier one proves nothing about the shutdown steps.
+            let mut shutdown = pin!(stop(station));
+            let mut refused_while_pending = 0_u32;
+            loop {
+                yield_now().await;
+                // The actor drops every subscription after it left its loop and before it
+                // closes its jobs and the endpoint.
+                let stopping = subscription_ended(&mut events).await;
+                if poll_now(&mut shutdown).await.is_ready() {
+                    break;
+                }
+                assert!(
+                    matches!(
+                        Station::start(config.clone()).await,
+                        Err(StartError::AlreadyRunning)
+                    ),
+                    "a second station started before the first one's shutdown returned"
+                );
+                if poll_now(&mut shutdown).await.is_ready() {
+                    break;
+                }
+                if stopping {
+                    refused_while_pending += 1;
+                }
+            }
+            // This guard checks the test's power, not the station: it needs the endpoint close to
+            // take more than one turn, which the open peer connection makes it do. If a later
+            // shutdown finishes faster, move this test to a seam instead of deleting the guard.
+            assert!(
+                refused_while_pending > 0,
+                "no start attempt overlapped the pending shutdown"
+            );
+            let (restarted, _client) = start(config).await;
+            tokio::join!(stop(restarted), peer.shutdown());
+            network.shutdown().await;
+        },
+        "shutdown lock test timed out",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
     within(
@@ -462,7 +546,15 @@ async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
             );
             assert_eq!(before[0].url, installed);
 
-            for (after, limit) in [(None, 32), (Some("not a peer name"), 1), (None, 0)] {
+            let long_boundary = "z".repeat(4096);
+            for (after, limit) in [
+                (None, 32),
+                (Some("not a peer name"), 1),
+                (None, 0),
+                (Some(""), 0),
+                (None, u32::MAX),
+                (Some(long_boundary.as_str()), 0),
+            ] {
                 let page = checked(
                     client.tower_candidates(after, limit).await,
                     "read the M1 tower candidate page",
@@ -479,7 +571,14 @@ async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
             };
             assert_eq!(client.tower_add(malformed).await, Err(invalid.clone()));
             assert_eq!(client.tower_remove(malformed).await, Err(invalid));
-            for url in [installed.as_str(), "https://tower.synthetic.invalid/"] {
+            // Valid URLs that are not in canonical form are refused as pinned too, not as invalid.
+            let unslashed = installed.trim_end_matches('/').to_owned();
+            for url in [
+                installed.as_str(),
+                "https://tower.synthetic.invalid/",
+                "HTTPS://Tower.SYNTHETIC.INVALID.:443",
+                unslashed.as_str(),
+            ] {
                 assert_eq!(client.tower_add(url).await, Err(ApiError::TowersPinned));
                 assert_eq!(client.tower_remove(url).await, Err(ApiError::TowersPinned));
             }
@@ -537,6 +636,229 @@ async fn station_starts_while_the_tower_is_unavailable() {
             stop(station).await;
         },
         "offline startup test timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn zero_timeouts_are_refused_and_leave_the_data_directory_free() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let scratch = checked(tempfile::tempdir(), "create station test directory");
+            // This socket reserves a loopback port and never serves an HTTP response.
+            let offline = checked(
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)),
+                "reserve unavailable tower port",
+            );
+            let address = checked(offline.local_addr(), "read local tower address");
+            let url = format!("http://{address}/");
+            let valid = config(
+                &scratch.path().join("station"),
+                &url,
+                IpTransport::RelayOnly,
+            );
+            let mut zero_send = valid.clone();
+            zero_send.send_deadline = Duration::ZERO;
+            let mut zero_connect = valid.clone();
+            zero_connect.connect_timeout = Duration::ZERO;
+            for invalid in [zero_send, zero_connect] {
+                assert!(matches!(
+                    Station::start(invalid).await,
+                    Err(StartError::InvalidTimeouts)
+                ));
+                let (station, _client) = start(valid.clone()).await;
+                stop(station).await;
+            }
+        },
+        "zero timeout test timed out",
+    )
+    .await;
+}
+
+/// A loopback TCP forwarder in front of the tower, owned by one test for its whole duration.
+///
+/// Until [`Forwarder::cut`] it pipes each accepted connection both ways to the tower. From then
+/// on it ends every piped connection and closes each new connection as soon as it is accepted,
+/// counting those refused connections. Its listener stays bound until the test shuts it down,
+/// after the station has stopped, so no other test can be given its port while the station
+/// keeps dialling it.
+struct Forwarder {
+    url: String,
+    down: watch::Sender<bool>,
+    refused: Arc<Refused>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct Refused {
+    count: AtomicUsize,
+    grew: Notify,
+}
+
+impl Forwarder {
+    async fn start(tower: SocketAddr) -> Self {
+        let listener = checked(
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await,
+            "bind tower forwarder",
+        );
+        let address = checked(listener.local_addr(), "read tower forwarder address");
+        let (down, _) = watch::channel(false);
+        let refused = Arc::new(Refused::default());
+        let task = tokio::spawn(Self::forward(
+            listener,
+            tower,
+            down.subscribe(),
+            Arc::clone(&refused),
+        ));
+        Self {
+            url: format!("http://{address}/"),
+            down,
+            refused,
+            task,
+        }
+    }
+
+    async fn forward(
+        listener: tokio::net::TcpListener,
+        tower: SocketAddr,
+        down: watch::Receiver<bool>,
+        refused: Arc<Refused>,
+    ) {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                // Never spin on a failing accept; the listener stays bound either way.
+                yield_now().await;
+                continue;
+            };
+            if *down.borrow() {
+                refused.count.fetch_add(1, Ordering::SeqCst);
+                refused.grew.notify_one();
+                drop(client);
+                continue;
+            }
+            let mut down = down.clone();
+            tokio::spawn(async move {
+                let pipe = async {
+                    let mut upstream = TcpStream::connect(tower).await?;
+                    copy_bidirectional(&mut client, &mut upstream).await
+                };
+                // Biased, so that no byte is forwarded once the outage has begun.
+                tokio::select! {
+                    biased;
+                    _ = down.wait_for(|down| *down) => {}
+                    _ = pipe => {}
+                }
+            });
+        }
+    }
+
+    /// Starts the outage: ends the piped connections and refuses every later one.
+    fn cut(&self) {
+        self.down.send_replace(true);
+    }
+
+    fn refused(&self) -> usize {
+        self.refused.count.load(Ordering::SeqCst)
+    }
+
+    async fn refused_more_than(&self, count: usize) {
+        while self.refused() <= count {
+            self.refused.grew.notified().await;
+        }
+    }
+
+    async fn shutdown(self) {
+        self.task.abort();
+        assert!(
+            self.task.await.is_err_and(|error| error.is_cancelled()),
+            "tower forwarder stops"
+        );
+    }
+}
+
+async fn next_tower_state(events: &mut Subscription) -> TowerState {
+    loop {
+        if let Event::Status { mut status } = next_event(events).await {
+            return status.towers.swap_remove(0).state;
+        }
+    }
+}
+
+fn assert_not_connected(state: &TowerState) {
+    assert!(
+        *state != TowerState::Connected,
+        "a tower that is down was reported connected"
+    );
+}
+
+#[tokio::test]
+async fn a_tower_that_went_down_is_not_reported_connected_and_reaches_failing() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            // The tower keeps running: the outage is the forwarder's alone, and neither the
+            // forwarder's port nor the tower's is released while the station keeps dialling.
+            let network = Network::start().await;
+            let forwarder = Forwarder::start(network.tower.http_addr()).await;
+            let (station, client) = start(config(
+                &network.scratch.path().join("station"),
+                &forwarder.url,
+                IpTransport::RelayOnly,
+            ))
+            .await;
+            wait_online(&client).await;
+            let mut events = subscribe(&client).await;
+            forwarder.cut();
+            within(
+                ONLINE_TIMEOUT,
+                async {
+                    // Reports queued before the outage can still say Connected. After each failed
+                    // attempt iroh publishes the failure (Failing) for the backoff, then Connecting
+                    // while it dials again; it publishes Connected only after a successful dial.
+                    // From the first report that is not Connected on, Connected is a failure.
+                    let mut state = next_tower_state(&mut events).await;
+                    while state == TowerState::Connected {
+                        state = next_tower_state(&mut events).await;
+                    }
+                    while !matches!(state, TowerState::Failing { .. }) {
+                        state = next_tower_state(&mut events).await;
+                        assert_not_connected(&state);
+                    }
+                    // The station must keep retrying after its first Failing report: wait until
+                    // the forwarder has refused a connection that it accepted after that report.
+                    let refused = forwarder.refused();
+                    loop {
+                        tokio::select! {
+                            () = forwarder.refused_more_than(refused) => break,
+                            state = next_tower_state(&mut events) => assert_not_connected(&state),
+                        }
+                    }
+                    // Reports already queued can predate that attempt; the next Failing report
+                    // after them is a retry that failed again.
+                    while let Some(event) = queued_event(&mut events).await {
+                        if let Event::Status { status } = event {
+                            assert_not_connected(&status.towers[0].state);
+                        }
+                    }
+                    loop {
+                        let state = next_tower_state(&mut events).await;
+                        assert_not_connected(&state);
+                        if matches!(state, TowerState::Failing { .. }) {
+                            break;
+                        }
+                    }
+                },
+                "station keeps reporting a tower that is down as failing",
+            )
+            .await;
+            let status = checked(client.status().await, "read station status");
+            assert_not_connected(&status.towers[0].state);
+            stop(station).await;
+            forwarder.shutdown().await;
+            network.shutdown().await;
+        },
+        "tower failure test timed out",
     )
     .await;
 }
