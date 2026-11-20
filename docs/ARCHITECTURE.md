@@ -159,11 +159,12 @@ again. So a station watches its home tower (below).
   it was configured with and the ones it remembered across restarts; and only then the SRV record
   again. A changed SRV record therefore matters to newcomers and to a node that has lost every
   tower, not to a running network.
-- **Towers named by a peer are candidates, not part of the set.** Stations exchange their working
-  tower sets over an established link. What a peer sends is checked, kept as candidates with the
-  peer's name, and shown. A station never connects to a candidate, never adds one to its relay map
-  and never passes one on; a chief may take one into the set with an explicit command (decided in
-  #73). Automatic use would be an exception to hard rule 8 and is the owner's to grant.
+- **Towers named by a peer are candidates.** Stations exchange the HTTPS
+  entries of their working tower sets over an established link. What a peer sends is checked,
+  kept as candidates with the peer's name, and shown. A station never connects to a candidate,
+  never adds one to its relay map and never passes one on. A chief may take one into the set
+  with an explicit command (decided in #73). Automatic use would be an exception to hard rule 8
+  and is the owner's to grant.
 - **A station watches its home tower.** After some seconds with no home or a disconnected home,
   it asks iroh for a new net report at a growing, capped interval. Re-inserting an existing
   configuration asks iroh to probe without interrupting relay-map lookup. The watchdog leaves a
@@ -296,6 +297,8 @@ across short sends and resets when new authenticated frames arrive. A caller che
 its original send deadline. If the observed connection is still current and has made
 no progress for the full interval, the sender closes it and can redial. QUIC replenishes
 credits in batches. A crash with 14 unanswered sends can exhaust those credits on loopback.
+An opt-in tower announcement takes one of those credits, so 13 unanswered chat sends can
+exhaust them.
 [#119](https://github.com/tiltbob/thecompany/issues/119)
 
 If a chat stream disconnects before its connection reports a close reason, the sender waits for that
@@ -308,6 +311,27 @@ leaves delivery uncertain because an earlier attempt can still be accepted. The 
 up to 16 concurrent incoming streams per link and applies `send_deadline` to each stream,
 including waiting for the actor's reply. It refuses unauthorized chat on an established link by
 resetting the stream with code `403`. A full or closed chat mailbox returns `unavailable`.
+
+An opt-in M2 link opens one `{"proto":"towers","v":1}` stream in each direction per admitted
+transport. It sends the HTTPS projection captured at admission in a `towers` array of `{url,
+qad_port}` entries. The whole list contains at most eight distinct canonical HTTPS root URLs.
+A missing or null QAD port means off. Receivers ignore unknown fields in the request and its
+entries. A list that violates the tower rules is rejected whole. Framed replies are
+`{"type":"ack"}` or `{"type":"nack","reason":"…"}` with reason `invalid_towers`,
+`unsupported_version` or `unavailable`. A chat-only link replies `unknown_protocol`. The tower
+stream needs its own authorization after the link hello. Refusal resets the stream with code
+`403`, and malformed frames reset it with code `0`. Replacement starts a new attempt even if the
+path is the same. An attempt ends on a reply, connection closure or deadline, and sends never
+retry or dial.
+
+Tower receives share the 16-stream limit and deadline. One tower stream per transport can read a
+body or wait for mailbox space or the actor. A further recognized tower stream receives
+`unavailable`. Slow headers and flow-controlled replies still use slots within the shared limit
+and deadline. The separate mailbox holds up to 32 snapshots. ACK follows the station's
+whole-snapshot commit while the exact admitted connection and peer remain current. A queued
+snapshot can still commit after its sender's deadline if that lease remains current. The native
+link treats received URLs as data. The station is responsible for retaining committed candidate
+snapshots across ordinary disconnects.
 
 ### Stations and the chief's frontends
 

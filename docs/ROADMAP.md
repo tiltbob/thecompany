@@ -202,7 +202,8 @@ unlisted station denied.
 | `crates/numbers/src/endpoint.rs` | `tls_roots` wired to `ca_tls_config`; `dns` wired to iroh's resolver with no public fallback; the relay map carries each entry's QAD port | #76, Codex |
 | `crates/numbers/src/bootstrap.rs` | `srv_name(domain)` → `_numbers._tcp.<domain>.`; `towers_from_srv` (pure); the object-safe `Locator` trait, held as `Arc<dyn Locator>`; `DnsLocator` on `n0-dns-resolver`, no public fallback: with the system's resolvers it builds a fresh resolver for each lookup; with one given nameserver it keeps one resolver and clears its cache before each lookup; its own deadline (10 s by default) bounds the lookup's network waits, not the synchronous read of the system's resolver configuration; `LocateError`, whose text never carries a name | #72, Claude |
 | `crates/numbers/src/testing.rs` | `FakeDns` (cargo feature `test-support`): a DNS server on 127.0.0.1 answering SRV and A from a table the test sets, able to stay silent, recording every query. The station tests reuse it | #72, Claude |
-| `crates/numbers/src/proto/towers.rs` | proto `towers` v1: over an established link with a peer in the peer book, each side sends its own working set `{towers: [{url, qad_port}]}`; the receiver checks it and drops a bad list whole. The station gets an admitted-link notification and protocol dispatch beyond chat, so that it sends its set on every new link | #81, Codex |
+| `crates/numbers/src/proto/towers.rs`, `crates/numbers/src/link/` | The opt-in `towers` v1 stream sends one HTTPS working-set snapshot per side on each admitted transport. The link validates the whole list and hands it to the station with the exact connection identity. | #128, Codex |
+| `crates/station/src/towers.rs` | The station supplies its working set to the link and keeps the latest accepted candidate snapshot per peer. | #81, Codex |
 | `crates/station/src/towers.rs` | owned by the actor: `towers.json` in the data dir (the set, each entry's source, the bootstrap domain), written atomically and only by the actor; the start order; `StationConfig` gains a tower input (`Pinned(TowerSet) \| Domain(String) \| Remembered`), a locator, `tls_roots` and `dns`; fills `source` and `bootstrap_domain` | #77, Codex |
 | `crates/station/src/towers.rs` | the watchdog on the home tower, the `Denied` state, and the return to SRV (below) | #78, Codex |
 | `crates/station-daemon/src/main.rs` | `station run [--data-dir DIR] [--domain DOMAIN] [--tower URL]... [--tower-ca PEM]`, and a hidden `--dns-server ADDR` for tests or none (open in #79). A first run with no `--tower`, no `--domain` and no remembered set is refused with a plain message. The rustls provider install stays in `main` | #79, Codex |
@@ -289,14 +290,15 @@ connection whose selected relay path goes down does not move to the new home tow
 through its original tower.
 
 **Towers named by a peer** (decision 16, settled on #73: exchange and show only). Over an
-established link with a peer in the peer book, a station sends its own working set. What arrives
-must be `https`, in the canonical form, with a root path, at most 8 entries and within the 64 KiB
-frame cap; anything else drops the whole list. The station keeps what arrives as candidates, with
-the source `peer` and the peer's name, and shows them. It never connects to a candidate, never adds
-one to its relay map and never passes one on, also when every tower of its own set has failed. A
-chief may take a candidate into the set with an explicit command, `chief tower add <url>`, as with
-any tower URL the chief types; that is the chief's own act, so hard rule 8 is not touched. A station
-whose towers are all gone therefore recovers through SRV or through the chief, not through a peer.
+established link with a peer in the peer book, a station sends the HTTPS entries of its working
+set. What arrives must be `https`, in the canonical form, with a root path, at most 8 entries and
+within the 64 KiB frame cap. Anything else drops the whole list. The station keeps what arrives as
+candidates, with the source `peer` and the peer's name, and shows them. It never connects to a
+candidate, never adds one to its relay map and never passes one on, even when every tower in its
+own set has failed. A chief may take a candidate into the set with the explicit command
+`chief tower add <url>`, as with any tower URL the chief types. That explicit choice follows
+hard rule 8. A station whose towers are all gone therefore recovers through SRV or through
+the chief.
 
 **What the station shows.** `home_relay_status()` lists the home tower only, so the API distinguishes
 an observed state from an unobserved tower in the station's set. The home tower can be connected,
@@ -494,10 +496,11 @@ Each is a `Decision:` issue with a recommendation, attached to the milestone it 
     iroh's `portmapper` feature out of the libraries. If real deployments show links that stay
     relayed and hurt, it comes back as an explicit opt-in of the station.
 16. **Tower sets passed on by peers (M2).** Decided by both agents on #73: exchange and show only.
-    A station sends its own working set to peers in its peer book and shows what it gets as
-    candidates with the peer's name; it never connects to one, adds one to its relay map or passes
-    one on, and a chief may take one into the set with an explicit command. Whether a station may
-    ever use a peer's candidates on its own is an exception to hard rule 8 and left to the owner.
+    A station sends the HTTPS entries of its working set to peers in its peer book and shows what
+    it gets as candidates with the peer's name. The station never connects to a candidate, adds
+    one to its relay map or passes one on. A chief may take one into the set with an explicit
+    command. Whether a station may ever use a peer's candidates on its own is an exception to
+    hard rule 8 and left to the owner.
 17. **Recovering a tower (M2).** Decided by both agents on #74: a watchdog in the station requests
     a fresh net report only after it has seen no home tower, or a home tower that is not
     connected, for some seconds, at a growing, capped interval, and never while the home tower is
