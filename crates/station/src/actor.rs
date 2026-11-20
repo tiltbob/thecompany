@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use chief::api::{
     ApiError, BODY_MAX_BYTES, Direction, Event, FailReason, Link as PeerLink, Message,
-    MessageStatus, Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status, TowerState,
-    check_peer_name, clean, clean_tower_display,
+    MessageStatus, Peer, PeerStation, RECEIPT_WINDOW, Request, Response, Status,
+    TowerCandidatesPage, TowerState, check_peer_name, check_tower_url, clean, clean_tower_display,
 };
 use chief::client::{EventSink, SUBSCRIPTION_CAPACITY, Subscription, subscription};
 use iroh::{Watcher, endpoint::RelayStatus};
@@ -170,6 +170,17 @@ impl Actor {
             Request::Status => Ok(Response::Status {
                 status: self.status.clone(),
             }),
+            // M1 pins the explicit startup tower and receives no tower announcements.
+            Request::TowerCandidates { .. } => Ok(Response::TowerCandidates {
+                page: TowerCandidatesPage {
+                    groups: Vec::new(),
+                    next_after_peer: None,
+                },
+            }),
+            Request::TowerAdd { url } | Request::TowerRemove { url } => {
+                check_tower_url(&url)?;
+                Err(ApiError::TowersPinned)
+            }
             Request::Peers => Ok(Response::Peers {
                 peers: self
                     .book

@@ -268,9 +268,9 @@ pub enum Command {
     /// that; the tower's reason follows; a tower of this project says "not on this tower's list":
     /// give its operator the id that `chief id` prints).
     ///
-    /// Sources: configured (given when the station was started); remembered (stored by an
-    /// earlier run); srv (found through the domain's DNS record); peer (named by a peer and added
-    /// by the chief).
+    /// Tower sources include configured (given at startup or added by the chief without a matching
+    /// peer announcement), remembered (stored by an earlier run), srv (found through the domain's
+    /// DNS record), and peer (named by a peer and added by the chief).
     ///
     /// Then one line per peer station: `peer <name> <station-id> <link>`.
     Status,
@@ -402,6 +402,8 @@ impl Exit {
             | ApiError::StationTaken { .. }
             | ApiError::MessageNotFound { .. }
             | ApiError::Invalid { .. }
+            | ApiError::TowersPinned
+            | ApiError::TowerSetFull { .. }
             | ApiError::Internal { .. }
             | ApiError::BadRequest { .. } => Self::Failed,
         }

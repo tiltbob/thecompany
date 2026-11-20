@@ -446,6 +446,60 @@ async fn restart_keeps_key_and_book_and_reconnects_on_next_send() {
 }
 
 #[tokio::test]
+async fn pinned_station_lists_no_candidates_and_refuses_tower_changes() {
+    within(
+        CASE_TIMEOUT,
+        async {
+            let network = Network::start().await;
+            let (station, client) = network.station("station", IpTransport::RelayOnly).await;
+            wait_online(&client).await;
+            let mut events = subscribe(&client).await;
+            let before = checked(client.status().await, "read pinned tower status").towers;
+            assert_eq!(before.len(), 1);
+            let installed = checked(
+                numbers_base::canonical_tower_url(network.tower.url()),
+                "canonicalize the loopback tower URL",
+            );
+            assert_eq!(before[0].url, installed);
+
+            for (after, limit) in [(None, 32), (Some("not a peer name"), 1), (None, 0)] {
+                let page = checked(
+                    client.tower_candidates(after, limit).await,
+                    "read the M1 tower candidate page",
+                );
+                assert!(page.groups.is_empty());
+                assert_eq!(page.next_after_peer, None);
+            }
+
+            let malformed = "https://tower.synthetic.invalid/?marker";
+            let invalid = ApiError::Invalid {
+                field: "url".into(),
+                reason: "a tower URL must have a root path and no credentials, query, or fragment"
+                    .into(),
+            };
+            assert_eq!(client.tower_add(malformed).await, Err(invalid.clone()));
+            assert_eq!(client.tower_remove(malformed).await, Err(invalid));
+            for url in [installed.as_str(), "https://tower.synthetic.invalid/"] {
+                assert_eq!(client.tower_add(url).await, Err(ApiError::TowersPinned));
+                assert_eq!(client.tower_remove(url).await, Err(ApiError::TowersPinned));
+            }
+
+            let after = checked(client.status().await, "read unchanged pinned tower status");
+            assert_eq!(after.towers, before);
+            assert!(
+                queued_event(&mut events).await.is_none(),
+                "candidate reads and refused changes do not publish status"
+            );
+
+            stop(station).await;
+            network.shutdown().await;
+        },
+        "pinned tower API test timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn station_starts_while_the_tower_is_unavailable() {
     within(
         CASE_TIMEOUT,
