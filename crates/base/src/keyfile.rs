@@ -320,10 +320,11 @@ pub fn load_or_create_key<const N: usize>(
 /// even if the path used to open it has since changed. Errors identify only a bare filename or the
 /// directory descriptor.
 ///
-/// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`], with
-/// one difference: if the key is missing and `dir` cannot be synced, this function refuses before
-/// calling `generate`, at every call, while [`load_or_create_key`] publishes the key, reports the
-/// sync error and loads the key at the next call.
+/// Key checks, atomic publication and generator behavior are as in [`load_or_create_key`]. The two
+/// differ in when a missing key meets a directory that does not sync. This function syncs `dir`
+/// first: if that fails, it refuses before calling `generate`, and does so again at every call.
+/// [`load_or_create_key`] opens the directory itself and syncs it only after publication: if that
+/// sync fails, it reports the error, the key is already published, and the next call loads it.
 pub fn load_or_create_key_in<const N: usize>(
     dir: &File,
     name: &OsStr,
