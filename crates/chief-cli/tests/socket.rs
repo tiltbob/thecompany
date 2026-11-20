@@ -232,6 +232,35 @@ async fn chat_through_the_socket() {
 }
 
 #[tokio::test]
+async fn a_chat_skips_a_line_that_is_not_utf8_through_the_socket() {
+    bounded(async {
+        let rig = rig().await;
+        let command = parse(&["chat", "bob"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let input: &[u8] = b"one\nnot \xff utf-8\ntwo\n";
+        let exit = run(&command, &rig.client, input, &mut out, &mut err).await;
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "a line is not valid UTF-8 and was not sent\n"
+        );
+        let bodies: Vec<String> = rig
+            .fake
+            .requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, ["one", "two"]);
+        rig.server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn status_and_the_peer_book_through_the_socket() {
     bounded(async {
         let rig = rig().await;
@@ -374,7 +403,13 @@ async fn a_chat_never_sends_to_another_instance_that_took_the_socket() {
         };
         let (exit, (_input, server)) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
-        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        // The binding refuses the send with `Disconnected`, which the chat cannot tell from a
+        // lost answer.
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n\
+             the last line may have been sent; check `chief log bob`\n"
+        );
         assert_eq!(sends(&second), 0);
         assert!(second.messages().is_empty());
         assert_eq!(out.text().lines().count(), 1);
@@ -413,7 +448,17 @@ async fn a_typed_line_and_the_end_of_the_instance_ready_together_never_reach_the
         // first, nothing reaches the second instance.
         let exit = session.await;
         assert_eq!(exit, Exit::NoStation);
-        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        // The line was either sent off (the chat cannot know how far it got) or not yet.
+        let stopped = "the station stopped; the chat has ended\n";
+        assert!(
+            [
+                format!("{stopped}the last line may have been sent; check `chief log bob`\n"),
+                format!("{stopped}1 typed line was not sent\n"),
+            ]
+            .contains(&err.text()),
+            "{}",
+            err.text()
+        );
         assert_eq!(sends(&second), 0);
         assert!(second.messages().is_empty());
         drop(input);

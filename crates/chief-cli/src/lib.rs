@@ -57,15 +57,33 @@
 //! # chat
 //!
 //! `chat` keeps showing what the station sends while a typed line is being sent. One line is sent
-//! at a time; lines typed meanwhile wait, in order. A line the station refuses (an unknown peer,
-//! an invalid body) prints its error and the chat goes on. When the station cannot be talked to
-//! any more (it stopped, restarted, or the connection broke), noticed by a send or by the live
-//! view, whichever comes first, the chat ends once, with one line on stderr and exit 3.
+//! at a time; lines typed meanwhile wait, in order: at most 64, and the input is not read while
+//! that many wait. A line ends at a newline, without it and without one carriage return before
+//! it; the last line may end at the end of the input. An empty or blank line is not sent.
+//!
+//! A line that cannot be sent prints one line on stderr, and the chat goes on:
+//!
+//! - one the station refuses (an unknown peer, an invalid body): the station's error;
+//! - one longer than [`BODY_MAX_BYTES`] (16384) bytes: `a line is longer than 16384 bytes and was
+//!   not sent` (the chat skips it to its end and keeps none of it beyond that bound);
+//! - one that is not valid UTF-8: `a line is not valid UTF-8 and was not sent`.
+//!
+//! If the input cannot be read, `cannot read the input: <error>`, and the chat goes on as at the
+//! end of the input; a line read only in part is dropped.
+//!
+//! When the station cannot be talked to any more (it stopped, is shutting down, restarted, or the
+//! connection broke), noticed by a send or by the live view, whichever comes first, the chat ends
+//! once, with one line on stderr and exit 3. Whenever a chat ends before the end of its input, for
+//! this or any other error, that line is followed by what was left undone: ``the last line may
+//! have been sent; check `chief log <peer>` `` if a line was being sent (also when it is that
+//! send's own timeout or lost connection that ends the chat), then `1 typed line was not sent` or
+//! `<N> typed lines were not sent` for the lines still waiting.
 //!
 //! End of input ends `chat` once the line being sent and the lines still waiting have been sent
 //! (each bounded by the transport's call timeout); what the station shows meanwhile is still
-//! printed. The outcome of the last message is not waited for (it is in `log`); `send` is the
-//! command that waits for the outcome.
+//! printed. The exit is then 0 if the station accepted every non-empty line, and 1 if it refused
+//! one, a line was too long or not UTF-8, or the input failed. The outcome of the last message is
+//! not waited for (it is in `log`); `send` is the command that waits for the outcome.
 //!
 //! # Output (stable: scripts parse it)
 //!
@@ -101,7 +119,8 @@
 //! # Exit codes
 //!
 //! See [`Exit`]: 0 done (for `send`: delivered); 1 the station refused or the operation failed
-//! (for `send`: refused, so not sent, or failed, so not delivered); 2 usage error; 3 cannot talk
+//! (for `send`: refused, so not sent, or failed, so not delivered; for `chat`: at the end of the
+//! input, a line was refused or not sent, or the input failed); 2 usage error; 3 cannot talk
 //! to a station, or the station restarted during the command (`log`, `status`, `send`), or
 //! stopped during a `chat`; for `send` also an unknown outcome (see "send" above).
 //!
@@ -111,8 +130,8 @@
 //! the environment once through [`PathEnv::read`] and owns the runtime.
 
 use chief::api::{
-    ApiError, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, Message, MessageStatus, Peer,
-    TowerState,
+    ApiError, BODY_MAX_BYTES, Direction, FailReason, LOG_PAGE_MAX_MESSAGES, Link, Message,
+    MessageStatus, Peer, TowerState,
 };
 use chief::client::{BindInstance, Client};
 use chief::follow::LogUpdate;
@@ -142,7 +161,8 @@ pub const AFTER_HELP: &str = "\
 Exit status:
   0  done; for send: the message was delivered
   1  the station refused or the operation failed; for send: the station refused the message
-     (it was not sent) or reported that it failed (it was not delivered)
+     (it was not sent) or reported that it failed (it was not delivered); for chat: at the end
+     of the input, a line was refused, too long or not UTF-8, or the input failed
   2  usage error
   3  cannot talk to a station: none is running, it speaks another API version, it stopped
      answering, or it restarted during the command; for send: also when the outcome is unknown
@@ -203,10 +223,17 @@ pub enum Command {
     },
     /// Show the last 50 messages, then follow live; each line typed is sent to the peer
     ///
-    /// Lines are sent one at a time, in order, while the chat keeps showing new messages. End of
-    /// input (Ctrl-D) ends the chat once the lines typed so far have been sent, without waiting
-    /// for their outcome; `chief send` is the command that waits for it. The chat ends with exit 3
-    /// when the station stops or restarts.
+    /// Lines are sent one at a time, in order, while the chat keeps showing new messages. Blank
+    /// lines are ignored. A line longer than 16384 bytes, or not valid UTF-8, is not sent: one
+    /// line on stderr, and the chat goes on; so does a line the station refuses.
+    ///
+    /// End of input (Ctrl-D) ends the chat once the lines typed so far have been sent, without
+    /// waiting for their outcome; `chief send` is the command that waits for it. The exit is then
+    /// 0 if every line was sent, and 1 if a line was refused or not sent.
+    ///
+    /// The chat ends with exit 3 when the station stops or restarts. Then stderr also says if the
+    /// last line may have been sent (check `chief log <peer>`) and how many typed lines were not
+    /// sent.
     Chat {
         /// The peer that typed lines go to (messages of every peer are shown)
         peer: String,
@@ -239,7 +266,8 @@ pub enum Exit {
     Done,
     /// 1: the station refused or the operation failed: an unknown peer, an invalid name or body,
     /// any error the station itself answers with. For `send`: the station refused the message (it
-    /// was not sent) or reported that it failed (it was not delivered).
+    /// was not sent) or reported that it failed (it was not delivered). For `chat`, at the end of
+    /// the input: a line was refused, too long or not UTF-8, or the input failed.
     Failed,
     /// 2: a usage error, reported by clap.
     Usage,
@@ -337,7 +365,10 @@ pub fn socket_path(station: Option<&Path>, env: &PathEnv) -> Result<PathBuf, Str
 /// includes the bound instance being gone (the station restarted mid-command), a log cursor that
 /// does not move back ([`ApiError::BadReply`]), a `send` whose outcome is unknown (it got no
 /// answer, or the station accepted it and the wait for the outcome failed or passed
-/// [`SEND_OUTCOME_WAIT`]), and a `chat` that ends because the station stopped. `chat` returns 0 at the end of `input`, after the lines read so far have been sent.
+/// [`SEND_OUTCOME_WAIT`]), and a `chat` that ends because the station stopped. At the end of
+/// `input`, once the lines read so far have been sent, `chat` returns 0 if the station accepted
+/// every non-empty line, and 1 if it refused one, a line was too long or not UTF-8, or `input`
+/// failed.
 pub async fn run<T, I>(
     command: &Command,
     client: &Client<T>,
@@ -749,24 +780,160 @@ fn station_gone(error: &ApiError) -> bool {
     Exit::for_error(error) == Exit::NoStation || *error == ApiError::Stopping
 }
 
-/// Ends a chat because the station is gone, with one line on `err` and exit 3. `error` is what
-/// noticed it; `None` when the live view ended.
-fn end_chat(err: &mut dyn Write, error: Option<&ApiError>) -> Outcome {
-    match error {
+/// Why a chat ended before the end of its input.
+enum ChatEnd {
+    /// The station is gone: `Some(error)` is what noticed it, `None` that the live view ended.
+    Gone(Option<ApiError>),
+    /// Another error of the live view.
+    Error(ApiError),
+    /// Writing to `out` failed.
+    Output(io::Error),
+}
+
+/// Ends a chat before the end of its input: one line for `end` on `err`, as `run` would print it,
+/// then what was left undone: the line in flight, if a send was (`in_flight`), and the number of
+/// typed lines still queued (`queued`). Returns the exit for `end`: 3 when the station is gone.
+fn end_chat(err: &mut dyn Write, end: ChatEnd, peer: &str, in_flight: bool, queued: usize) -> Exit {
+    let exit = match end {
         // Timeout, IncompatibleApi, BadReply: one line each in `report`.
-        Some(
-            other @ (ApiError::Timeout { .. }
+        ChatEnd::Gone(Some(
+            error @ (ApiError::Timeout { .. }
             | ApiError::IncompatibleApi { .. }
             | ApiError::BadReply { .. }),
-        ) => {
-            report(err, other);
+        )) => {
+            report(err, &error);
+            Exit::NoStation
         }
         // The end of the live view, or a station that stopped, restarted or went away.
-        _ => {
+        ChatEnd::Gone(_) => {
             let _ = say(err, "the station stopped; the chat has ended");
+            Exit::NoStation
+        }
+        ChatEnd::Error(error) => report(err, &error),
+        ChatEnd::Output(error) => {
+            let _ = say(err, &format!("cannot write the output: {error}"));
+            Exit::Failed
+        }
+    };
+    if in_flight {
+        let _ = say(
+            err,
+            &format!("the last line may have been sent; check `chief log {peer}`"),
+        );
+    }
+    match queued {
+        0 => {}
+        1 => {
+            let _ = say(err, "1 typed line was not sent");
+        }
+        n => {
+            let _ = say(err, &format!("{n} typed lines were not sent"));
         }
     }
-    Ok(Exit::NoStation)
+    exit
+}
+
+/// What [`LineReader::next`] read.
+enum Input {
+    /// A line, without its `\n` and without one `\r` before it: valid UTF-8 and at most
+    /// [`BODY_MAX_BYTES`] bytes.
+    Line(String),
+    /// A line longer than [`BODY_MAX_BYTES`] bytes; it was skipped to its end.
+    TooLong,
+    /// A line that is not valid UTF-8.
+    NotUtf8,
+    /// The end of the input.
+    End,
+    /// The input failed. A line read only in part before is dropped.
+    Failed(io::Error),
+}
+
+/// How many bytes of a line [`LineReader`] keeps: [`BODY_MAX_BYTES`] and one `\r`.
+const LINE_KEEP_MAX: usize = BODY_MAX_BYTES + 1;
+
+/// Reads the lines of `chat` from a buffered input, keeping at most [`LINE_KEEP_MAX`] bytes of a
+/// line: a longer line is skipped to its end and reported as [`Input::TooLong`], however long it
+/// runs. A line ends at `\n`; the last one may end at the end of the input.
+struct LineReader<R> {
+    input: R,
+    /// The line read so far; empty while a line that is too long is skipped.
+    line: Vec<u8>,
+    /// The line read so far is too long, and is being skipped.
+    too_long: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> LineReader<R> {
+    fn new(input: R) -> Self {
+        Self {
+            input,
+            line: Vec::new(),
+            too_long: false,
+        }
+    }
+
+    /// The next line, or what else the input gave.
+    ///
+    /// Cancel-safe, so it can be used in `select!`: the only await is `fill_buf`, which takes
+    /// nothing from the input; what it returned is moved into `self` and consumed without an
+    /// await in between, so a dropped call loses nothing, and the part of a line read so far
+    /// stays in `self` for the next call.
+    async fn next(&mut self) -> Input {
+        loop {
+            let (used, complete) = {
+                let buf = match self.input.fill_buf().await {
+                    Ok(buf) => buf,
+                    Err(error) => {
+                        self.line.clear();
+                        self.too_long = false;
+                        return Input::Failed(error);
+                    }
+                };
+                if buf.is_empty() {
+                    // The end of the input; the last line may lack its newline.
+                    if self.too_long || !self.line.is_empty() {
+                        return self.finish();
+                    }
+                    return Input::End;
+                }
+                let (part, used, complete) = match buf.iter().position(|&b| b == b'\n') {
+                    Some(at) => (&buf[..at], at + 1, true),
+                    None => (buf, buf.len(), false),
+                };
+                if !self.too_long {
+                    if self.line.len() + part.len() > LINE_KEEP_MAX {
+                        // Too long to send: keep nothing more of it.
+                        self.too_long = true;
+                        self.line = Vec::new();
+                    } else {
+                        self.line.extend_from_slice(part);
+                    }
+                }
+                (used, complete)
+            };
+            self.input.consume(used);
+            if complete {
+                return self.finish();
+            }
+        }
+    }
+
+    /// The line read so far, which has ended; resets for the next one.
+    fn finish(&mut self) -> Input {
+        let mut line = std::mem::take(&mut self.line);
+        if std::mem::take(&mut self.too_long) {
+            return Input::TooLong;
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.len() > BODY_MAX_BYTES {
+            return Input::TooLong;
+        }
+        match String::from_utf8(line) {
+            Ok(line) => Input::Line(line),
+            Err(_) => Input::NotUtf8,
+        }
+    }
 }
 
 async fn chat<T, I>(
@@ -789,70 +956,118 @@ where
         }));
     }
     let mut follower = client.follow_log(None, CHAT_TAIL).await?;
-    let mut lines = input.lines();
+    let mut lines = LineReader::new(input);
     // Typed lines not sent yet, in order, and the one send in flight.
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut pending: Option<PendingSend<'_>> = None;
+    // Whether `pending` has been polled: before that, its line has not gone anywhere.
+    let mut started = false;
     let mut input_open = true;
+    // Whether every non-empty line read so far was accepted by the station: the exit at the end
+    // of the input.
+    let mut all_accepted = true;
     loop {
         if pending.is_none()
             && let Some(text) = queue.pop_front()
         {
             pending = Some(Box::pin(async move { client.send(peer, &text).await }));
+            started = false;
         }
         if !input_open && pending.is_none() {
-            return Ok(Exit::Done);
+            return Ok(if all_accepted {
+                Exit::Done
+            } else {
+                Exit::Failed
+            });
         }
         let reading = input_open && queue.len() < CHAT_QUEUE_MAX;
-        tokio::select! {
+        let end = tokio::select! {
             // Biased: what the station has to show goes first, so the backlog is printed before a
             // line is read, and the end of the station before a send's error.
             biased;
             // Cancel-safe: updates not yet yielded stay queued in the follower.
             update = follower.next() => match update {
-                Ok(Some(LogUpdate::Added(message))) => say(out, &format_message(&message))?,
-                Ok(Some(LogUpdate::Changed(message))) => say(out, &format_change(&message))?,
+                Ok(Some(LogUpdate::Added(message))) => match say(out, &format_message(&message)) {
+                    Ok(()) => continue,
+                    Err(error) => ChatEnd::Output(error),
+                },
+                Ok(Some(LogUpdate::Changed(message))) => match say(out, &format_change(&message)) {
+                    Ok(()) => continue,
+                    Err(error) => ChatEnd::Output(error),
+                },
                 // The subscription ended, or a re-read after a `Resync` found another instance.
-                Ok(None) => return end_chat(err, None),
-                Err(error) if station_gone(&error) => return end_chat(err, Some(&error)),
+                Ok(None) => ChatEnd::Gone(None),
+                Err(error) if station_gone(&error) => ChatEnd::Gone(Some(error)),
                 // Any other error ends the chat too, with its own message and exit; it is never
                 // retried, so a station that keeps failing cannot spin this loop.
-                Err(error) => return Err(Stop::Api(error)),
+                Err(error) => ChatEnd::Error(error),
             },
             // The send in flight, polled together with the follower and the input. A future is
             // polled only here, and dropped once it is done.
             sent = async {
                 match pending.as_mut() {
-                    Some(send) => send.await,
+                    Some(send) => {
+                        started = true;
+                        send.await
+                    }
                     None => std::future::pending().await,
                 }
             }, if pending.is_some() => {
                 pending = None;
                 match sent {
                     // The outcome arrives through the follower, as a change of the message.
-                    Ok(_) => {}
-                    Err(error) if station_gone(&error) => return end_chat(err, Some(&error)),
+                    Ok(_) => continue,
+                    // This send's own error ends the chat. Its line may have been sent when the
+                    // call ended without an answer (rule 12 in chief::api).
+                    Err(error) if station_gone(&error) => {
+                        let in_flight = unanswered(&error);
+                        let exit =
+                            end_chat(err, ChatEnd::Gone(Some(error)), peer, in_flight, queue.len());
+                        return Ok(exit);
+                    }
                     // A refusal of this one message: say why and go on.
                     Err(error) => {
                         report(err, &error);
+                        all_accepted = false;
+                        continue;
                     }
                 }
             },
-            // Cancel-safe: `Lines::next_line` keeps a partly read line in its own buffer.
-            line = lines.next_line(), if reading => match line {
-                Ok(Some(line)) => {
-                    let text = line.strip_suffix('\r').unwrap_or(&line);
-                    if !text.trim().is_empty() {
-                        queue.push_back(text.to_owned());
+            // Cancel-safe: see `LineReader::next`.
+            line = lines.next(), if reading => {
+                match line {
+                    Input::Line(text) => {
+                        if !text.trim().is_empty() {
+                            queue.push_back(text);
+                        }
+                    }
+                    Input::TooLong => {
+                        all_accepted = false;
+                        let _ = say(
+                            err,
+                            &format!("a line is longer than {BODY_MAX_BYTES} bytes and was not sent"),
+                        );
+                    }
+                    Input::NotUtf8 => {
+                        all_accepted = false;
+                        let _ = say(err, "a line is not valid UTF-8 and was not sent");
+                    }
+                    // End of input: the lines read so far are still sent.
+                    Input::End => input_open = false,
+                    // As the end of input, after one line.
+                    Input::Failed(error) => {
+                        all_accepted = false;
+                        input_open = false;
+                        let _ = say(err, &format!("cannot read the input: {error}"));
                     }
                 }
-                // End of input: the lines read so far are still sent.
-                Ok(None) => input_open = false,
-                Err(error) => {
-                    let _ = say(err, &format!("cannot read the input: {error}"));
-                    return Ok(Exit::Failed);
-                }
+                continue;
             },
-        }
+        };
+        // The live view ended the chat, or failed, or stdout did. A send never polled has not
+        // gone anywhere: its line counts as not sent.
+        let in_flight = pending.is_some() && started;
+        let not_sent = queue.len() + usize::from(pending.is_some() && !started);
+        return Ok(end_chat(err, end, peer, in_flight, not_sent));
     }
 }

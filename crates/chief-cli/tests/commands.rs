@@ -19,10 +19,11 @@ use clap::error::ErrorKind;
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
 
 const BOUND: Duration = Duration::from_secs(30);
@@ -1008,7 +1009,7 @@ async fn chat_ends_when_the_station_restarts_under_it() {
 }
 
 #[tokio::test]
-async fn chat_reports_a_send_error_and_goes_on() {
+async fn chat_reports_a_refused_line_goes_on_and_exits_1() {
     bounded(async {
         let fake = fake_with_peers().await;
         let c = Client::new(fake.clone());
@@ -1022,10 +1023,307 @@ async fn chat_reports_a_send_error_and_goes_on() {
             err.wait_for(|s| s == "no peer named bob\n").await;
             fake.receive("alice", "still here").unwrap();
             out.wait_for(|s| s.ends_with("<- alice still here\n")).await;
+            // A later line is still sent.
+            Client::new(fake.clone())
+                .peer_add("bob", "STATION-B")
+                .await
+                .unwrap();
+            input.write_all(b"back again\n").await.unwrap();
+            out.wait_for(|s| s.contains("-> bob (sending) back again\n"))
+                .await;
             drop(input);
         };
         let (exit, ()) = tokio::join!(session, drive);
-        assert_eq!(exit, Exit::Done);
+        // One line was refused: exit 1 at the end of the input.
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(err.text(), "no peer named bob\n");
+        assert_eq!(sends(&fake), ["anyone?", "back again"]);
+    })
+    .await;
+}
+
+// chat: bad input lines and a chat that ends early (findings B of the second review of #51).
+
+/// Starts `chief chat <peer>` reading `input`: the future, its stdout and its stderr.
+fn chat_on<'a, T: BindInstance, R: AsyncRead + Unpin + 'a>(
+    client: &'a Client<T>,
+    command: &'a Command,
+    input: R,
+) -> (impl Future<Output = Exit> + 'a, Shared, Shared) {
+    let out = Shared::default();
+    let err = Shared::default();
+    let (mut o, mut e) = (out.clone(), err.clone());
+    let fut = async move { run(command, client, BufReader::new(input), &mut o, &mut e).await };
+    (fut, out, err)
+}
+
+/// Runs a chat on `input` (all of it, then end of input) to its end: (exit, stdout, stderr).
+async fn chat_all<T: BindInstance>(client: &Client<T>, input: &[u8]) -> (Exit, String, String) {
+    let command = parse(&["chat", "bob"]);
+    let (session, out, err) = chat_on(client, &command, input);
+    let exit = session.await;
+    (exit, out.text(), err.text())
+}
+
+const NOT_UTF8: &str = "a line is not valid UTF-8 and was not sent\n";
+
+fn too_long() -> String {
+    format!("a line is longer than {BODY_MAX_BYTES} bytes and was not sent\n")
+}
+
+#[tokio::test]
+async fn a_line_that_is_not_utf8_is_skipped_and_the_chat_goes_on() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let (exit, _, err) = chat_all(&c, b"one\nbad \xff\xfe byte\ntwo\n").await;
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(err, NOT_UTF8);
+        assert_eq!(sends(&fake), ["one", "two"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_line_of_the_maximum_length_is_sent_and_a_longer_one_is_skipped() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let longest = "a".repeat(BODY_MAX_BYTES);
+        let longer = "b".repeat(BODY_MAX_BYTES + 1);
+        // The longest line also with a `\r` before its newline, which is dropped.
+        let input = format!("{longest}\n{longer}\n{longest}\r\nafter\n");
+        let (exit, _, err) = chat_all(&c, input.as_bytes()).await;
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(err, too_long());
+        assert_eq!(sends(&fake), [longest.as_str(), &longest, "after"]);
+    })
+    .await;
+}
+
+/// An input of `left` bytes of `x` and no newline, then end of input.
+struct Endless {
+    left: usize,
+}
+
+impl AsyncRead for Endless {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let n = self.left.min(buf.remaining()).min(4096);
+        buf.put_slice(&[b'x'; 4096][..n]);
+        self.left -= n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn an_input_that_never_ends_a_line_is_skipped_as_one_line_too_long() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err) = chat_on(&c, &command, Endless { left: 8 << 20 });
+        assert_eq!(session.await, Exit::Failed);
+        assert_eq!(out.text(), "");
+        assert_eq!(err.text(), too_long());
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn crlf_and_a_last_line_without_a_newline() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let (exit, _, err) = chat_all(&c, b"one\r\n\r\n  \ntwo\r\nlast").await;
+        assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+        assert_eq!(sends(&fake), ["one", "two", "last"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failing_input_still_sends_the_lines_read_and_exits_1() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let input = tokio::io::AsyncReadExt::chain(&b"one\ntwo\npart"[..], Broken);
+        let (session, _out, err) = chat_on(&c, &command, input);
+        assert_eq!(session.await, Exit::Failed);
+        assert_eq!(err.text(), "cannot read the input: the pipe broke\n");
+        assert_eq!(sends(&fake), ["one", "two"]);
+    })
+    .await;
+}
+
+/// An input that fails every read.
+struct Broken;
+
+impl AsyncRead for Broken {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::other("the pipe broke")))
+    }
+}
+
+/// How many chunks a [`Chunks`] input has handed out.
+#[derive(Clone, Default)]
+struct Taken {
+    n: Arc<Mutex<usize>>,
+    changed: Arc<Notify>,
+}
+
+impl Taken {
+    async fn wait_for(&self, n: usize) {
+        loop {
+            let mut changed = pin!(self.changed.notified());
+            changed.as_mut().enable();
+            if *self.n.lock().unwrap() >= n {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// An input the test feeds one chunk at a time; it is `Pending` between chunks and ends when the
+/// sender is dropped. The chat has taken a chunk once [`Taken`] counts it: the chat's poll that
+/// took it has read every line in it before the test runs again.
+struct Chunks {
+    rx: tokio::sync::mpsc::UnboundedReceiver<&'static [u8]>,
+    taken: Taken,
+}
+
+fn chunks() -> (
+    tokio::sync::mpsc::UnboundedSender<&'static [u8]>,
+    Chunks,
+    Taken,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let taken = Taken::default();
+    (
+        tx,
+        Chunks {
+            rx,
+            taken: taken.clone(),
+        },
+        taken,
+    )
+}
+
+impl AsyncRead for Chunks {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => {
+                buf.put_slice(chunk);
+                *self.taken.n.lock().unwrap() += 1;
+                self.taken.changed.notify_waiters();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_line_split_across_reads_survives_a_live_message_between_its_halves() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        fake.set_now_ms(T0);
+        let c = Client::new(fake.clone());
+        let command = parse(&["chat", "bob"]);
+        let (tx, input, taken) = chunks();
+        let (session, out, err) = chat_on(&c, &command, input);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            tx.send(b"hel").unwrap();
+            taken.wait_for(1).await;
+            // The follower's branch wins the select: the read of the line is dropped between
+            // its halves.
+            fake.receive("alice", "between").unwrap();
+            out.wait_for(|s| s.ends_with("<- alice between\n")).await;
+            tx.send(b"lo\n").unwrap();
+            out.wait_for(|s| s.contains("-> bob (sending) hello\n"))
+                .await;
+            drop(tx);
+        };
+        let (exit, ()) = tokio::join!(session, drive);
+        assert_eq!((exit, err.text().as_str()), (Exit::Done, ""));
+        assert_eq!(sends(&fake), ["hello"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_chat_that_ends_early_reports_the_line_in_flight_and_the_lines_queued() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let gated = Gated::new(&fake, HoldAt::Request);
+        let gate = Arc::clone(&gated.gate);
+        let c = Client::new(gated);
+        let command = parse(&["chat", "bob"]);
+        let (tx, input, taken) = chunks();
+        let (session, _out, err) = chat_on(&c, &command, input);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            tx.send(b"one\ntwo\nthree\n").unwrap();
+            taken.wait_for(1).await;
+            gate.wait_held(1).await;
+            fake.stop();
+            tx
+        };
+        let (exit, _tx) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n\
+             the last line may have been sent; check `chief log bob`\n\
+             2 typed lines were not sent\n"
+        );
+        assert!(sends(&fake).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_send_without_an_answer_in_a_chat_says_the_line_may_have_been_sent() {
+    bounded(async {
+        let fake = fake_with_peers().await;
+        let c = Client::new(LostAnswer {
+            fake: fake.clone(),
+            error: ApiError::Timeout { after_ms: 10_000 },
+        });
+        let command = parse(&["chat", "bob"]);
+        let (session, out, err, mut input) = chat(&c, &command);
+        let drive = async {
+            fake.wait_for_subscribers(1).await;
+            input.write_all(b"hello\n").await.unwrap();
+            input
+        };
+        let (exit, _input) = tokio::join!(session, drive);
+        assert_eq!(exit, Exit::NoStation);
+        assert_eq!(
+            err.text(),
+            "the station did not answer within 10000 ms\n\
+             the last line may have been sent; check `chief log bob`\n"
+        );
+        // It was sent; the send's error ends the chat in the poll that sent it, before the
+        // live view shows it.
+        assert_eq!(sends(&fake), ["hello"]);
+        assert_eq!(out.text(), "");
     })
     .await;
 }
@@ -1258,7 +1556,13 @@ async fn chat_never_sends_to_an_instance_restarted_inside_the_send() {
         };
         let (exit, _input) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
-        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        // The bound transport refuses the send with `Disconnected`, which the chat cannot tell
+        // from a lost answer.
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n\
+             the last line may have been sent; check `chief log bob`\n"
+        );
         assert!(sends(&fake).is_empty());
         // The new instance logged only its own message.
         let bodies: Vec<String> = fake.messages().into_iter().map(|m| m.body).collect();
@@ -1444,7 +1748,12 @@ async fn the_station_stopping_while_a_send_is_held_ends_the_chat_once() {
         };
         let (exit, _input) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
-        assert_eq!(err.text(), "the station stopped; the chat has ended\n");
+        // The live view ends the chat first, with the send in flight.
+        assert_eq!(
+            err.text(),
+            "the station stopped; the chat has ended\n\
+             the last line may have been sent; check `chief log bob`\n"
+        );
 
         // Only the send finds out: calls fail with `Stopping`, the subscription stays open.
         let fake = fake_with_peers().await;
@@ -1462,6 +1771,7 @@ async fn the_station_stopping_while_a_send_is_held_ends_the_chat_once() {
         };
         let (exit, _input) = tokio::join!(session, drive);
         assert_eq!(exit, Exit::NoStation);
+        // `Stopping` is a refusal: the line was not sent.
         assert_eq!(err.text(), "the station stopped; the chat has ended\n");
     })
     .await;
