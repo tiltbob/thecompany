@@ -264,7 +264,7 @@ fn rejects_malformed_duplicate_empty_and_self_entries() {
     write_file(&peer_path, &vec![b' '; PEER_FILE_MAX_BYTES + 1], 0o600);
     assert!(matches!(
         storage.load_peers(own),
-        Err(StorageError::PeerBookTooLarge)
+        Err(StorageError::RecordTooLarge(RecordFile::Peers))
     ));
 }
 
@@ -319,11 +319,11 @@ fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
     write_file(&peer_path, b"keep", 0o644);
     assert!(matches!(
         storage.load_peers(own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(matches!(
         storage.save_peers(&book, own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(fs::read(&peer_path).expect("read fixture") == b"keep");
     assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 2);
@@ -332,11 +332,11 @@ fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
     fs::create_dir(&peer_path).expect("create directory in place of peer book");
     assert!(matches!(
         storage.load_peers(own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(matches!(
         storage.save_peers(&book, own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(peer_path.is_dir());
     assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 2);
@@ -347,11 +347,11 @@ fn unsafe_targets_are_not_replaced_and_staging_file_is_cleaned() {
     symlink(&target, &peer_path).expect("link peer book fixture");
     assert!(matches!(
         storage.load_peers(own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(matches!(
         storage.save_peers(&book, own),
-        Err(StorageError::PeerFile)
+        Err(StorageError::PrivateRecord(RecordFile::Peers))
     ));
     assert!(peer_path.is_symlink());
     assert!(fs::read(&target).expect("read fixture target") == b"keep");
@@ -364,7 +364,7 @@ fn staging_name_collisions_preserve_every_preexisting_entry() {
     let storage = Storage::lock(&path).expect("lock fixture");
     let own = new_id();
     let book = single_peer("alice", new_id());
-    let stale = path.join(staging_name(0));
+    let stale = path.join(staging_name(RecordFile::Peers, 0));
     write_file(&stale, b"stale", 0o600);
     storage
         .save_peers(&book, own)
@@ -373,17 +373,22 @@ fn staging_name_collisions_preserve_every_preexisting_entry() {
     assert_eq!(fs::read_dir(&path).expect("list fixtures").count(), 3);
 
     for index in 1..STAGING_ATTEMPTS {
-        write_file(&path.join(staging_name(index)), b"stale", 0o600);
+        write_file(
+            &path.join(staging_name(RecordFile::Peers, index)),
+            b"stale",
+            0o600,
+        );
     }
     let next = single_peer("bob", new_id());
     assert!(matches!(
         storage.save_peers(&next, own),
-        Err(StorageError::StagingNamesTaken)
+        Err(StorageError::StagingNamesTaken(RecordFile::Peers))
     ));
     assert!(storage.load_peers(own).expect("load old book") == book);
     for index in 0..STAGING_ATTEMPTS {
         assert!(
-            fs::read(path.join(staging_name(index))).expect("read existing stage fixture")
+            fs::read(path.join(staging_name(RecordFile::Peers, index)))
+                .expect("read existing stage fixture")
                 == b"stale"
         );
     }
@@ -411,7 +416,9 @@ fn validation_failure_preserves_old_book_and_directory_sync_failure_commits() {
     let next = single_peer("bob", new_id());
     let bytes = serde_json::to_vec(&DiskBook::from_book(&next)).expect("encode next book");
     let outcome = storage
-        .replace_peers(&bytes, |_| Err(io::ErrorKind::Other.into()))
+        .replace_record(RecordFile::Peers, &bytes, |_| {
+            Err(io::ErrorKind::Other.into())
+        })
         .expect("rename committed");
     assert_eq!(outcome, SaveOutcome::DurabilityUncertain);
     assert!(storage.load_peers(own).expect("load committed replacement") == next);
