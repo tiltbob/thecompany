@@ -84,6 +84,10 @@ fn srv_name_refuses_what_is_not_a_domain() {
         "user@example.test",
         "exa*mple.test",
         "bücher.example.test",
+        "-team.example.test",
+        "team-.example.test",
+        "example.-test",
+        "exa;mple.test",
         &long_label,
         &long_name,
     ] {
@@ -117,6 +121,10 @@ fn towers_from_srv_canonical_form() {
         ("b.example.test", 0),
         ("b.example.test/x", 443),
         ("b.example.test..", 443),
+        ("-b.example.test", 443),
+        ("b-.example.test", 443),
+        ("b_b.example.test", 443),
+        ("b;b.example.test", 443),
     ]));
     assert_eq!(
         towers,

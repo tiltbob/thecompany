@@ -76,8 +76,9 @@ pub enum LocateError {
 /// Returns the fully qualified SRV name to look up for `domain`: `_numbers._tcp.<domain>.`.
 ///
 /// The domain may end in one dot and is put in lower case. It must be a plain host name: labels of
-/// ASCII letters, digits and hyphens, separated by single dots. A scheme, a path, a port,
-/// whitespace, an underscore or an empty label make it [`LocateError::InvalidDomain`].
+/// ASCII letters, digits and hyphens, separated by single dots, no label beginning or ending with
+/// a hyphen. A scheme, a path, a port, whitespace, an underscore or an empty label make it
+/// [`LocateError::InvalidDomain`].
 pub fn srv_name(domain: &str) -> Result<String, LocateError> {
     let domain = domain.strip_suffix('.').unwrap_or(domain);
     if !is_host_name(domain) {
@@ -124,13 +125,16 @@ fn tower_url(target: &str, port: u16) -> Option<String> {
 }
 
 /// Whether `name`, without a trailing dot, is a plain host name: labels of 1 to 63 ASCII letters,
-/// digits and hyphens, separated by single dots, at most 253 characters in all.
+/// digits and hyphens that neither begin nor end with a hyphen, separated by single dots, at most
+/// 253 characters in all. The tower applies the same rule to its own host name.
 fn is_host_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= MAX_LABEL_LEN
+                && !label.starts_with('-')
+                && !label.ends_with('-')
                 && label
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
