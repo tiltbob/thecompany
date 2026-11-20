@@ -1,21 +1,24 @@
 //! Finding a domain's towers through DNS SRV.
 //!
 //! A station that is given only a domain asks DNS for the SRV record `_numbers._tcp.<domain>.`.
-//! Each record names one tower by target host and port, and becomes the tower URL
-//! `https://<target>:<port>/`. Priority and weight are not used: the station wants every tower the
-//! domain lists, not a choice among them.
+//! Each record names one tower by target host and port, and becomes a [`TowerEntry`] built by
+//! [`TowerEntry::from_url`] from `https://<target>:<port>`. Priority and weight are not used: the
+//! station wants every tower the domain lists, not a choice among them.
 //!
-//! The URLs are canonical: the host is in lower case and has no trailing dot, the port is left out
-//! when it is 443, and the list is sorted and has no duplicates. The relay code compares tower URLs
-//! as text, so two spellings of one tower would be two towers to it.
+//! The URLs are those of [`canonical_tower_url`], the one URL rule of the workspace: the host is in
+//! lower case and has no trailing dot, the port is left out when it is 443. A tower found here and
+//! the same host and port typed by a user are the same string. The list is sorted by URL and has no
+//! duplicates: the relay code compares tower URLs as text, so two spellings of one tower would be
+//! two towers to it. SRV carries no QAD port, so every located tower has the default of
+//! [`TowerEntry::from_url`] for HTTPS: QAD on UDP 7842.
 //!
 //! [`DnsLocator`] never falls back to public DNS resolvers. It asks either the resolvers the
 //! system is configured with or one nameserver the caller names. The towers a station trusts must
 //! not come from a resolver it did not choose.
 //!
-//! A domain may name at most [`MAX_LOCATED_TOWERS`] towers. A larger answer is an error of its
-//! own, [`LocateError::TooManyTowers`], not a silent cut: which towers a station gets must not
-//! depend on an arbitrary choice.
+//! A domain may name at most [`MAX_TOWERS`] towers, the bound of a [`TowerSet`]. A larger answer
+//! is an error of its own, [`LocateError::TooManyTowers`], not a silent cut: which towers a station
+//! gets must not depend on an arbitrary choice.
 //!
 //! Two bounds make a lookup fail with [`LocateError::Timeout`]. n0-dns-resolver gives each query to
 //! a UDP nameserver 6 seconds, a constant that cannot be changed from here; that is a budget per
@@ -34,7 +37,7 @@
 //! lets those levels through for `n0_dns_resolver` writes the domain and the tower host names to
 //! its log.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -43,9 +46,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use n0_dns_resolver::{DnsProtocol, DnsResolver, Nameserver};
-use url::Url;
+use url::{Host, Url};
 
-use crate::TowerSet;
+use crate::{DnsConfig, MAX_TOWERS, TowerEntry};
+#[cfg(doc)]
+use crate::{TowerSet, canonical_tower_url};
 
 /// The SRV service and protocol labels put in front of a domain: `_numbers._tcp`.
 pub const SRV_SERVICE: &str = "_numbers._tcp";
@@ -54,21 +59,15 @@ pub const SRV_SERVICE: &str = "_numbers._tcp";
 /// [`DnsLocator::with_timeout`] sets another deadline: 10 seconds.
 pub const DEFAULT_LOCATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most towers one domain may name: equal to the bound of the tower set the station installs
-/// them in. A larger answer is [`LocateError::TooManyTowers`].
-pub const MAX_LOCATED_TOWERS: usize = 8;
-
 /// The longest domain name, in characters, without the trailing dot (RFC 1035).
 const MAX_NAME_LEN: usize = 253;
 /// The longest label of a domain name, in characters (RFC 1035).
 const MAX_LABEL_LEN: usize = 63;
-/// The port an `https` URL leaves out.
-const HTTPS_PORT: u16 = 443;
 
 /// An error finding the towers of a domain.
 ///
-/// No variant carries the domain or a target: the caller knows which domain it asked for, and
-/// neither belongs in a log.
+/// No variant carries the domain, a target, a tower URL or a nameserver address: the caller knows
+/// which domain it asked for, and none of them belongs in a log.
 #[derive(Debug, thiserror::Error)]
 pub enum LocateError {
     /// The domain is not a plain domain name.
@@ -78,7 +77,7 @@ pub enum LocateError {
     /// record is unusable.
     #[error("the domain names no tower")]
     NoTower,
-    /// The domain names more than [`MAX_LOCATED_TOWERS`] usable, distinct towers.
+    /// The domain names more than [`MAX_TOWERS`] usable towers with distinct canonical URLs.
     #[error("the domain names more towers than a station can use")]
     TooManyTowers,
     /// The DNS resolver did not answer in time.
@@ -107,46 +106,53 @@ pub fn srv_name(domain: &str) -> Result<String, LocateError> {
     Ok(format!("{SRV_SERVICE}.{}.", domain.to_ascii_lowercase()))
 }
 
-/// Returns the canonical tower URLs for SRV answers given as (target, port) pairs.
+/// Returns the towers for SRV answers given as (target, port) pairs.
 ///
-/// Each usable pair becomes `https://<target>:<port>/` with the target in lower case and without
-/// its trailing dot, and the port left out when it is 443. The result is sorted and has no
-/// duplicates. A pair is skipped when its target is empty or `.` (RFC 2782: the service is not
-/// available), when the target is not a plain host name, when the port is 0, or when the URL would
-/// not come out in this canonical form or would not be accepted by [`TowerSet::from_url`].
-pub fn towers_from_srv(records: impl IntoIterator<Item = (String, u16)>) -> Vec<String> {
-    records
-        .into_iter()
-        .filter_map(|(target, port)| tower_url(&target, port))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+/// Each usable pair becomes [`TowerEntry::from_url`] of `https://<target>:<port>`, so its URL is
+/// the one [`canonical_tower_url`] gives and its QAD setting is the default for HTTPS: UDP 7842
+/// (SRV carries no QAD port). The result is sorted by URL; two pairs that come to the same URL are
+/// one tower, the first kept. This function does not apply the bound of [`MAX_TOWERS`]; the
+/// locator does.
+///
+/// A pair is skipped when:
+/// - its target is empty or `.` (RFC 2782: the service is not available), or its port is 0;
+/// - its target holds anything but ASCII letters, digits, hyphens and dots, so that the URL parser
+///   cannot rewrite it (no percent-decoding, no international name, no URL syntax);
+/// - [`TowerEntry::from_url`] refuses the URL (an empty label, a label of more than 63 characters
+///   or one that begins or ends with a hyphen, a name of more than 253, more than one final dot);
+/// - the host is an IP address, also one the URL parser reads from a numeric name such as
+///   `1.2.3.4`: an SRV target is a DNS name.
+pub fn towers_from_srv(records: impl IntoIterator<Item = (String, u16)>) -> Vec<TowerEntry> {
+    let mut towers = BTreeMap::new();
+    for (target, port) in records {
+        if let Some(entry) = tower_entry(&target, port) {
+            towers.entry(entry.url().to_owned()).or_insert(entry);
+        }
+    }
+    towers.into_values().collect()
 }
 
-/// The canonical tower URL for one SRV answer, or `None` if the answer is unusable.
-fn tower_url(target: &str, port: u16) -> Option<String> {
-    let host = target.strip_suffix('.').unwrap_or(target);
-    if port == 0 || !is_host_name(host) {
+/// The tower for one SRV answer, or `None` if the answer is unusable.
+fn tower_entry(target: &str, port: u16) -> Option<TowerEntry> {
+    if port == 0
+        || target.is_empty()
+        || target == "."
+        || !target
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
         return None;
     }
-    let host = host.to_ascii_lowercase();
-    let url = if port == HTTPS_PORT {
-        format!("https://{host}/")
-    } else {
-        format!("https://{host}:{port}/")
-    };
-    // The URL parser rewrites some hosts, such as a short numeric one into an IPv4 address. Keep
-    // only URLs that survive parsing unchanged, so the text is the one the relay code will see.
-    let parsed = Url::parse(&url).ok()?;
-    if parsed.as_str() != url || TowerSet::from_url(&url).is_err() {
-        return None;
-    }
-    Some(url)
+    let entry = TowerEntry::from_url(&format!("https://{target}:{port}")).ok()?;
+    // `canonical_tower_url` accepts IP literals for explicit tower URLs; an SRV target is a name.
+    let url = Url::parse(entry.url()).ok()?;
+    matches!(url.host(), Some(Host::Domain(_))).then_some(entry)
 }
 
 /// Whether `name`, without a trailing dot, is a plain host name: labels of 1 to 63 ASCII letters,
 /// digits and hyphens that neither begin nor end with a hyphen, separated by single dots, at most
-/// 253 characters in all. The tower applies the same rule to its own host name.
+/// 253 characters in all. The rule of [`srv_name`] for the bootstrap domain, which is not a URL;
+/// tower hosts follow [`canonical_tower_url`], which applies the same rule to DNS names.
 fn is_host_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
@@ -163,17 +169,19 @@ fn is_host_name(name: &str) -> bool {
 
 /// The future [`Locator::locate`] returns: boxed, `Send`, and borrowing the locator and the domain.
 pub type LocateFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<String>, LocateError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<TowerEntry>, LocateError>> + Send + 'a>>;
 
-/// Finds the tower URLs a domain names.
+/// Finds the towers a domain names.
 ///
 /// The station holds a `Locator` as `Arc<dyn Locator>`. [`DnsLocator`] is the real one; tests can
 /// supply their own. The trait is object-safe, so `locate` returns a boxed future
 /// ([`LocateFuture`]) rather than an `impl Future`. A lookup happens rarely, so the allocation does
 /// not matter.
 pub trait Locator: Send + Sync {
-    /// Returns the canonical tower URLs for `domain`, as [`towers_from_srv`] makes them. The list
-    /// is never empty: a domain that names no tower is [`LocateError::NoTower`].
+    /// Returns the towers for `domain`, as [`towers_from_srv`] makes them: canonical URLs, sorted,
+    /// no two alike. The list is never empty and has at most [`MAX_TOWERS`] entries: a domain that
+    /// names no tower is [`LocateError::NoTower`], one that names more is
+    /// [`LocateError::TooManyTowers`].
     fn locate<'a>(&'a self, domain: &'a str) -> LocateFuture<'a>;
 }
 
@@ -220,7 +228,27 @@ impl std::ops::Deref for LookupResolver<'_> {
 }
 
 impl DnsLocator {
-    /// A locator over the system's resolver configuration, with no public fallback.
+    /// A locator for the resolver `dns` describes: [`DnsConfig::System`] is [`Self::system`],
+    /// [`DnsConfig::Nameserver`] is [`Self::with_nameserver`]. Construction does no IO. The
+    /// deadline is [`DEFAULT_LOCATE_TIMEOUT`].
+    pub fn new(dns: DnsConfig) -> Self {
+        let source = match dns {
+            DnsConfig::System => Source::System,
+            DnsConfig::Nameserver(addr) => {
+                let resolver = DnsResolver::builder()
+                    .nameserver(Nameserver::new(addr, DnsProtocol::Udp))
+                    .build();
+                Source::Nameserver(Box::new(resolver))
+            }
+        };
+        Self {
+            source,
+            timeout: DEFAULT_LOCATE_TIMEOUT,
+        }
+    }
+
+    /// A locator over the system's resolver configuration, with no public fallback:
+    /// `DnsLocator::new(DnsConfig::System)`.
     ///
     /// Every lookup builds a new resolver, which reads the system configuration afresh, so a
     /// lookup after a network change asks the nameservers configured now, not those of the first
@@ -231,13 +259,11 @@ impl DnsLocator {
     ///
     /// Construction does no IO. The deadline is [`DEFAULT_LOCATE_TIMEOUT`].
     pub fn system() -> Self {
-        Self {
-            source: Source::System,
-            timeout: DEFAULT_LOCATE_TIMEOUT,
-        }
+        Self::new(DnsConfig::System)
     }
 
-    /// A locator that asks only the nameserver at `addr`. For tests, and for people who must name
+    /// A locator that asks only the nameserver at `addr`:
+    /// `DnsLocator::new(DnsConfig::Nameserver(addr))`. For tests, and for people who must name
     /// their resolver.
     ///
     /// Each query goes out over UDP, with up to six datagrams paced 300 ms to 1 s apart and then
@@ -249,13 +275,7 @@ impl DnsLocator {
     /// its pooled TCP connection; `locate` clears the cache before each lookup. The deadline is
     /// [`DEFAULT_LOCATE_TIMEOUT`].
     pub fn with_nameserver(addr: SocketAddr) -> Self {
-        let resolver = DnsResolver::builder()
-            .nameserver(Nameserver::new(addr, DnsProtocol::Udp))
-            .build();
-        Self {
-            source: Source::Nameserver(Box::new(resolver)),
-            timeout: DEFAULT_LOCATE_TIMEOUT,
-        }
+        Self::new(DnsConfig::Nameserver(addr))
     }
 
     /// Sets the deadline for a whole lookup, after which `locate` fails with
@@ -279,7 +299,7 @@ impl Locator for DnsLocator {
     ///
     /// An invalid domain, or a zero deadline, fails before anything is sent. The lookup runs under
     /// the locator's deadline (see [`DnsLocator::with_timeout`]) and needs a tokio runtime with the
-    /// time driver enabled. More than [`MAX_LOCATED_TOWERS`] towers, counted after
+    /// time driver enabled. More than [`MAX_TOWERS`] towers, counted after
     /// [`towers_from_srv`] has dropped unusable and duplicate targets, is
     /// [`LocateError::TooManyTowers`].
     ///
@@ -311,7 +331,7 @@ impl DnsLocator {
     }
 
     /// The body of [`Locator::locate`] for `DnsLocator`, before it is boxed.
-    async fn lookup(&self, domain: &str) -> Result<Vec<String>, LocateError> {
+    async fn lookup(&self, domain: &str) -> Result<Vec<TowerEntry>, LocateError> {
         let name = srv_name(domain)?;
         if self.timeout.is_zero() {
             return Err(LocateError::Timeout);
@@ -334,7 +354,7 @@ impl DnsLocator {
         if towers.is_empty() {
             return Err(LocateError::NoTower);
         }
-        if towers.len() > MAX_LOCATED_TOWERS {
+        if towers.len() > MAX_TOWERS {
             return Err(LocateError::TooManyTowers);
         }
         Ok(towers)
@@ -353,7 +373,8 @@ mod tests {
 
     use n0_dns_resolver::DnsResolver;
 
-    use super::{DnsLocator, LookupResolver};
+    use super::{DnsLocator, LookupResolver, Source};
+    use crate::DnsConfig;
 
     // The system-configured locator builds a new resolver for each lookup, so that a changed
     // system configuration is read again. Building a resolver does no IO, so this reads nothing
@@ -379,5 +400,25 @@ mod tests {
             panic!("the nameserver locator built a new resolver");
         };
         assert!(std::ptr::eq(a, b));
+    }
+
+    // Constructed only: neither locator is asked anything, so no test reaches a real resolver.
+    #[test]
+    fn new_follows_the_dns_config() {
+        let system = DnsLocator::new(DnsConfig::System);
+        assert!(matches!(system.source, Source::System));
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
+        let named = DnsLocator::new(DnsConfig::Nameserver(addr));
+        assert!(matches!(named.source, Source::Nameserver(_)));
+        assert!(matches!(DnsLocator::system().source, Source::System));
+        assert!(matches!(
+            DnsLocator::with_nameserver(addr).source,
+            Source::Nameserver(_)
+        ));
+        for locator in [system, named] {
+            let debug = format!("{locator:?}");
+            assert_eq!(debug, "DnsLocator { .. }");
+            assert!(!debug.contains("127.0.0.1") && !debug.contains("53"));
+        }
     }
 }

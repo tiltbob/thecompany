@@ -7,11 +7,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use numbers::bootstrap::{
-    DEFAULT_LOCATE_TIMEOUT, MAX_LOCATED_TOWERS, SRV_SERVICE, srv_name, towers_from_srv,
-};
+use numbers::bootstrap::{DEFAULT_LOCATE_TIMEOUT, SRV_SERVICE, srv_name, towers_from_srv};
 use numbers::testing::FakeDns;
-use numbers::{DnsLocator, LocateError, LocateFuture, Locator, TowerSet};
+use numbers::{
+    DnsConfig, DnsLocator, LocateError, LocateFuture, Locator, MAX_TOWERS, Qad, TowerEntry,
+    TowerSet, canonical_tower_url,
+};
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,6 +28,11 @@ async fn bounded<T>(limit: Duration, fut: impl Future<Output = T>) -> T {
 
 fn pairs(list: &[(&str, u16)]) -> Vec<(String, u16)> {
     list.iter().map(|(t, p)| ((*t).to_owned(), *p)).collect()
+}
+
+/// The URLs of `towers`, in order.
+fn urls(towers: &[TowerEntry]) -> Vec<&str> {
+    towers.iter().map(TowerEntry::url).collect()
 }
 
 async fn server() -> (FakeDns, DnsLocator) {
@@ -148,7 +154,7 @@ async fn locate_longest_domain_through_the_resolver() {
         let srv = format!("_numbers._tcp.{longest}");
         dns.set_srv(&srv, &[("a.example.test", 443)]);
         assert_eq!(
-            locator.locate(&longest).await.unwrap(),
+            urls(&locator.locate(&longest).await.unwrap()),
             ["https://a.example.test/"]
         );
         assert_eq!(dns.query_count_for(&srv, "SRV"), 1);
@@ -165,7 +171,7 @@ fn targets(n: usize) -> Vec<String> {
 #[tokio::test]
 async fn locate_accepts_eight_towers() {
     bounded(TEST_TIMEOUT, async {
-        assert_eq!(MAX_LOCATED_TOWERS, 8);
+        assert_eq!(MAX_TOWERS, 8);
         let (dns, locator) = server().await;
         let names = targets(8);
         let records: Vec<(&str, u16)> = names.iter().map(|t| (t.as_str(), 443)).collect();
@@ -206,7 +212,9 @@ async fn locate_counts_towers_after_removing_duplicates_and_unusable() {
         dns.set_srv(SRV, &records);
         let towers = locator.locate(DOMAIN).await.unwrap();
         assert_eq!(towers.len(), 8);
-        assert_eq!(towers[0], "https://t0.example.test/");
+        assert_eq!(towers[0].url(), "https://t0.example.test/");
+        // What the station installs: `TowerSet` takes the answer as it is.
+        assert_eq!(TowerSet::from_entries(towers).unwrap().len(), 8);
     })
     .await;
 }
@@ -215,7 +223,7 @@ async fn locate_counts_towers_after_removing_duplicates_and_unusable() {
 fn towers_from_srv_two_targets() {
     let towers = towers_from_srv(pairs(&[("b.example.test", 3340), ("a.example.test", 443)]));
     assert_eq!(
-        towers,
+        urls(&towers),
         ["https://a.example.test/", "https://b.example.test:3340/"]
     );
 }
@@ -239,22 +247,98 @@ fn towers_from_srv_canonical_form() {
         ("b_b.example.test", 443),
         ("b;b.example.test", 443),
     ]));
+    let found = urls(&towers);
     assert_eq!(
-        towers,
+        found,
         [
             "https://a.example.test/",
             "https://a.example.test:8443/",
             "https://c.example.test:8443/",
         ]
     );
-    let mut sorted = towers.clone();
+    let mut sorted = found.clone();
     sorted.sort();
     sorted.dedup();
-    assert_eq!(towers, sorted);
-    for url in &towers {
-        assert!(TowerSet::from_url(url).is_ok(), "TowerSet refused {url}");
+    assert_eq!(found, sorted);
+    for url in &found {
+        assert_eq!(canonical_tower_url(url).unwrap(), *url);
         assert!(!url.contains(".test."), "trailing dot in {url}");
     }
+    assert!(TowerSet::from_entries(towers).is_ok());
+}
+
+// The URL rule is `canonical_tower_url`'s: a tower from SRV and the same host and port typed by a
+// user are the same string (issue 67).
+#[test]
+fn towers_from_srv_matches_what_a_user_types() {
+    for (target, port, typed) in [
+        ("h.example.test.", 443, "https://h.example.test"),
+        ("H.Example.Test", 443, "https://h.example.test:443/"),
+        ("h.example.test.", 8443, "HTTPS://H.EXAMPLE.TEST.:8443"),
+    ] {
+        let towers = towers_from_srv(pairs(&[(target, port)]));
+        assert_eq!(urls(&towers), [canonical_tower_url(typed).unwrap()]);
+        assert_eq!(towers[0], TowerEntry::from_url(typed).unwrap());
+    }
+}
+
+// SRV carries no QAD port: a located tower gets the HTTPS default of `TowerEntry::from_url`.
+#[test]
+fn towers_from_srv_uses_the_default_qad_port() {
+    let towers = towers_from_srv(pairs(&[("a.example.test", 443), ("b.example.test", 3340)]));
+    assert_eq!(towers.len(), 2);
+    for tower in &towers {
+        assert_eq!(tower.qad(), Qad::Port(7842));
+    }
+}
+
+#[test]
+fn towers_from_srv_one_tower_per_canonical_url() {
+    let towers = towers_from_srv(pairs(&[
+        ("a.example.test", 443),
+        ("A.EXAMPLE.TEST.", 443),
+        ("a.example.test.", 443),
+    ]));
+    assert_eq!(urls(&towers), ["https://a.example.test/"]);
+}
+
+// The bound is the locator's, not this function's: nine distinct targets stay nine here.
+#[test]
+fn towers_from_srv_does_not_cut() {
+    let names = targets(9);
+    let records: Vec<(&str, u16)> = names.iter().map(|t| (t.as_str(), 443)).collect();
+    assert_eq!(towers_from_srv(pairs(&records)).len(), 9);
+}
+
+// What is not a DNS name is skipped, also where `canonical_tower_url` would accept it for a typed
+// URL: an IP address, an international name, a percent-encoded name.
+#[test]
+fn towers_from_srv_skips_what_is_not_a_dns_name() {
+    let long_label = format!("{}.example.test", "a".repeat(64));
+    let towers = towers_from_srv(pairs(&[
+        ("192.0.2.1", 443),
+        ("192.0.2.1.", 443),
+        ("127.0.0.1", 3340),
+        ("[::1]", 443),
+        ("123", 443),
+        ("0x7f.1", 443),
+        ("1.2.3.04", 443),
+        ("a.1", 443),
+        ("bücher.example.test", 443),
+        ("xn--bcher-kva.example.test", 443),
+        ("a%62.example.test", 443),
+        ("a@b.example.test", 443),
+        ("a:1.example.test", 443),
+        ("a?.example.test", 443),
+        ("a#.example.test", 443),
+        ("a\\b.example.test", 443),
+        ("a b.example.test", 443),
+        ("a\tb.example.test", 443),
+        ("example..test", 443),
+        (&long_label, 443),
+    ]));
+    // Only the name that is already ASCII remains.
+    assert_eq!(urls(&towers), ["https://xn--bcher-kva.example.test/"]);
 }
 
 #[test]
@@ -272,7 +356,7 @@ async fn locate_two_targets() {
         dns.set_srv(SRV, &[("b.example.test.", 3340), ("A.example.test", 443)]);
         let towers = locator.locate(DOMAIN).await.unwrap();
         assert_eq!(
-            towers,
+            urls(&towers),
             ["https://a.example.test/", "https://b.example.test:3340/"]
         );
         assert_only_srv_queries(&dns);
@@ -325,12 +409,12 @@ async fn locate_asks_again_after_the_answer_changed() {
         let (dns, locator) = server().await;
         dns.set_srv(SRV, &[("a.example.test", 443)]);
         assert_eq!(
-            locator.locate(DOMAIN).await.unwrap(),
+            urls(&locator.locate(DOMAIN).await.unwrap()),
             ["https://a.example.test/"]
         );
         dns.set_srv(SRV, &[("b.example.test", 443), ("c.example.test", 443)]);
         assert_eq!(
-            locator.locate(DOMAIN).await.unwrap(),
+            urls(&locator.locate(DOMAIN).await.unwrap()),
             ["https://b.example.test/", "https://c.example.test/"]
         );
         dns.remove(SRV);
@@ -483,6 +567,27 @@ async fn system_locator_is_built_without_io() {
         // Constructed only: never queried, so no test reaches a real resolver.
         let locator = DnsLocator::system();
         assert_eq!(format!("{locator:?}"), "DnsLocator { .. }");
+        let locator = DnsLocator::new(DnsConfig::System);
+        assert_eq!(format!("{locator:?}"), "DnsLocator { .. }");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn new_with_a_nameserver_asks_that_nameserver() {
+    bounded(TEST_TIMEOUT, async {
+        let dns = FakeDns::start().await.expect("bind the fake DNS server");
+        let locator = DnsLocator::new(DnsConfig::Nameserver(dns.addr()));
+        // The address is not in the locator's Debug, as it is not in `DnsConfig`'s.
+        let debug = format!("{locator:?}");
+        assert_eq!(debug, "DnsLocator { .. }");
+        assert!(!debug.contains(&dns.addr().port().to_string()));
+        dns.set_srv(SRV, &[("a.example.test", 443)]);
+        let towers = locator.locate(DOMAIN).await.unwrap();
+        assert_eq!(urls(&towers), ["https://a.example.test/"]);
+        assert_eq!(towers[0].qad(), Qad::Port(7842));
+        assert_eq!(dns.query_count(), 1);
+        assert_only_srv_queries(&dns);
     })
     .await;
 }
@@ -500,7 +605,7 @@ const _: () = {
 };
 
 /// A locator that answers every domain with a fixed result, as the station's tests will use.
-struct FixedLocator(Result<Vec<String>, ()>);
+struct FixedLocator(Result<Vec<TowerEntry>, ()>);
 
 impl Locator for FixedLocator {
     fn locate<'a>(&'a self, _domain: &'a str) -> LocateFuture<'a> {
@@ -510,7 +615,10 @@ impl Locator for FixedLocator {
 }
 
 /// Generic use, the other way a caller may hold a locator.
-async fn via_generic<L: Locator>(locator: &L, domain: &str) -> Result<Vec<String>, LocateError> {
+async fn via_generic<L: Locator>(
+    locator: &L,
+    domain: &str,
+) -> Result<Vec<TowerEntry>, LocateError> {
     locator.locate(domain).await
 }
 
@@ -521,15 +629,15 @@ async fn dns_locator_through_arc_dyn() {
         dns.set_srv(SRV, &[("b.example.test", 3340), ("a.example.test", 443)]);
         let shared: Arc<dyn Locator> = Arc::new(locator);
         let expected = ["https://a.example.test/", "https://b.example.test:3340/"];
-        assert_eq!(shared.locate(DOMAIN).await.unwrap(), expected);
+        assert_eq!(urls(&shared.locate(DOMAIN).await.unwrap()), expected);
         // `Arc<dyn Locator>` is itself a `Locator`, so it also goes where one is expected.
-        assert_eq!(via_generic(&shared, DOMAIN).await.unwrap(), expected);
+        assert_eq!(urls(&via_generic(&shared, DOMAIN).await.unwrap()), expected);
         // The future can move to another task.
         let task = tokio::spawn({
             let shared = Arc::clone(&shared);
             async move { shared.locate(DOMAIN).await }
         });
-        assert_eq!(task.await.unwrap().unwrap(), expected);
+        assert_eq!(urls(&task.await.unwrap().unwrap()), expected);
         assert_eq!(dns.query_count(), 3);
         assert_only_srv_queries(&dns);
     })
@@ -539,7 +647,7 @@ async fn dns_locator_through_arc_dyn() {
 #[tokio::test]
 async fn hand_written_locator_as_arc_dyn() {
     bounded(TEST_TIMEOUT, async {
-        let towers = vec!["https://a.example.test/".to_owned()];
+        let towers = vec![TowerEntry::from_url("https://a.example.test/").unwrap()];
         let found: Arc<dyn Locator> = Arc::new(FixedLocator(Ok(towers.clone())));
         let none: Arc<dyn Locator> = Arc::new(FixedLocator(Err(())));
         assert_eq!(found.locate(DOMAIN).await.unwrap(), towers);
