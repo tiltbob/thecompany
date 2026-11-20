@@ -8,7 +8,9 @@ pub mod gate;
 pub mod identity;
 pub mod towers;
 
-pub use endpoint::{Endpoint, EndpointBindError, EndpointConfig, IpTransport};
+pub use endpoint::{
+    Endpoint, EndpointBindError, EndpointConfig, EndpointRouterBuilder, IpTransport,
+};
 pub use gate::{Authorizer, CLOSE_NOT_ALLOWED, Protocol};
 pub use identity::{NodeId, generate_node_key, node_id};
 pub use towers::{TowerSet, TowerSetError};

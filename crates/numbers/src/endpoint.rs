@@ -7,9 +7,10 @@ use std::sync::Arc;
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::dns::DnsResolver;
 use iroh::endpoint::{
-    BindError, InvalidSocketAddr, NetReportConfig, PortmapperConfig, QuicTransportConfig, presets,
+    BindError, Incoming, InvalidSocketAddr, NetReportConfig, PortmapperConfig, QuicTransportConfig,
+    presets,
 };
-use iroh::protocol::{Router, RouterBuilder};
+use iroh::protocol::{DynProtocolHandler, Router, RouterBuilder as IrohRouterBuilder};
 use iroh::{RelayMap, RelayMode, SecretKey, TransportAddr};
 use n0_future::{StreamExt, boxed::BoxStream, stream};
 
@@ -98,21 +99,28 @@ impl Endpoint {
         Ok(Self { inner, gate })
     }
 
-    /// Accesses iroh for outgoing dials, status, and shutdown.
+    /// Accesses iroh only for outgoing dials, status, and shutdown.
     ///
-    /// Inbound protocols must use [Self::router_builder] to apply the pre-handshake filter.
-    /// Use fully handshaken connections so the authorization hook has run.
+    /// The authorization hook checks the authenticated remote id and negotiated ALPN
+    /// on outgoing connections too. Use fully handshaken connections so the hook has run.
+    ///
+    /// Serve all inbound protocols through [Self::router_builder]. Never call
+    /// [`iroh::Endpoint::accept`], [`iroh::Endpoint::set_alpns`], or [`Router::builder`]
+    /// with this handle. Doing so can bypass the pre-handshake filter.
     pub fn iroh(&self) -> &iroh::Endpoint {
         &self.inner
     }
 
-    /// Starts configuring the inbound router with the pre-handshake filter installed.
+    /// Starts configuring the inbound router, which applies the pre-handshake filter.
     ///
     /// Register the protocol handlers on the returned builder before spawning it.
-    pub fn router_builder(&self) -> RouterBuilder {
-        let gate = self.gate.clone();
-        Router::builder(self.inner.clone())
-            .incoming_filter(Arc::new(move |incoming| gate.filter(incoming)))
+    pub fn router_builder(&self) -> EndpointRouterBuilder {
+        EndpointRouterBuilder {
+            inner: Router::builder(self.inner.clone()),
+            gate: self.gate.clone(),
+            #[cfg(test)]
+            filter_decisions: None,
+        }
     }
 
     /// Returns the endpoint's policy for authorizing streams.
@@ -124,6 +132,55 @@ impl Endpoint {
 impl fmt::Debug for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Endpoint").finish_non_exhaustive()
+    }
+}
+
+/// Registers protocol handlers for an endpoint's gated inbound router.
+pub struct EndpointRouterBuilder {
+    inner: IrohRouterBuilder,
+    gate: Gate,
+    #[cfg(test)]
+    filter_decisions:
+        Option<tokio::sync::mpsc::UnboundedSender<iroh::protocol::IncomingFilterOutcome>>,
+}
+
+impl EndpointRouterBuilder {
+    /// Registers a handler for an ALPN in negotiation order.
+    pub fn accept(
+        mut self,
+        alpn: impl AsRef<[u8]>,
+        handler: impl Into<Box<dyn DynProtocolHandler>>,
+    ) -> Self {
+        self.inner = self.inner.accept(alpn, handler);
+        self
+    }
+
+    /// Installs the endpoint's gate and starts accepting connections.
+    #[must_use = "Router aborts when dropped, use Router::shutdown to shut the router down cleanly"]
+    pub fn spawn(self) -> Router {
+        let Self {
+            inner,
+            gate,
+            #[cfg(test)]
+            filter_decisions,
+        } = self;
+        let filter = move |incoming: &Incoming| gate.filter(incoming);
+        #[cfg(test)]
+        let filter = move |incoming: &Incoming| {
+            let decision = filter(incoming);
+            if let Some(observer) = &filter_decisions {
+                let _ = observer.send(decision);
+            }
+            decision
+        };
+        inner.incoming_filter(Arc::new(filter)).spawn()
+    }
+}
+
+impl fmt::Debug for EndpointRouterBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndpointRouterBuilder")
+            .finish_non_exhaustive()
     }
 }
 
@@ -148,3 +205,6 @@ impl AddressLookup for TowerLookup {
         Some(stream::once(Ok(item)).boxed())
     }
 }
+
+#[cfg(test)]
+mod tests;

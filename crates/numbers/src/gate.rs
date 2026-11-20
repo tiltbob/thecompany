@@ -42,7 +42,14 @@ impl Authorizer {
 
     /// Atomically replaces the station's known peers.
     ///
-    /// The station is responsible for closing any existing links it revokes.
+    /// The caller must validate that each station id appears only once. If an id
+    /// appears more than once, the last name wins.
+    ///
+    /// Changing the policy does not close links that already passed the handshake
+    /// hook, including links still being registered. The link layer must call
+    /// [Self::authorize] when registering a handshaken link and before admitting
+    /// each stream. Serialize these checks with policy replacement and closing
+    /// revoked links.
     pub fn replace_peers(&self, peers: impl IntoIterator<Item = (NodeId, String)>) {
         let peers = peers
             .into_iter()
