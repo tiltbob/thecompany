@@ -12,6 +12,7 @@ doc = false
 
 [dependencies]
 clap.workspace = true
+iroh-base.workspace = true
 iroh-relay = { workspace = true, features = ["server"] }
 rustls.workspace = true
 thiserror.workspace = true
@@ -20,6 +21,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Integration tests act as stations through the tower.
+iroh.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [lints]

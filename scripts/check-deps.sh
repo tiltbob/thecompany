@@ -3,6 +3,8 @@
 #
 # Hard rule 5 (AGENTS.md): frontends hold no network state. `chief` and `chief-cli` depend on
 # `numbers-base` only, never on `numbers` or iroh.
+# The tower holds no member code: `numbers-tower` never depends on `numbers`, `numbers-station` or
+# `chief`.
 # docs/ARCHITECTURE.md, appendix "Dependencies": the libraries never enable iroh's `test-utils`,
 # and keep `portmapper` and `fast-apple-datapath` out.
 #
@@ -80,6 +82,11 @@ fi
 for frontend in chief chief-cli; do
     forbid "$frontend" numbers iroh iroh-base iroh-relay
 done
+
+# The tower holds no member code. docs/ARCHITECTURE.md: a tower is untrusted and never a member, and
+# the tower binary contains no sealing or key code; so it links neither the network library, nor
+# the station, nor the frontend API. Its tests act as stations through iroh, a dev-dependency.
+forbid numbers-tower numbers numbers-station chief
 
 for lib in numbers numbers-station; do
     forbid_iroh_features "$lib" test-utils portmapper fast-apple-datapath
